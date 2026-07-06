@@ -152,6 +152,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `OptionPositionsRequireIdentityChange` (non-standard, wrapper-handled). Relevant only to code
   tracking this unreleased development line, where both the old and new variants are pre-release.
 
+### Security
+
+- Upgraded `anyhow` to 1.0.103 and `quick-xml` to 0.41.0 to clear three RUSTSEC advisories:
+  RUSTSEC-2026-0190 (unsoundness in `anyhow::Error::downcast_mut`), RUSTSEC-2026-0194 (quadratic
+  run time when checking a start tag for duplicate attribute names) and RUSTSEC-2026-0195
+  (unbounded namespace-declaration allocation in `NsReader`, a memory-exhaustion DoS). `quick-xml`
+  backs the IBKR Flex XML parser behind the `ibkr` feature; the bump is API-compatible for the
+  `Reader`/`de::from_str` surface in use.
+
 ## [0.5.0] - 2026-06-19
 
 ### Changed
