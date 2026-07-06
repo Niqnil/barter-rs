@@ -362,11 +362,13 @@ mod tests {
         let actions = parse_corporate_actions(ACTIVITY_FIXTURE).unwrap();
         assert_eq!(
             find(&actions, "TSLA").principal_adjust_factor,
-            Some(Decimal::from(2))
+            // A TIPS-style inflation factor (deliberately NOT a round split-ratio-looking value),
+            // reinforcing that this field is surfaced raw and is not the split ratio.
+            Some(Decimal::new(10023, 4)) // 1.0023
         );
         assert_eq!(
             find(&actions, "SPLIT").principal_adjust_factor,
-            Some(Decimal::new(1, 1)) // 0.1
+            Some(Decimal::new(9977, 4)) // 0.9977 (again a TIPS factor, not a ratio)
         );
         // Empty `principalAdjustFactor=""` collapses to None.
         assert_eq!(find(&actions, "AAPL").principal_adjust_factor, None);

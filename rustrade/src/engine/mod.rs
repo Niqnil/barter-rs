@@ -825,7 +825,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
 
             let side = position.side;
             let result = position.apply_split(ratio_decimal, policy, last_price);
-            // Read the post-split basis AFTER apply_split overwrote it (Convention A): quantity
+            // Read the post-split basis AFTER apply_split overwrote it: quantity
             // and price then share the post-split era, valuing the disposed sliver with one
             // multiply and no ratio knowledge.
             let price_entry_average_post_split = position.price_entry_average;
@@ -1259,6 +1259,13 @@ pub enum EngineOutput<
     /// option positions are left at their pre-split terms. This is therefore **not** retryable —
     /// the wrapper must close the listed options (and/or open positions under a pre-declared new
     /// identity), it must not re-inject the same action.
+    ///
+    /// **Resting option orders are the caller's responsibility here.** Unlike the standard-split
+    /// path (and the equity path), this non-standard branch emits **no**
+    /// [`EngineOutput::OpenOrdersAtSplit`] for the affected options — the engine touches no option
+    /// state on a non-standard split. Any resting orders on the old option identity are therefore
+    /// **not** surfaced through this observable; the wrapper must cancel them as part of the
+    /// identity change, since they reference a contract identity that no longer trades post-split.
     ///
     /// # Backtest pattern
     /// This is fully backtestable through the same aux-event seam used for the split itself, because

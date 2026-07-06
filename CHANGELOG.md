@@ -90,7 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`reqwest`'s `Error: Display` would otherwise embed the full URL, leaking the token into logs); the
   variant is documented to never carry the URL. The HTTP client also enforces HTTPS-only transport
   and rejects redirects (`https_only(true)` + `redirect::Policy::none()`), so the token cannot leak
-  via an HTTPS→HTTP downgrade redirect. A runnable example
+  via an HTTPS→HTTP downgrade redirect. `IbkrFlexConfig::new` / `from_env` trim both credentials and
+  reject an empty (or whitespace-only) value up front (`IbkrFlexError::InvalidCredential`), so a
+  malformed token fails observably at construction rather than as an opaque IBKR `1003` "invalid
+  token" at fetch time. A runnable example
   (`ibkr_flex_corporate_actions`, `--features ibkr`) sketches the wrapper-side reconcile.
 
 ### Changed
@@ -131,6 +134,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-monotonic backtest clock and out-of-order engine feed. Mirrors `AuxEventsInMemory::new`.
   **Breaking** only for callers that were (incorrectly) supplying unsorted data — observable failure
   over silent corruption.
+- **`alpaca` and `massive` features no longer enable global float `Decimal` serialization**
+  (`rustrade-data`). Both features previously enabled `rust_decimal/serde-float`, a **global**
+  feature whose side effect — through Cargo feature unification across the workspace — was to flip
+  every `Decimal`'s default `Serialize`/`Deserialize` to a lossy `f64`. They now enable the
+  field-level `rust_decimal/serde-with-float` instead, so `Decimal` keeps its deterministic,
+  lossless string wire format everywhere by default. **Breaking** for any downstream that built with
+  `--features alpaca` / `--features massive` and relied (intentionally or as a side effect) on the
+  global float form: fields that must serialize as floats now need an explicit
+  `#[serde(with = "rust_decimal::serde::float")]` (or `float_option`). The integration clients that
+  require it already carry this attribute.
 
 ### Removed
 

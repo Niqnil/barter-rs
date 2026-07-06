@@ -3,7 +3,11 @@ use crate::{
     engine::{
         EngineMeta, EngineOutput, Processor,
         audit::{AuditTick, EngineAudit, ProcessAudit, context::EngineContext},
-        state::{EngineState, instrument::data::InstrumentDataState, position::PositionId},
+        state::{
+            EngineState,
+            instrument::data::InstrumentDataState,
+            position::{PositionId, SplitRoundingPolicy},
+        },
     },
     execution::AccountStreamEvent,
 };
@@ -441,7 +445,17 @@ where
                                  count {} before a standard split — data corruption",
                                 position.quantity_abs,
                             );
-                            position.apply_split(ratio, policy, option_last_price);
+                            // Pass `Fractional` explicitly, NOT the equity `policy`, mirroring the
+                            // live handler (`process_corporate_action`): the assert above guarantees
+                            // an integer contract count so the policy is a no-op here, and the
+                            // equity's whole-share-lot policy does not govern option legs. Hard-coding
+                            // it keeps live and replica byte-identical even if a future
+                            // `SplitRoundingPolicy` variant were to differ on already-integer inputs.
+                            position.apply_split(
+                                ratio,
+                                SplitRoundingPolicy::Fractional,
+                                option_last_price,
+                            );
                         }
                     }
                 }

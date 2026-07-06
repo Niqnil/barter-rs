@@ -13,7 +13,7 @@ use rustrade::{
             generate_algo_orders::GenerateAlgoOrdersOutput,
             send_requests::{SendCancelsAndOpensOutput, SendRequestsOutput},
         },
-        audit::EngineAudit,
+        audit::{AuditTick, EngineAudit},
         clock::HistoricalClock,
         command::Command,
         execution_tx::MultiExchangeTxMap,
@@ -113,6 +113,17 @@ type TestEngine = Engine<
     MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
     TestBuyAndHoldStrategy,
     DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
+>;
+
+// Empty audit-update iterator for `StateReplicaManager::new` in the parity tests, aliased so the
+// deeply-nested type (and its `clippy::type_complexity` allow) isn't repeated at each call site.
+type DummyAuditUpdates = std::iter::Empty<
+    AuditTick<
+        EngineAudit<
+            EngineEvent<DataKind>,
+            EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+        >,
+    >,
 >;
 
 #[test]
@@ -1476,16 +1487,8 @@ fn test_contract_expiry_replica_state_cleared() {
         context: seed_context,
     };
 
-    // Type annotation required for StateReplicaManager::new to infer the iterator element type
-    #[allow(clippy::type_complexity)]
-    let dummy_updates: std::iter::Empty<
-        AuditTick<
-            EngineAudit<
-                EngineEvent<DataKind>,
-                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
-            >,
-        >,
-    > = std::iter::empty();
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type.
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
     let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
 
     // Extract outputs from the audit to drive the replica update_from_event.
@@ -1624,16 +1627,8 @@ fn test_corporate_action_replica_parity_floor_split() {
             sequence: Sequence(0),
         },
     };
-    // Type annotation required for StateReplicaManager::new to infer the iterator element type
-    #[allow(clippy::type_complexity)]
-    let dummy_updates: std::iter::Empty<
-        AuditTick<
-            EngineAudit<
-                EngineEvent<DataKind>,
-                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
-            >,
-        >,
-    > = std::iter::empty();
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type.
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
     let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
 
     // Drive the replica with the live outputs. The CorporateAction arm event-replays and ignores
@@ -1831,16 +1826,8 @@ fn test_corporate_action_replica_parity_short_reverse_split() {
             sequence: Sequence(0),
         },
     };
-    // Type annotation required for StateReplicaManager::new to infer the iterator element type
-    #[allow(clippy::type_complexity)]
-    let dummy_updates: std::iter::Empty<
-        AuditTick<
-            EngineAudit<
-                EngineEvent<DataKind>,
-                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
-            >,
-        >,
-    > = std::iter::empty();
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type.
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
     let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
 
     let outputs = match &audit_tick.event {
@@ -1939,16 +1926,8 @@ fn test_corporate_action_replica_parity_unsupported_non_spot() {
             sequence: Sequence(0),
         },
     };
-    // Type annotation required for StateReplicaManager::new to infer the iterator element type
-    #[allow(clippy::type_complexity)]
-    let dummy_updates: std::iter::Empty<
-        AuditTick<
-            EngineAudit<
-                EngineEvent<DataKind>,
-                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
-            >,
-        >,
-    > = std::iter::empty();
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type.
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
     let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
     replica_manager.update_from_event(ca_event, &outputs);
 
@@ -2479,16 +2458,8 @@ fn test_corporate_action_option_replica_parity_standard_split() {
             sequence: Sequence(0),
         },
     };
-    // Type annotation required for StateReplicaManager::new to infer the iterator element type
-    #[allow(clippy::type_complexity)]
-    let dummy_updates: std::iter::Empty<
-        AuditTick<
-            EngineAudit<
-                EngineEvent<DataKind>,
-                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
-            >,
-        >,
-    > = std::iter::empty();
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type.
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
     let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
 
     // Drive the replica with the live outputs. The standard option adjustment is pure event-replay
@@ -3148,8 +3119,9 @@ fn send_fill(
             side,
             price,
             quantity: dec!(1),
-            // Hedging option engine: quote is USD = AssetIndex(1)
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+            // BTCUSDT (instrument 0) quote = usdt = AssetIndex(2). Fee is zero here regardless, but
+            // use the correct quote asset for the instrument this helper always fills (index 0).
+            fees: asset_fees(0, Decimal::ZERO),
         }),
     }));
     engine.process(event);

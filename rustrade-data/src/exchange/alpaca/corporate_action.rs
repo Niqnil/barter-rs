@@ -124,7 +124,10 @@ mod tests {
         );
 
         let query = build_query(&filter);
-        assert_eq!(query.symbols, vec!["NVDA".to_string(), "AAPL".to_string()]);
+        assert_eq!(
+            query.symbols,
+            vec![SmolStr::new("NVDA"), SmolStr::new("AAPL")]
+        );
         assert_eq!(query.start, filter.start);
         assert_eq!(query.end, filter.end);
     }

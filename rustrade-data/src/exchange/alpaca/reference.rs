@@ -23,6 +23,7 @@ use chrono::NaiveDate;
 use futures::Stream;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use smol_str::SmolStr;
 use tracing::{debug, warn};
 
 /// Maximum results per page (Alpaca API limit).
@@ -58,7 +59,7 @@ const SPLIT_TYPES: &str = "forward_split,reverse_split";
 #[derive(Debug, Default, Clone)]
 pub struct CorporateActionsQuery {
     /// Underlying symbols to filter by; empty means no symbol restriction (all symbols in range).
-    pub symbols: Vec<String>,
+    pub symbols: Vec<SmolStr>,
     /// Inclusive lower bound on the action's effective date.
     pub start: Option<NaiveDate>,
     /// Inclusive upper bound on the action's effective date.
@@ -79,7 +80,7 @@ impl CorporateActionsQuery {
     pub fn symbols<I, S>(mut self, symbols: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<SmolStr>,
     {
         self.symbols = symbols.into_iter().map(Into::into).collect();
         self

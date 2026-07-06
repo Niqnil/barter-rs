@@ -63,7 +63,7 @@ use super::rest::AlpacaRestClient;
 
 /// Errors from Alpaca options API operations.
 ///
-/// Alias of the shared [`AlpacaRestError`](super::super::rest::AlpacaRestError): options requests
+/// Alias of the shared [`AlpacaRestError`](super::rest::AlpacaRestError): options requests
 /// have no failure modes beyond the common transport/protocol ones, so the single REST error type
 /// is reused rather than duplicated per endpoint family.
 pub use super::rest::AlpacaRestError as AlpacaOptionsError;

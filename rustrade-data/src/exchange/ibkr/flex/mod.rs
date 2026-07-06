@@ -83,6 +83,13 @@ pub enum IbkrFlexError {
     #[error("environment variable error: {0}")]
     EnvVar(String),
 
+    /// A supplied credential (the Flex `token` or `query_id`) is empty after trimming surrounding
+    /// whitespace. Raised by [`IbkrFlexConfig::new`] so a malformed credential fails observably at
+    /// construction, naming the offending field, rather than later as an opaque IBKR `1003`
+    /// "invalid token" after a live fetch.
+    #[error("invalid credential: {0}")]
+    InvalidCredential(String),
+
     /// Transport-level HTTP error (connection, timeout, or non-2xx status).
     ///
     /// The inner [`reqwest::Error`] **never carries the request URL.** The Flex token is
@@ -161,15 +168,23 @@ impl fmt::Debug for IbkrFlexConfig {
 impl IbkrFlexConfig {
     /// Create a config from an explicit Flex token and saved-query id.
     ///
-    /// `token` and `query_id` are stored **verbatim** — they are not trimmed or validated. Leading
-    /// or trailing whitespace will be sent in the `t=`/`q=` query parameters and rejected by IBKR
-    /// with a confusing `1003` "invalid token" at fetch time. Pass already-clean values, or use
-    /// [`from_env`](Self::from_env), which trims and rejects empty values.
-    pub fn new(token: impl Into<String>, query_id: impl Into<String>) -> Self {
-        Self {
-            token: token.into(),
-            query_id: query_id.into(),
-        }
+    /// Both values are **trimmed** of surrounding whitespace and rejected if empty (or empty after
+    /// trimming), so a malformed credential fails here — observably, naming the offending field —
+    /// rather than later as an opaque IBKR `1003` "invalid token" at fetch time. This mirrors the
+    /// validation [`from_env`](Self::from_env) performs, and matches the fallible-`new` shape used
+    /// by the other exchange clients in this crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IbkrFlexError::InvalidCredential`] if either value is empty after trimming.
+    pub fn new(
+        token: impl Into<String>,
+        query_id: impl Into<String>,
+    ) -> Result<Self, IbkrFlexError> {
+        Ok(Self {
+            token: Self::require_nonempty_trimmed("token", token.into())?,
+            query_id: Self::require_nonempty_trimmed("query_id", query_id.into())?,
+        })
     }
 
     /// Create a config from environment variables.
@@ -200,7 +215,31 @@ impl IbkrFlexConfig {
                 "IBKR_FLEX_QUERY_ID is set but empty".to_owned(),
             ));
         }
-        Ok(Self::new(token, query_id))
+        // Route through `new` so there is a single construction/validation path. The env-var checks
+        // above already produce variable-specific messages (`IBKR_FLEX_TOKEN is set but empty`),
+        // which are more actionable than `new`'s generic field-level error, so they run first; the
+        // re-trim/re-check inside `new` is then a cheap no-op.
+        Self::new(token, query_id)
+    }
+
+    /// Trim `value` and reject it if empty (or empty after trimming), tagging the error with
+    /// `field` so the failure names which credential was malformed. Allocates a new `String` only
+    /// when trimming actually removed characters.
+    fn require_nonempty_trimmed(
+        field: &'static str,
+        value: String,
+    ) -> Result<String, IbkrFlexError> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(IbkrFlexError::InvalidCredential(format!(
+                "{field} is empty after trimming whitespace"
+            )));
+        }
+        if trimmed.len() == value.len() {
+            Ok(value)
+        } else {
+            Ok(trimmed.to_owned())
+        }
     }
 }
 
@@ -706,7 +745,8 @@ mod tests {
 
     #[test]
     fn config_debug_redacts_token() {
-        let config = IbkrFlexConfig::new("super-secret-token", "987654");
+        let config =
+            IbkrFlexConfig::new("super-secret-token", "987654").expect("valid credentials");
         let debug = format!("{config:?}");
         assert!(
             !debug.contains("super-secret-token"),
@@ -717,13 +757,60 @@ mod tests {
 
     #[test]
     fn client_debug_hides_token() {
-        let client = IbkrFlexClient::new(IbkrFlexConfig::new("super-secret-token", "987654"))
-            .expect("HTTP client should build");
+        let client = IbkrFlexClient::new(
+            IbkrFlexConfig::new("super-secret-token", "987654").expect("valid credentials"),
+        )
+        .expect("HTTP client should build");
         let debug = format!("{client:?}");
         assert!(
             !debug.contains("super-secret-token"),
             "token must not leak via Debug"
         );
         assert!(debug.contains("987654"));
+    }
+
+    #[test]
+    fn new_rejects_empty_or_whitespace_token() {
+        for token in ["", "   ", "\t\n"] {
+            match IbkrFlexConfig::new(token, "987654") {
+                Err(IbkrFlexError::InvalidCredential(msg)) => assert!(
+                    msg.contains("token"),
+                    "error should name the `token` field, got: {msg}"
+                ),
+                other => panic!("expected InvalidCredential for token {token:?}, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn new_rejects_empty_or_whitespace_query_id() {
+        for query_id in ["", "   ", "\t\n"] {
+            match IbkrFlexConfig::new("valid-token", query_id) {
+                Err(IbkrFlexError::InvalidCredential(msg)) => assert!(
+                    msg.contains("query_id"),
+                    "error should name the `query_id` field, got: {msg}"
+                ),
+                other => {
+                    panic!("expected InvalidCredential for query_id {query_id:?}, got: {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_trims_surrounding_whitespace() {
+        let config = IbkrFlexConfig::new("  super-secret-token  ", "  987654  ")
+            .expect("padded-but-nonempty credentials are valid");
+        // Debug redacts the token, so `query_id` is the only observable window into the stored
+        // (trimmed) values. Confirm the surrounding whitespace was stripped before storage.
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("\"987654\""),
+            "query_id should be trimmed to `987654`, got: {debug}"
+        );
+        assert!(
+            !debug.contains("  987654"),
+            "surrounding whitespace should not survive into the stored query_id, got: {debug}"
+        );
     }
 }

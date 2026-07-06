@@ -51,7 +51,7 @@
                          conid="76792991" securityID="" securityIDType="" cusip="88160R101"
                          isin="US88160R1014" underlyingConid="" underlyingSymbol=""
                          issuer="TESLA INC" multiplier="" strike="" expiry="" putCall=""
-                         principalAdjustFactor="2" reportDate="2025-01-15" dateTime="2025-01-15;000000"
+                         principalAdjustFactor="1.0023" reportDate="2025-01-15" dateTime="2025-01-15;000000"
                          amount="0" proceeds="0" value="0" quantity="100"
                          fifoPnlRealized="0" mtmPnl="0" code="" type="FS" />
 
@@ -101,7 +101,7 @@
                          conid="22222223" securityID="" securityIDType="" cusip="987654321"
                          isin="US9876543210" underlyingConid="" underlyingSymbol=""
                          issuer="SPLIT CORP" multiplier="" strike="" expiry="" putCall=""
-                         principalAdjustFactor="0.1" reportDate="2025-01-15" dateTime="2025-01-15;000000"
+                         principalAdjustFactor="0.9977" reportDate="2025-01-15" dateTime="2025-01-15;000000"
                          amount="0" proceeds="0" value="0" quantity="-900"
                          fifoPnlRealized="0" mtmPnl="0" code="" type="RS" />
 
@@ -129,7 +129,7 @@
                       conid="76792991" securityID="" securityIDType="" cusip="88160R101"
                       isin="US88160R1014" underlyingConid="" underlyingSymbol="" underlyingSecurityID=""
                       issuer="TESLA INC" multiplier="" strike="" expiry=""
-                      putCall="" principalAdjustFactor="2" maturity="" issueDate=""
+                      putCall="" principalAdjustFactor="" maturity="" issueDate=""
                       underlyingCategory="" subCategory="" code="" />
 
         <SecurityInfo assetCategory="STK" symbol="GOOG" description="ALPHABET INC"

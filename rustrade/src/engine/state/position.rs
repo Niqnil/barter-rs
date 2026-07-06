@@ -695,8 +695,9 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
             SplitRoundingPolicy::Fractional => scaled_quantity,
         };
 
-        // Post-split fractional shares disposed (Convention A). Zero under `Fractional`, and for
-        // any split leaving a whole share count (all forward splits from a whole-share base).
+        // Post-split fractional shares disposed, expressed in POST-split share units (the scaled
+        // quantity minus the floored quantity). Zero under `Fractional`, and for any split leaving
+        // a whole share count (all forward splits from a whole-share base).
         let remainder = scaled_quantity - new_quantity;
 
         // Notional-preserving per-share basis: old_avg / ratio (≡ old_notional ÷ the *unfloored*
@@ -1950,7 +1951,7 @@ mod tests {
     #[test]
     fn test_apply_split_floor_to_zero() {
         // 1 share, reverse 1:10, Floor: floors to 0. remainder is the full scaled fraction 0.1
-        // (post-split units, Convention A) — NOT 1.0. apply_split only rescales self; the slot
+        // (post-split units) — NOT 1.0. apply_split only rescales self; the slot
         // removal + PositionExit is the handler's job (asserted at the handler/replica level).
         let mut p = split_position(Side::Buy, dec!(50), dec!(1), dec!(1), dec!(2));
         let result = p.apply_split(dec!(0.1), SplitRoundingPolicy::Floor, Some(dec!(500)));
@@ -1959,7 +1960,7 @@ mod tests {
         assert_eq!(
             result.remainder,
             dec!(0.1),
-            "remainder is post-split fractional shares (Convention A), not pre-split 1.0"
+            "remainder is post-split fractional shares, not pre-split 1.0"
         );
         assert_eq!(
             p.price_entry_average,
