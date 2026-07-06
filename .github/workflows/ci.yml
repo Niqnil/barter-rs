@@ -66,6 +66,15 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
+      # The `--all-features` debug build + link of the whole workspace (ethers,
+      # aws-lc-sys, ring, the exchange SDKs, ...) can exhaust the runner's disk
+      # ("No space left on device" during the mold link step). Reclaim ~12 GB of
+      # preinstalled toolchains we never use instead of adding a third-party action.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
       - name: Install mold linker
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
         with:
