@@ -7,7 +7,7 @@ use rust_decimal_macros::dec;
 use rustrade::{
     EngineEvent, Sequence, Timed,
     engine::{
-        Engine, EngineOutput, Processor,
+        Engine, EngineOutput, Processor, UnsupportedCorporateActionReason,
         action::{
             ActionOutput,
             generate_algo_orders::GenerateAlgoOrdersOutput,
@@ -1683,6 +1683,34 @@ fn test_corporate_action_replica_parity_floor_split() {
             .corporate_actions_processed
             .contains("BTCUSDT-reverse-1-2")
     );
+
+    // Output ordering: within a single position's processing a `SplitRemainder` is pushed BEFORE its
+    // paired `PositionExit`. "dust" (1 → floor(0.5) = 0) both disposes a 0.5 fractional sliver AND
+    // floors to zero, so it emits BOTH observables — the cash-in-lieu record must precede the close
+    // so a consumer can credit the CIL against a still-referenced position id before seeing it exit.
+    let dust_remainder_idx = outputs
+        .iter()
+        .position(|o| {
+            matches!(
+                o,
+                EngineOutput::SplitRemainder { position_id, .. } if *position_id == dust_id
+            )
+        })
+        .expect("dust must emit a SplitRemainder (0.5 disposed)");
+    let dust_exit_idx = outputs
+        .iter()
+        .position(|o| {
+            matches!(
+                o,
+                EngineOutput::PositionExit(exit) if exit.position_id == dust_id
+            )
+        })
+        .expect("dust floored to zero must emit a PositionExit");
+    assert!(
+        dust_remainder_idx < dust_exit_idx,
+        "SplitRemainder (idx {dust_remainder_idx}) must precede its paired PositionExit \
+         (idx {dust_exit_idx}) for the same floored-to-zero position"
+    );
 }
 
 /// End-to-end idempotency for `CorporateAction`: the identical event fired twice must apply the
@@ -2416,6 +2444,288 @@ fn test_corporate_action_option_non_standard_requires_identity_change() {
             "ratio {ratio}: equity id must be recorded"
         );
     }
+}
+
+/// A **non-standard** split where the affected option holds a **resting order** must NOT emit an
+/// `OpenOrdersAtSplit` for that option. The non-standard path signals a wrapper-side identity change
+/// and touches no option state — it never snapshots the option's resting orders (unlike the standard
+/// path, which price-adjusts them and reports them). Pins that the order snapshot is exclusive to the
+/// in-place-adjustment branch: a resting order on an option facing a reverse/fractional split is
+/// surfaced only via the identity-change signal, never as a now-meaningless `OpenOrdersAtSplit`.
+#[test]
+fn test_corporate_action_option_non_standard_no_open_orders_at_split() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+
+    // Long option position AND a resting order on the OPTION (idx0). The standard path WOULD surface
+    // this order via OpenOrdersAtSplit (see the adjusts-in-place test); the non-standard path must not.
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+    let order_event = account_event_order_response(0, 1, Side::Buy, 1.0, 0.0);
+    engine.process(order_event);
+
+    // 1:2 reverse split on the Spot underlying (idx1) — non-standard (OCC assigns a new identity).
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-1-2-reverse".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // No OpenOrdersAtSplit for the option (idx0): the non-standard path snapshots no option orders.
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OpenOrdersAtSplit { instrument, .. } if *instrument == InstrumentIndex(0)
+        )),
+        "a non-standard split must not emit OpenOrdersAtSplit for an option holding a resting order"
+    );
+
+    // Sanity: the identity-change signal IS emitted for the option, and no in-place adjustment.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OptionPositionsRequireIdentityChange { affected_options, .. }
+                if affected_options.contains(&InstrumentIndex(0))
+        )),
+        "the option must be listed for a wrapper-side identity change"
+    );
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::OptionPositionAdjustedForSplit { .. })),
+        "a non-standard split must not adjust the option in place"
+    );
+}
+
+/// Pre-validation rejects a standard split **atomically** when a held option position carries a
+/// non-integer contract count (state corruption): the engine emits
+/// `UnsupportedCorporateAction { reason: PositionStateInvalid }`, mutates **nothing** (option strike
+/// and the corrupt quantity are left as-is), and does **not** record the `id` — so the action stays
+/// retryable once the position is reconciled. Directly exercises the read-only pre-validation pass
+/// (`validate_corporate_action_split`) and the new rejection reason.
+#[test]
+fn test_corporate_action_pre_validation_rejects_non_integer_option_contracts() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+
+    // Open a normal (integer) option position, then PLANT corruption: force a fractional contract
+    // count directly on the position slot (a valid feed can never produce this).
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .position
+        .positions
+        .get_mut(&PositionId::NETTING)
+        .expect("option position should exist")
+        .quantity_abs = dec!(2.5);
+
+    // 2:1 STANDARD forward split on the Spot underlying (idx1) — would adjust the option in place,
+    // but pre-validation must reject it because idx0 holds 2.5 contracts.
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // Exactly the rejection observable, attributed to the splitting equity with the corruption reason.
+    let rejections: Vec<_> = outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::UnsupportedCorporateAction {
+                instrument, reason, ..
+            } => Some((*instrument, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejections.len(), 1, "expected exactly one rejection");
+    assert_eq!(rejections[0].0, InstrumentIndex(1));
+    assert_eq!(
+        rejections[0].1,
+        UnsupportedCorporateActionReason::PositionStateInvalid
+    );
+
+    // Atomic: nothing was mutated. Option strike still pre-split, corrupt quantity untouched.
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(
+        contract.strike,
+        dec!(50_000),
+        "option strike must be untouched"
+    );
+    assert_eq!(
+        option_state
+            .position
+            .positions
+            .get(&PositionId::NETTING)
+            .expect("option position should persist")
+            .quantity_abs,
+        dec!(2.5),
+        "the corrupt contract count must be left as-is (no partial rescale)"
+    );
+
+    // The `id` was NOT recorded ⇒ retryable once the position is reconciled.
+    let spot_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(1));
+    assert!(
+        !spot_state
+            .corporate_actions_processed
+            .contains("BTCUSD-2-1-split"),
+        "a rejected action must not record its id"
+    );
+
+    // No adjustment or CIL leaked through.
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OptionPositionAdjustedForSplit { .. }
+                | EngineOutput::SplitRemainder { .. }
+        )),
+        "a rejected split must emit no adjustment or remainder"
+    );
+}
+
+/// Pre-validation rejects a stock split **atomically** when rescaling an affected position would
+/// overflow `Decimal` (an extreme/adversarial quantity, not a transient condition): the engine
+/// emits `UnsupportedCorporateAction { reason: ArithmeticOverflow }`, mutates **nothing**, and does
+/// **not** record the `id`. The end-to-end handler counterpart to the unit-level
+/// `position::tests::test_apply_split_ratio_overflow_is_err_and_leaves_position_unmutated` —
+/// exercising the overflow branch of the read-only pre-validation pass
+/// (`validate_corporate_action_split`) through the full `process_corporate_action` path.
+#[test]
+fn test_corporate_action_pre_validation_rejects_arithmetic_overflow() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx); // Netting spot
+
+    // Mark 100, long 10 @ 100 on Spot instrument 0.
+    engine.process(market_event_trade(1, 0, dec!(100)));
+    open_position_via_trade(&mut engine, 0, 2, Side::Buy, dec!(100), dec!(10), "pos");
+
+    // PLANT an adversarial quantity a forward split cannot rescale without overflowing `Decimal`
+    // (`Decimal::MAX * 2` has no representation). A valid feed can never produce this.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .position
+        .positions
+        .values_mut()
+        .next()
+        .expect("spot position should exist")
+        .quantity_abs = Decimal::MAX;
+
+    // 2:1 STANDARD forward split on the same Spot instrument — pre-validation must reject it because
+    // rescaling the planted quantity overflows before any mutation.
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSDT-overflow-2-1".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // Exactly the rejection observable, attributed to the splitting equity with the overflow reason.
+    let rejections: Vec<_> = outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::UnsupportedCorporateAction {
+                instrument, reason, ..
+            } => Some((*instrument, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejections.len(), 1, "expected exactly one rejection");
+    assert_eq!(rejections[0].0, InstrumentIndex(0));
+    assert_eq!(
+        rejections[0].1,
+        UnsupportedCorporateActionReason::ArithmeticOverflow
+    );
+
+    // Atomic: nothing was mutated. The planted quantity and its untouched basis / high-water mark
+    // are all left exactly as they were (no partial rescale).
+    let instrument_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let position = instrument_state
+        .position
+        .positions
+        .values()
+        .next()
+        .expect("spot position should persist");
+    assert_eq!(
+        position.quantity_abs,
+        Decimal::MAX,
+        "the planted quantity must be left as-is (no partial rescale)"
+    );
+    assert_eq!(
+        position.price_entry_average,
+        dec!(100),
+        "basis must be untouched"
+    );
+    assert_eq!(
+        position.quantity_abs_max,
+        dec!(10),
+        "high-water mark must be untouched"
+    );
+
+    // The `id` was NOT recorded ⇒ retryable once the feed is corrected.
+    assert!(
+        !instrument_state
+            .corporate_actions_processed
+            .contains("BTCUSDT-overflow-2-1"),
+        "a rejected action must not record its id"
+    );
+
+    // No rescale, remainder, or open-orders snapshot leaked through the rejection.
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SplitRemainder { .. } | EngineOutput::OpenOrdersAtSplit { .. }
+        )),
+        "a rejected split must emit no remainder or open-orders snapshot"
+    );
 }
 
 /// Live engine vs audit-replica parity for a **standard** option adjustment: the replica

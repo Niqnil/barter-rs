@@ -15,7 +15,7 @@ use crate::{
         state::{
             EngineState,
             instrument::data::InstrumentDataState,
-            order::{in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
+            order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
             position::{PositionExited, PositionId, SplitRoundingPolicy},
             trading::TradingState,
         },
@@ -781,17 +781,46 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         let ratio: SplitRatio = *ratio;
         let ratio_decimal = ratio.get();
 
+        // Classify the split for OPTION handling ONCE, up front: `true` ⇒ adjust the options in
+        // place (standard whole-number forward split); `false` ⇒ signal a downstream identity
+        // change. Computed here so pre-validation (Step 2c) and application (Step 5) share the
+        // identical classification and can never drift.
+        let adjust_options_in_place = option_split_adjust_in_place(id, key, kind);
+
+        // Step 2c: PRE-VALIDATE the split against EVERY position it would mutate, WITHOUT mutating
+        // anything, BEFORE Step 3's output push and Step 4's mutation. A feed that would overflow
+        // `Decimal`, or a corrupted (non-integer) option contract count, rejects the action
+        // ATOMICALLY here — no position is partially rescaled and the `id` is NOT recorded
+        // (retryable once the blocking condition is resolved). Single-sourced with the audit replica
+        // via `InstrumentStates::validate_corporate_action_split`, so both reach the identical
+        // accept/reject decision by construction rather than by hand-mirrored vigilance.
+        if let Err(reason) = self.state.instruments.validate_corporate_action_split(
+            key,
+            ratio,
+            policy,
+            adjust_options_in_place,
+        ) {
+            warn!(
+                %id,
+                instrument = ?key,
+                ?reason,
+                "CorporateAction: split failed pre-validation (applying it would mutate positions \
+                 non-atomically) — emitting UnsupportedCorporateAction; id NOT recorded (retryable \
+                 once the blocking condition is resolved)."
+            );
+            outputs.push(EngineOutput::UnsupportedCorporateAction {
+                instrument: *key,
+                kind: kind.clone(),
+                reason,
+            });
+            return outputs;
+        }
+
         // Step 3: snapshot resting orders as an observable — do NOT cancel (a broker price-adjusts
-        // them, so an engine-side cancel would diverge from the broker).
-        let resting_orders: Vec<OpenOrderAtSplit> = instrument_state
-            .orders
-            .orders()
-            .map(|order| OpenOrderAtSplit {
-                cid: order.key.cid.clone(),
-                price_pre_split: order.price,
-                quantity_pre_split: order.quantity,
-            })
-            .collect();
+        // them, so an engine-side cancel would diverge from the broker). Re-borrow the instrument
+        // state: pre-validation above released the earlier borrow.
+        let instrument_state = self.state.instruments.instrument_index(key);
+        let resting_orders = snapshot_open_orders_at_split(&instrument_state.orders);
 
         // Last price for the eager `pnl_unrealised` recompute. None ⇒ 0 (+ warn); the split is
         // still applied and the `id` recorded (NOT retryable).
@@ -824,7 +853,27 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             };
 
             let side = position.side;
-            let result = position.apply_split(ratio_decimal, policy, last_price);
+            let result = match position.apply_split(ratio, policy, last_price) {
+                Ok(result) => result,
+                // Step 2c pre-validation already proved every equity position rescales without
+                // `Decimal` overflow, so an `Err` here is genuinely unreachable unless that
+                // invariant is broken; fail loudly rather than silently skip the split. (An
+                // extreme `last_price` does NOT reach this arm — the derived `pnl_unrealised`
+                // recompute degrades to 0 and is flagged on the `Ok` result, see below.)
+                Err(error) => {
+                    unreachable!("apply_split failed after pre-validation for {pos_id:?}: {error}")
+                }
+            };
+            if result.pnl_unrealised_overflowed {
+                warn!(
+                    %id,
+                    instrument = ?key,
+                    position_id = ?pos_id,
+                    "CorporateAction: post-split pnl_unrealised recompute overflowed Decimal \
+                     (extreme last price) — set to 0, corrected on the next market tick. The split \
+                     (quantity/basis) was still applied atomically."
+                );
+            }
             // Read the post-split basis AFTER apply_split overwrote it: quantity
             // and price then share the post-split era, valuing the disposed sliver with one
             // multiply and no ratio knowledge.
@@ -895,12 +944,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             )
         };
 
-        // Classify the split for OPTION handling up front (cheap; only `warn!`s on an unexpected
-        // classification). `true` ⇒ adjust the options in place (standard split); `false` ⇒ signal
-        // a downstream identity change. A future `#[non_exhaustive]` `SplitAdjustmentKind` variant
-        // is handled conservatively as non-standard and `warn!`-surfaced (observable beats silent)
-        // — see [`option_split_adjust_in_place`].
-        if option_split_adjust_in_place(id, key, kind) {
+        // Step 5 branches on the option classification computed up front in Step 2c — reused here
+        // (rather than recomputed) so application can never diverge from what pre-validation
+        // checked. `true` ⇒ adjust the options in place (standard split); `false` ⇒ signal a
+        // downstream identity change (see [`option_split_adjust_in_place`]).
+        if adjust_options_in_place {
             // STANDARD (whole-number forward split, OCC Art. VI §11): the option keeps its contract
             // identity, so the adjustment is purely mechanical (strike ÷ ratio; contracts × ratio
             // for held positions; multiplier/contract_size unchanged). Adjust the strike of EVERY
@@ -946,15 +994,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // positions — a broker price-adjusts them, so the engine cancels nothing, but the
                 // wrapper must know (and a backtest MockExchange would otherwise fill a
                 // now-stale-premium resting order against the post-split print).
-                let option_orders: Vec<OpenOrderAtSplit> = option_state
-                    .orders
-                    .orders()
-                    .map(|order| OpenOrderAtSplit {
-                        cid: order.key.cid.clone(),
-                        price_pre_split: order.price,
-                        quantity_pre_split: order.quantity,
-                    })
-                    .collect();
+                let option_orders = snapshot_open_orders_at_split(&option_state.orders);
 
                 // The OPTION's own last price (premium) for the eager pnl_unrealised recompute —
                 // not the underlying equity's. None ⇒ 0 (+ warn), mirroring the equity path: the
@@ -987,32 +1027,35 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                         );
                     };
 
-                    // Option contract counts are whole, and a standard split is a whole-number
-                    // ratio, so `integer × integer` stays integer with no fractional remainder —
-                    // the equity's `SplitRoundingPolicy` (a whole-share-lot concept) does not govern
-                    // option legs. Enforce that invariant on the INPUT with a hard `assert!` (NOT
-                    // `debug_assert!`, which compiles out in release): a non-integer contract count
-                    // is state corruption that must fail observably, never be silently floored
-                    // (under `Floor`) or silently carried (under `Fractional`). Asserting the input
-                    // — rather than the post-split `remainder` — is the meaningful check: under
-                    // `Fractional` the remainder is always zero by construction, so a remainder
-                    // assert would be vacuous. With the invariant upheld the disposal is provably
-                    // zero, so no SplitRemainder/CIL or floor-to-zero close is possible here.
-                    assert!(
-                        position.quantity_abs.fract().is_zero(),
-                        "option position {pos_id:?} holds a non-integer contract count {} before a \
-                         standard split — data corruption",
-                        position.quantity_abs,
-                    );
-                    // Pass `Fractional` explicitly, NOT the equity's `policy`: the assert above
-                    // guarantees an integer contract count so no remainder can arise (the policy is
-                    // a no-op here), and threading the equity's whole-share-lot policy into the
-                    // option path would falsely imply it governs option legs. It does not.
-                    position.apply_split(
-                        ratio_decimal,
+                    // Option contract counts are whole and a standard split is a whole-number ratio,
+                    // so `integer × integer` stays integer with no fractional remainder — the
+                    // equity's `SplitRoundingPolicy` (a whole-share-lot concept) does not govern
+                    // option legs, so pass `Fractional` explicitly (threading the equity policy here
+                    // would falsely imply it governs option legs). Step 2c pre-validation already
+                    // rejected any non-integer contract count (as `PositionStateInvalid`) and proved
+                    // this rescale cannot overflow, so no remainder or floor-to-zero can arise and
+                    // the `Err` arm is genuinely unreachable.
+                    let opt_result = match position.apply_split(
+                        ratio,
                         SplitRoundingPolicy::Fractional,
                         option_last_price,
-                    );
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => unreachable!(
+                            "option apply_split failed after pre-validation for {pos_id:?}: {error}"
+                        ),
+                    };
+                    if opt_result.pnl_unrealised_overflowed {
+                        warn!(
+                            %id,
+                            instrument = ?opt_key,
+                            position_id = ?pos_id,
+                            "CorporateAction: post-split option pnl_unrealised recompute overflowed \
+                             Decimal (extreme premium) — set to 0, corrected on the next market \
+                             tick. The option adjustment (contract count/basis) was still applied \
+                             atomically."
+                        );
+                    }
                     outputs.push(EngineOutput::OptionPositionAdjustedForSplit {
                         option_instrument: opt_key,
                         ratio,
@@ -1109,6 +1152,23 @@ fn option_split_adjust_in_place(
             false
         }
     }
+}
+
+/// Snapshot every resting order in `orders` into the [`OpenOrderAtSplit`] records carried by an
+/// [`EngineOutput::OpenOrdersAtSplit`] observable. Shared by the equity and held-option snapshot
+/// sites in `process_corporate_action` so both capture exactly the same fields — a split cancels
+/// nothing (a broker price-adjusts resting orders), it only reports them.
+fn snapshot_open_orders_at_split(
+    orders: &Orders<ExchangeIndex, InstrumentIndex>,
+) -> Vec<OpenOrderAtSplit> {
+    orders
+        .orders()
+        .map(|order| OpenOrderAtSplit {
+            cid: order.key.cid.clone(),
+            price_pre_split: order.price,
+            quantity_pre_split: order.quantity,
+        })
+        .collect()
 }
 
 impl<Clock, State, ExecutionTxs, Strategy, Risk> Engine<Clock, State, ExecutionTxs, Strategy, Risk>
@@ -1292,8 +1352,10 @@ pub enum EngineOutput<
 
     /// Observable signal that a [`CorporateAction`](crate::EngineEvent::CorporateAction) could
     /// **not** be processed. The action was **not** applied and its `id` was **not** recorded, so
-    /// it remains retryable once support is added (e.g. a corrected instrument key, or a future
-    /// library version). See [`UnsupportedCorporateActionReason`].
+    /// it remains retryable once the blocking condition is resolved — a corrected instrument key, a
+    /// future library version, or a reconciled position. Note some reasons are only retryable after
+    /// upstream state is fixed (not automatically on the next identical event); see the per-variant
+    /// notes on [`UnsupportedCorporateActionReason`].
     UnsupportedCorporateAction {
         /// The instrument the rejected action targeted.
         instrument: InstrumentKey,
@@ -1331,6 +1393,18 @@ pub enum UnsupportedCorporateActionReason {
     /// The corporate-action kind is not handled by this engine version (only stock splits are
     /// supported). Reachable once non-split kinds (dividends, spin-offs, …) are delivered.
     ActionKindNotSupported,
+    /// A position the split would mutate is in an invalid state that pre-validation rejected
+    /// **before any mutation** — specifically a **held option position with a non-integer contract
+    /// count** facing a standard (whole-number) split. Option contracts are whole; a fractional
+    /// count is state corruption, so the action is rejected atomically rather than silently floored
+    /// (under `Floor`) or carried (under `Fractional`). **Not** self-healing on retry: the
+    /// corrupted position must be reconciled before the action can succeed.
+    PositionStateInvalid,
+    /// The split arithmetic would overflow `Decimal` for at least one affected position — an
+    /// extreme ratio or quantity driving a rescaled field past `Decimal::MAX`. Detected by the
+    /// read-only pre-validation pass, so **no** position was mutated. Indicates a corrupt or
+    /// adversarial feed rather than a transient condition.
+    ArithmeticOverflow,
 }
 
 /// Output produced by the [`Engine`] updating from an [`TradingState`], used to construct

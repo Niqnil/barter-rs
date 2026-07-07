@@ -287,11 +287,43 @@ where
                 let CorporateActionKind::StockSplit { ratio } = kind else {
                     return;
                 };
-                // Unwrap the validated `SplitRatio` to its inner `Decimal` for the arithmetic
-                // below. Unlike the live handler — which keeps the typed `SplitRatio` (as `ratio`)
-                // to carry into its output records and names the inner value `ratio_decimal` — the
-                // replica emits no outputs, so it shadows `ratio` directly with the `Decimal`.
-                let ratio = ratio.get();
+                // Keep the typed `SplitRatio` (`ratio`) for `apply_split` and derive its inner
+                // `Decimal` (`ratio_decimal`) for the option strike division — mirroring the live
+                // handler's split of the two. (The live handler additionally carries the typed
+                // `SplitRatio` into output records; the replica emits none, so it needs the typed
+                // value only for `apply_split`.)
+                let ratio_decimal = ratio.get();
+
+                // Classify for option handling ONCE, up front (mirrors the live handler's Step 2c).
+                // `SplitAdjustmentKind` is `#[non_exhaustive]` (another crate) and cannot be matched
+                // exhaustively here; only a Standard split mutates option state in the replica —
+                // NonStandard, any future variant, and the unreachable None deliberately skip (the
+                // live handler emits only a signal output for them, which the replica — mirroring
+                // state, not outputs — has nothing to apply). Hoisted above the mutation so
+                // pre-validation and application share one classification and cannot drift.
+                let adjust_options_in_place =
+                    matches!(kind.split_kind(), Some(SplitAdjustmentKind::Standard));
+
+                // Pre-validate the whole action BEFORE mutating anything, mirroring the live
+                // handler's Step 2c: if the live engine rejected it (Decimal overflow or a corrupted
+                // option contract count) it recorded no `id` and mutated nothing, so the replica
+                // must do the same or state parity drifts. Single-sourced via the same
+                // `validate_corporate_action_split` the live handler calls, so both reach the
+                // identical accept/reject decision. No output emitted — the replica mirrors state,
+                // and the live engine already logged the rejection.
+                if self
+                    .replica_engine_state()
+                    .instruments
+                    .validate_corporate_action_split(
+                        &instrument,
+                        ratio,
+                        policy,
+                        adjust_options_in_place,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
 
                 // Last price for the eager `pnl_unrealised` recompute — same source the live
                 // handler reads. Identical here because the replica replayed the same market data.
@@ -319,7 +351,15 @@ where
                         .instruments
                         .instrument_index_mut(&instrument);
                     if let Some(position) = instrument_state.position.positions.get_mut(&pos_id) {
-                        position.apply_split(ratio, policy, last_price);
+                        // Pre-validated above ⇒ `Err` is unreachable; `unreachable!` mirrors the live
+                        // handler (a live panic here must be a replica panic too, or audit parity
+                        // drifts). The replica discards the `Ok` value, so `if let Err` suffices.
+                        if let Err(error) = position.apply_split(ratio, policy, last_price) {
+                            unreachable!(
+                                "replica: equity apply_split failed after pre-validation for \
+                                 {pos_id:?}: {error}"
+                            );
+                        }
                     }
                 }
 
@@ -358,16 +398,7 @@ where
                 // forward split, so no output-mirror is needed (unlike the equity Floor-to-zero
                 // close above). NON-standard splits leave options untouched (the live handler only
                 // emits a signal and mutates no option state), so this whole block is skipped.
-                //
-                // Classify via a `match` (not the old `if matches!`) to stay structurally symmetric
-                // with the live handler. `SplitAdjustmentKind` is `#[non_exhaustive]` (another
-                // crate) and cannot be matched exhaustively here; only a Standard split mutates
-                // option state in the replica — NonStandard, any future variant, and the unreachable
-                // None deliberately skip (the live handler emits only a signal output for them, which
-                // the replica, mirroring state not outputs, has nothing to apply). Warnings are
-                // intentionally omitted (see the block comment above).
-                let adjust_options_in_place =
-                    matches!(kind.split_kind(), Some(SplitAdjustmentKind::Standard));
+                // Branches on `adjust_options_in_place` computed up front (see the hoist above).
                 if adjust_options_in_place {
                     let (equity_base, equity_quote, equity_exchange) = {
                         let equity = self
@@ -413,7 +444,7 @@ where
                                  {opt_key:?}"
                             );
                         };
-                        contract.strike /= ratio;
+                        contract.strike /= ratio_decimal;
 
                         // Unheld option: strike correction is the whole job (silent registry fix),
                         // mirroring the live handler.
@@ -434,28 +465,24 @@ where
                                      positions map"
                                 );
                             };
-                            // Mirror the live handler's input invariant (see
-                            // `process_corporate_action`): option contract counts are whole, so a
-                            // non-integer count is corruption that must fail observably — not be
-                            // silently floored/carried. Keeps live and replica behaviour identical
-                            // (a live panic here must be a replica panic, or audit parity drifts).
-                            assert!(
-                                position.quantity_abs.fract().is_zero(),
-                                "replica: option position {pos_id:?} holds a non-integer contract \
-                                 count {} before a standard split — data corruption",
-                                position.quantity_abs,
-                            );
                             // Pass `Fractional` explicitly, NOT the equity `policy`, mirroring the
-                            // live handler (`process_corporate_action`): the assert above guarantees
-                            // an integer contract count so the policy is a no-op here, and the
-                            // equity's whole-share-lot policy does not govern option legs. Hard-coding
-                            // it keeps live and replica byte-identical even if a future
-                            // `SplitRoundingPolicy` variant were to differ on already-integer inputs.
-                            position.apply_split(
+                            // live handler (`process_corporate_action`): pre-validation already
+                            // rejected any non-integer contract count (as `PositionStateInvalid`), so
+                            // the policy is a no-op here and the equity's whole-share-lot policy does
+                            // not govern option legs. Pre-validated ⇒ `Err` is unreachable;
+                            // `unreachable!` mirrors the live handler (a live panic here must be a
+                            // replica panic too, or audit parity drifts). The replica discards the
+                            // `Ok` value, so `if let Err` suffices.
+                            if let Err(error) = position.apply_split(
                                 ratio,
                                 SplitRoundingPolicy::Fractional,
                                 option_last_price,
-                            );
+                            ) {
+                                unreachable!(
+                                    "replica: option apply_split failed after pre-validation for \
+                                     {pos_id:?}: {error}"
+                                );
+                            }
                         }
                     }
                 }

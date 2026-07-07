@@ -5,7 +5,10 @@ use crate::{EngineEvent, Timed};
 /// using market data, and analyzing the performance of these simulations.
 use crate::{
     backtest::{
-        aux_events::{AuxEventSource, NoAuxEvents, assert_aux_events_sorted},
+        aux_events::{
+            AuxEventSource, NoAuxEvents, assert_aux_corporate_action_effective_times,
+            assert_aux_events_sorted,
+        },
         market_data::BacktestMarketData,
         summary::{BacktestSummary, MultiBacktestSummary},
     },
@@ -77,7 +80,8 @@ pub struct BacktestArgsConstant<MarketData, SummaryInterval, State, AuxEvents = 
     /// Source of auxiliary (non-market) `EngineEvent`s to interleave with the market data in
     /// simulated-time order (e.g. corporate actions, contract expiries).
     ///
-    /// Defaults to [`NoAuxEvents`] (yields nothing), so existing backtests opt out at zero cost.
+    /// Defaults to [`NoAuxEvents`] (yields nothing), so existing backtests opt out at negligible
+    /// per-event overhead.
     /// Corporate actions are market facts shared across an entire strategy sweep, so they live on
     /// this shared constant and thread through [`run_backtests`] for free.
     pub aux_events: AuxEvents,
@@ -279,6 +283,12 @@ where
     // panic shared with `AuxEventsInMemory::new`; the aux set is handful-sized, so the O(n) scan is
     // immeasurable. See [`assert_aux_events_sorted`].
     assert_aux_events_sorted(&aux);
+    // Enforce the second `AuxEventSource` obligation: every injected `CorporateAction`'s
+    // `effective_time` must equal its wrapping `Timed::time`. A mismatch would order the action at
+    // one instant but apply it at another (a silent look-ahead / stale-stamp bug); the handler
+    // cannot see the wrapping `Timed`, so this pre-merge site is the only place to catch it. Hard
+    // panic, handful-sized scan. See [`assert_aux_corporate_action_effective_times`].
+    assert_aux_corporate_action_effective_times(&aux);
 
     // Seed the clock from the earliest of the first market event and the first aux event, so an aux
     // event scheduled before the first market tick still orders and stamps correctly.

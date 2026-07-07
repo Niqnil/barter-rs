@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// `System.feed_tx`; this trait is the backtest equivalent.
 ///
 /// The default implementation, [`NoAuxEvents`], yields nothing — existing backtests opt out at
-/// zero cost.
+/// negligible per-event overhead.
 ///
 /// # Caller obligations
 /// - [`aux_events`](Self::aux_events) MUST yield events sorted ascending by [`Timed::time`]. The
@@ -26,9 +26,10 @@ use std::sync::Arc;
 ///   [`Timed::time`] MUST equal the action's `effective_time`. These are two independent knobs: the
 ///   merge **positions** the event in the stream by `Timed::time`, while the handler advances the
 ///   [`HistoricalClock`](crate::engine::clock::HistoricalClock) to `effective_time` and stamps the
-///   adjustment there. A mismatch is silently honored — the action would be *ordered* at one instant
-///   but *take effect* at another — so the adjustment fires at the wrong simulated time. This is not
-///   enforced (the handler cannot see the wrapping `Timed`); keep them equal.
+///   adjustment there. A mismatch would *order* the action at one instant but make it *take effect*
+///   at another. The backtest harness **enforces** this pre-merge via
+///   [`assert_aux_corporate_action_effective_times`] (a hard panic naming the offending event) — the
+///   handler itself cannot see the wrapping `Timed`, so keep the two equal to pass the check.
 ///
 /// # Limitation — `ContractExpiry` does not advance the backtest clock
 /// [`EngineEvent::ContractExpiry`](crate::EngineEvent::ContractExpiry) carries no timestamp (unlike
@@ -55,8 +56,8 @@ pub trait AuxEventSource<
 /// Zero-size [`AuxEventSource`] that yields no events.
 ///
 /// The default `AuxEvents` type for [`BacktestArgsConstant`](super::BacktestArgsConstant), so a
-/// backtest that injects no corporate actions or expiries pays nothing — the two-way merge sees an
-/// empty aux side and reduces to the market stream unchanged.
+/// backtest that injects no corporate actions or expiries adds only negligible per-event overhead —
+/// the two-way merge sees an empty aux side and forwards the market stream.
 #[derive(Debug, Clone, Default)]
 pub struct NoAuxEvents;
 
@@ -97,6 +98,42 @@ pub(crate) fn assert_aux_events_sorted<MarketKind, ExchangeKey, AssetKey, Instru
             i + 1,
             w[1].time,
         );
+    }
+}
+
+/// Panic if any injected [`EngineEvent::CorporateAction`] carries an `effective_time` that differs
+/// from its wrapping [`Timed::time`] (the second [`AuxEventSource`] caller obligation).
+///
+/// The merge **positions** a corporate action in the stream by `Timed::time`, while the handler
+/// advances the [`HistoricalClock`](crate::engine::clock::HistoricalClock) to `effective_time` and
+/// stamps the adjustment there. If the two disagree the action is *ordered* at one instant but
+/// *takes effect* at another — a silent look-ahead / stale-stamp bug with no failure point in a
+/// release build. This enforces them equal at the same pre-merge site as
+/// [`assert_aux_events_sorted`] (a hard panic in all builds — the handler itself cannot see the
+/// wrapping `Timed`, so the harness is the only place this can be checked). The O(N) scan is
+/// negligible over the handful-sized aux set, and the message names the offending event so a failing
+/// source is debuggable without a rebuild.
+pub(crate) fn assert_aux_corporate_action_effective_times<
+    MarketKind,
+    ExchangeKey,
+    AssetKey,
+    InstrumentKey,
+>(
+    events: &[Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>],
+) {
+    for (i, event) in events.iter().enumerate() {
+        if let EngineEvent::CorporateAction {
+            id, effective_time, ..
+        } = &event.value
+            && *effective_time != event.time
+        {
+            panic!(
+                "AuxEventSource CorporateAction (id={id}) at events[{i}] must carry \
+                 effective_time == Timed::time; effective_time={effective_time:?} != \
+                 Timed::time={:?}",
+                event.time,
+            );
+        }
     }
 }
 
@@ -156,13 +193,34 @@ where
 #[allow(clippy::expect_used)] // Test code: panics on bad fixture input are acceptable
 mod tests {
     use super::*;
+    use crate::SplitRoundingPolicy;
     use crate::shutdown::Shutdown;
     use chrono::DateTime;
+    use rust_decimal::Decimal;
+    use rustrade_instrument::corporate_action::{CorporateActionKind, SplitRatio};
 
     fn at(secs: i64) -> Timed<EngineEvent> {
         Timed::new(
             EngineEvent::Shutdown(Shutdown),
             DateTime::from_timestamp(secs, 0).expect("valid timestamp"),
+        )
+    }
+
+    /// Build a `CorporateAction` whose `effective_time` and wrapping `Timed::time` can differ, to
+    /// exercise `assert_aux_corporate_action_effective_times`.
+    fn corp_action(effective_secs: i64, time_secs: i64) -> Timed<EngineEvent> {
+        Timed::new(
+            EngineEvent::CorporateAction {
+                id: "test-split".into(),
+                instrument: InstrumentIndex::new(0),
+                kind: CorporateActionKind::StockSplit {
+                    ratio: SplitRatio::new(Decimal::from(2)).expect("valid ratio"),
+                },
+                policy: SplitRoundingPolicy::Fractional,
+                effective_time: DateTime::from_timestamp(effective_secs, 0)
+                    .expect("valid timestamp"),
+            },
+            DateTime::from_timestamp(time_secs, 0).expect("valid timestamp"),
         )
     }
 
@@ -192,5 +250,30 @@ mod tests {
     fn aux_events_in_memory_new_rejects_unsorted() {
         // `AuxEventsInMemory::new` must delegate to the shared check rather than accept unsorted input.
         let _ = AuxEventsInMemory::<DataKind>::new(Arc::new(vec![at(2_000), at(1_000)]));
+    }
+
+    #[test]
+    fn assert_aux_corporate_action_effective_times_accepts_matching_times() {
+        // effective_time == Timed::time satisfies the contract; non-CorporateAction events (the
+        // trailing Shutdown) are ignored by the check. No panic.
+        assert_aux_corporate_action_effective_times::<
+            DataKind,
+            ExchangeIndex,
+            AssetIndex,
+            InstrumentIndex,
+        >(&[corp_action(1_000, 1_000), at(2_000)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "effective_time == Timed::time")]
+    fn assert_aux_corporate_action_effective_times_panics_on_mismatch() {
+        // A CorporateAction ordered at Timed::time=2000 but taking effect at 1000 is a silent
+        // look-ahead; the hard assert (all builds) must panic naming the offending event.
+        assert_aux_corporate_action_effective_times::<
+            DataKind,
+            ExchangeIndex,
+            AssetIndex,
+            InstrumentIndex,
+        >(&[corp_action(1_000, 2_000)]);
     }
 }

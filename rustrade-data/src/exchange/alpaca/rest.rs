@@ -66,6 +66,13 @@ pub enum AlpacaRestError {
     /// Invalid response format.
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+
+    /// The request could not be cloned for a retry — `reqwest` returns `None` from `try_clone`
+    /// only for streaming request bodies. Never occurs for the GET/query-string requests this
+    /// client issues today, but returned (not panicked) so a future streaming-body caller of the
+    /// shared retry helper recovers instead of aborting the task.
+    #[error("request body is not cloneable; cannot retry (streaming bodies are unsupported)")]
+    NotCloneable,
 }
 
 /// Authenticated Alpaca REST client.
@@ -180,6 +187,12 @@ impl AlpacaRestClient {
     ///
     /// The request must be cloneable (true for the query-string GET requests used here) so it can
     /// be re-sent across retries.
+    ///
+    /// # Errors
+    /// Returns [`AlpacaRestError::NotCloneable`] if the request carries a streaming body (`reqwest`
+    /// cannot clone it for a retry). This never happens for the GET requests this client issues, but
+    /// is surfaced as a recoverable `Err` — consistent with every other failure mode of this shared
+    /// helper — rather than a panic, so a future streaming-body caller can handle it.
     pub(crate) async fn request_with_retry<T>(
         &self,
         request: reqwest::RequestBuilder,
@@ -192,19 +205,16 @@ impl AlpacaRestClient {
         loop {
             attempts += 1;
 
-            // `try_clone` returns `None` only for streaming request bodies. This function is
-            // documented (and used) exclusively for GET/query-string requests, which always clone,
-            // so `None` is an unreachable programmer error — a caller passed a streaming-body
-            // request to a retry path that requires cloneability. Panic loudly (the most observable
-            // failure) rather than mislabel it as a server-side `InvalidResponse`. `request_with_retry`
-            // is `pub(crate)`, so every call site is internal and statically auditable; if it is ever
-            // widened to `pub`, return an `Err` here so external callers can recover instead of aborting.
-            #[allow(clippy::expect_used)]
-            let response = request
-                .try_clone()
-                .expect("request_with_retry requires a cloneable request (GET / no streaming body)")
-                .send()
-                .await?;
+            // `try_clone` returns `None` only for streaming request bodies. Every current caller
+            // passes a GET/query-string request (no body), so this always clones — but return a
+            // typed `Err` rather than panic: this shared retry helper already surfaces every other
+            // failure (rate limit, HTTP status, deserialisation) as an `AlpacaRestError`, and the
+            // function returns `Result`, so an added error branch is free and lets a future
+            // streaming-body caller recover instead of aborting the task.
+            let response = match request.try_clone() {
+                Some(request) => request.send().await?,
+                None => return Err(AlpacaRestError::NotCloneable),
+            };
 
             let status = response.status();
 

@@ -90,11 +90,20 @@ pub trait StockSplitSource {
     ///
     /// Every implementation MUST populate each descriptor's
     /// [`effective_date`](rustrade_instrument::corporate_action::CorporateAction::effective_date)
-    /// with the **market execution date** — the
-    /// calendar date on which the split takes effect on-exchange (shares outstanding adjust, the
-    /// price re-bases). It is **not** the declaration date, ex-date, or record date: those can
-    /// precede execution by days to weeks, and stamping the engine adjustment to one of them applies
-    /// the split early and silently corrupts backtest results.
+    /// with the **market execution date** — the calendar date on which the split takes effect
+    /// on-exchange: shares outstanding adjust and the price re-bases to the split-adjusted basis.
+    /// The field must be the date the adjustment actually *executes*, not merely when it was
+    /// announced or booked; stamping the engine adjustment to any *earlier* date applies the split
+    /// ahead of the market and silently corrupts backtest results.
+    ///
+    /// For a **stock split** that execution date is the **ex-split date**. Unlike a cash dividend —
+    /// whose ex-date deliberately *precedes* payment — a split's ex-date and execution date coincide:
+    /// on the ex-date the shares already trade on the new, split-adjusted basis. So mapping a
+    /// provider's ex-date onto `effective_date` is correct *for splits* (Alpaca's adapter does
+    /// exactly this, documenting the choice and pinning it with a fixture test). What the field must
+    /// **not** be is a *declaration*/announcement date, a *record* date, or a *payable*/settlement
+    /// date: those can fall days to weeks off the ex-date and would apply the split at the wrong
+    /// instant.
     ///
     /// Providers expose this date under different field names (e.g. Massive's `execution_date`), and
     /// some surface several candidate dates per split. Which provider field satisfies the

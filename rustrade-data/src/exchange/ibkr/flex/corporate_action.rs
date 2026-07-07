@@ -27,6 +27,7 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use smol_str::SmolStr;
+use tracing::warn;
 
 use super::{IbkrFlexError, nonempty};
 
@@ -60,7 +61,11 @@ pub struct IbkrFlexCorporateAction {
     ///
     /// This is an **account-scoped delta**, not a market-wide quantity, and is **not** a split
     /// ratio: deriving a ratio from `new_qty / old_qty` would require the pre-event holding, which
-    /// this library does not track. An absent or empty `quantity` is surfaced as `0`.
+    /// this library does not track. An absent or empty `quantity` is surfaced as `0`; a **malformed**
+    /// (present-but-unparseable) `quantity` is also coerced to `0` but emits a `warn!` first, since
+    /// `0` here is a valid-looking "no share change" sentinel that would otherwise silently mask a
+    /// real reorg quantity (unlike the other fields, which faithfully surface a malformed value as
+    /// `None`).
     pub quantity_delta: Decimal,
     /// Free-text action description (`actionDescription`), when present.
     ///
@@ -257,6 +262,10 @@ impl RawCorporateAction {
             .or_else(|| nonempty(self.action_type_attr))
             .unwrap_or_default();
 
+        // Computed BEFORE the struct literal so the warn can still reference `symbol` (which the
+        // literal moves). See `quantity_delta_or_warn` for why this field warns and the others do not.
+        let quantity_delta = quantity_delta_or_warn(self.quantity, self.symbol.as_deref());
+
         IbkrFlexCorporateAction {
             account_id: opt_smol(self.account_id),
             symbol: opt_smol(self.symbol),
@@ -265,7 +274,7 @@ impl RawCorporateAction {
             cusip: opt_smol(self.cusip),
             asset_category: opt_smol(self.asset_category),
             action_type: IbkrReorgType::from(code.as_str()),
-            quantity_delta: opt_decimal(self.quantity).unwrap_or(Decimal::ZERO),
+            quantity_delta,
             action_description: opt_smol(self.action_description),
             report_date: opt_date(self.report_date),
             date_time: opt_smol(self.date_time),
@@ -286,6 +295,31 @@ fn opt_smol(value: Option<String>) -> Option<SmolStr> {
 /// Parse a non-empty attribute as a [`Decimal`], yielding `None` if absent, empty, or malformed.
 fn opt_decimal(value: Option<String>) -> Option<Decimal> {
     nonempty(value).and_then(|v| v.parse().ok())
+}
+
+/// Parse the `quantity` attribute into `quantity_delta`, coercing a malformed value to
+/// `Decimal::ZERO` but **warning first**.
+///
+/// Every other field in this module is deliberately faithful — an absent, empty, or malformed
+/// attribute surfaces as `None`, so a downstream reader can tell "not reported" from "reported as
+/// X". `quantity_delta` is the one non-optional coercion: a malformed value collapses to `0`, which
+/// is a *valid-looking* "no share change" sentinel indistinguishable from a genuine zero. That
+/// silent collapse could mask a real reorg quantity, so a present-but-unparseable value is surfaced
+/// as an observable `warn!` (absent/empty stays a quiet `0` — a genuine "not reported", not a parse
+/// failure).
+fn quantity_delta_or_warn(value: Option<String>, symbol: Option<&str>) -> Decimal {
+    match nonempty(value) {
+        Some(raw) => raw.parse().unwrap_or_else(|_| {
+            warn!(
+                quantity = %raw,
+                symbol = ?symbol,
+                "IBKR flex: malformed corporate-action quantity coerced to 0 (a valid-looking \
+                 'no share change' sentinel) — a real reorg quantity may be silently lost."
+            );
+            Decimal::ZERO
+        }),
+        None => Decimal::ZERO,
+    }
 }
 
 /// Best-effort parse a `YYYY-MM-DD` attribute, yielding `None` if absent, empty, or malformed.

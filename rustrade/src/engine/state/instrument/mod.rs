@@ -1,8 +1,11 @@
 use crate::{
-    engine::state::{
-        instrument::{data::InstrumentDataState, filter::InstrumentFilter},
-        order::{Orders, manager::OrderManager},
-        position::{OmsMode, PositionExited, PositionManager},
+    engine::{
+        UnsupportedCorporateActionReason,
+        state::{
+            instrument::{data::InstrumentDataState, filter::InstrumentFilter},
+            order::{Orders, manager::OrderManager},
+            position::{OmsMode, PositionExited, PositionManager, SplitRoundingPolicy},
+        },
     },
     statistic::summary::instrument::TearSheetGenerator,
 };
@@ -23,6 +26,7 @@ use rustrade_execution::{
 use rustrade_instrument::{
     Keyed,
     asset::{AssetIndex, name::AssetNameExchange},
+    corporate_action::SplitRatio,
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{
@@ -105,6 +109,72 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
         self.0
             .get_mut(key)
             .unwrap_or_else(|| panic!("InstrumentStates does not contain: {key}"))
+    }
+
+    /// Pre-validate a stock split against **every** position it would mutate, **without mutating
+    /// anything**, so `process_corporate_action` (and its audit replica) can reject an
+    /// un-applicable action *atomically* — no partial rescaling on an overflowing feed or a
+    /// corrupted option contract count.
+    ///
+    /// Single-sourced so the live handler and the audit replica reach the identical decision by
+    /// construction (not by hand-mirrored vigilance). Checks, in the same order the handler mutates:
+    /// - every open position on the splitting `equity` can be rescaled without `Decimal` overflow
+    ///   (equity quantities may legitimately be fractional, so there is no integer check here);
+    /// - iff `adjust_options_in_place` (a standard, whole-number forward split), every **held**
+    ///   option position on the same underlying holds an **integer** contract count (a non-integer
+    ///   count is state corruption) and can be rescaled without overflow.
+    ///
+    /// Returns the [`UnsupportedCorporateActionReason`] the caller should surface on the first
+    /// failure, or `Ok(())` when the whole action can be applied. Non-standard splits touch no
+    /// option state, so only the equity positions are validated for them.
+    pub(crate) fn validate_corporate_action_split(
+        &self,
+        equity: &InstrumentIndex,
+        ratio: SplitRatio,
+        policy: SplitRoundingPolicy,
+        adjust_options_in_place: bool,
+    ) -> Result<(), UnsupportedCorporateActionReason> {
+        // Equity positions: overflow only. A fractional equity quantity is legitimate (fractional-
+        // share brokers), so there is no integer invariant to check here — unlike option contracts.
+        let equity_state = self.instrument_index(equity);
+        for position in equity_state.position.positions.values() {
+            position
+                .validate_split(ratio, policy)
+                .map_err(|_overflow| UnsupportedCorporateActionReason::ArithmeticOverflow)?;
+        }
+
+        // Non-standard splits leave all option state untouched (the handler only emits a signal),
+        // so there is nothing further to validate.
+        if !adjust_options_in_place {
+            return Ok(());
+        }
+
+        // Standard split: mirror the handler's held-option scan (base + quote + exchange identity)
+        // and enforce the integer-contract invariant + overflow-safety on every held option
+        // position BEFORE the handler mutates any of them.
+        let base = equity_state.instrument.underlying.base;
+        let quote = equity_state.instrument.underlying.quote;
+        let exchange = equity_state.instrument.exchange;
+        for option_state in self
+            .0
+            .values()
+            .filter(|state| state.is_option_on_underlying(&base, &quote, &exchange))
+        {
+            for position in option_state.position.positions.values() {
+                // Option contract counts are whole; a non-integer count is corruption the handler
+                // must not silently floor/carry. Surfaced as an observable rejection, not a panic.
+                if !position.quantity_abs.fract().is_zero() {
+                    return Err(UnsupportedCorporateActionReason::PositionStateInvalid);
+                }
+                // Held option legs are rescaled with `Fractional` (the integer invariant above makes
+                // the equity `policy` a no-op), matching the handler's per-option `apply_split`.
+                position
+                    .validate_split(ratio, SplitRoundingPolicy::Fractional)
+                    .map_err(|_overflow| UnsupportedCorporateActionReason::ArithmeticOverflow)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Return an `Iterator` of references to `InstrumentState`s being tracked, optionally filtered

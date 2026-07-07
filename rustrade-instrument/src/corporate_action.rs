@@ -344,9 +344,15 @@ mod tests {
             CorporateActionKind::stock_split(Decimal::ZERO, Decimal::from(5)),
             None
         );
-        // Single negative component.
+        // Single negative component — `split_to` negative alone.
         assert_eq!(
             CorporateActionKind::stock_split(Decimal::from(-2), Decimal::from(1)),
+            None
+        );
+        // Single negative component — `split_from` negative alone (the symmetric case: a positive
+        // `split_to` over a negative `split_from` yields a negative quotient the guard also rejects).
+        assert_eq!(
+            CorporateActionKind::stock_split(Decimal::from(2), Decimal::from(-1)),
             None
         );
         // Both-negative components: -2 / -1 = 2 is positive and would slip past a quotient-only

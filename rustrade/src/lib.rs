@@ -225,6 +225,18 @@ pub enum EngineEvent<
     ///   `OptionPositionsRequireIdentityChange` for any option positions on the underlying —
     ///   misleading noise for what changed nothing.
     ///
+    /// # Backtest ordering caveat — inject chronologically
+    /// The no-look-ahead guarantee holds only if actions are injected in **chronological order**.
+    /// The backtest [`HistoricalClock`](engine::clock::HistoricalClock) advances *monotonically* and
+    /// never regresses: it moves to `effective_time` only when that is at or after the clock's
+    /// current time. An action injected **out of order** — with an `effective_time` earlier than an
+    /// already-processed event — is still **applied**, but its outputs (and any folded
+    /// [`PositionExit`](engine::state::position::PositionExited)) are stamped at the clock's
+    /// **current** time, not the earlier `effective_time`. The
+    /// [`AuxEventSource`](backtest::aux_events::AuxEventSource) contract already requires ascending
+    /// `Timed::time` (enforced pre-merge by the backtest harness), so this only bites a caller that
+    /// hand-drives the engine or feeds events off-timeline.
+    ///
     /// # Missing last price
     /// Unlike [`ContractExpiry`](Self::ContractExpiry) — which bails and is retryable when the
     /// underlying price is unavailable — a split needs no price for its quantity/basis arithmetic.

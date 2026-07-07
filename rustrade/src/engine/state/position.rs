@@ -4,9 +4,12 @@ use indexmap::IndexMap;
 use rust_decimal::Decimal;
 pub use rustrade_execution::order::id::PositionId;
 use rustrade_execution::trade::{AssetFees, Trade, TradeId};
-use rustrade_instrument::{Side, asset::AssetIndex, instrument::InstrumentIndex};
+use rustrade_instrument::{
+    Side, asset::AssetIndex, corporate_action::SplitRatio, instrument::InstrumentIndex,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use thiserror::Error;
 use tracing::error;
 
 /// Order Management System mode governing how positions are tracked.
@@ -65,6 +68,50 @@ pub struct SplitResult {
     /// `price_entry_average` *after* [`Position::apply_split`] returns) to obtain the cost basis
     /// of the disposed sliver.
     pub remainder: Decimal,
+
+    /// `true` iff the eager post-split `pnl_unrealised` recompute overflowed `Decimal` and was
+    /// set to `0` instead of panicking.
+    ///
+    /// The split itself (`quantity_abs` / `price_entry_average` / `quantity_abs_max`) is **always**
+    /// applied — this flags only that the derived, already-approximate `pnl_unrealised` snapshot
+    /// (see [`Position::apply_split`]'s `last_price` docs) could not be represented from an extreme
+    /// `last_price` and was zeroed, exactly as when no `last_price` is available. It self-corrects
+    /// on the next market tick. The caller (handler) should emit a `warn!`; it is **never** a reason
+    /// to reject or retry the split. `#[serde(default)]` keeps this forward-compatible for any
+    /// downstream consumer that persists a `SplitResult` directly (the engine itself does not
+    /// persist it); default `false` = no overflow.
+    #[serde(default)]
+    pub pnl_unrealised_overflowed: bool,
+}
+
+/// Error from [`Position::apply_split`] / [`Position::validate_split`].
+///
+/// The ratio is a [`SplitRatio`] (always `> 0`), so a degenerate ratio is unconstructible — the
+/// only remaining failure is `Decimal` **overflow** when an extreme ratio or quantity drives a
+/// rescaled value past `Decimal::MAX`. [`Position::apply_split`] computes every rescaled field
+/// *before* committing any, so an `Err` leaves the [`Position`] **unmutated** (all-or-nothing).
+///
+/// `#[non_exhaustive]`: further split-failure causes can be added without breaking downstream
+/// exhaustive matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum SplitError {
+    /// The split arithmetic overflowed `Decimal` — one of `quantity_abs × ratio`,
+    /// `price_entry_average ÷ ratio`, or `quantity_abs_max × ratio` exceeded `Decimal::MAX`. The
+    /// [`Position`] is left unmutated; the caller should surface this as an observable failure
+    /// (the feed produced an unrepresentable ratio/quantity) rather than proceed.
+    #[error("split arithmetic overflowed Decimal (ratio or quantity too large to represent)")]
+    Overflow,
+}
+
+/// The rescaled field values a split produces, computed by [`Position::compute_split`] without
+/// mutating the position — committed by [`Position::apply_split`], discarded by
+/// [`Position::validate_split`].
+struct SplitComputed {
+    quantity_abs: Decimal,
+    price_entry_average: Decimal,
+    quantity_abs_max: Decimal,
+    remainder: Decimal,
 }
 
 /// Manages open positions for a single instrument.
@@ -581,6 +628,25 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         );
     }
 
+    /// Checked, non-mutating twin of [`update_pnl_unrealised`](Self::update_pnl_unrealised):
+    /// computes the unrealised PnL at `price`, returning `None` if the `Decimal` arithmetic
+    /// overflows instead of panicking.
+    ///
+    /// Used by [`apply_split`](Self::apply_split) to degrade the eager post-split `pnl_unrealised`
+    /// recompute to `0` on an extreme `last_price` rather than panic mid-way through an atomic
+    /// multi-position corporate-action adjustment. See [`checked_calculate_pnl_unrealised`].
+    fn checked_pnl_unrealised(&self, price: Decimal) -> Option<Decimal> {
+        checked_calculate_pnl_unrealised(
+            self.side,
+            self.price_entry_average,
+            self.quantity_abs,
+            self.quantity_abs_max,
+            self.fees_enter.fees,
+            price,
+            self.contract_size,
+        )
+    }
+
     /// Updates the [`Position`] `pnl_realised` from a closed portion of the [`Position`] quantity.
     pub fn update_pnl_realised(
         &mut self,
@@ -609,8 +675,10 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// # What is rescaled
     /// - `quantity_abs ×= ratio`, then floored under [`SplitRoundingPolicy::Floor`] only.
     /// - `price_entry_average = old_avg / ratio` — the true split-adjusted per-share basis.
-    ///   This is **notional-preserving** (`new_qty_unfloored × new_avg == old_qty × old_avg`)
-    ///   and is deliberately **not** `notional / floored_qty`, which would spread the disposed
+    ///   This is **notional-preserving** (`new_qty_unfloored × new_avg ≈ old_qty × old_avg`, exact
+    ///   up to `Decimal`'s 28-significant-digit precision — bit-exact for terminating quotients,
+    ///   within rounding for non-terminating ones such as any 1-for-3 or 1-for-7 reverse split) and
+    ///   is deliberately **not** `notional / floored_qty`, which would spread the disposed
     ///   fraction's value back into the surviving shares and inflate cost basis.
     /// - `quantity_abs_max ×= ratio`, **unfloored even under `Floor`**. It is the high-water
     ///   mark used solely as the denominator of the exit-fee proportion
@@ -627,6 +695,14 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// in which a risk check between the split and the next tick would read a stale pre-split
     /// value. `pnl_unrealised` is **never** scaled by `ratio` (that would assume the price moved
     /// exactly as the split predicted).
+    ///
+    /// An extreme `last_price` whose recompute would overflow `Decimal` is treated the **same** as
+    /// `None`: `pnl_unrealised` is set to `0`, [`SplitResult::pnl_unrealised_overflowed`] is set,
+    /// and the split still applies atomically. It is **never** turned into an `Err` or a panic — the
+    /// quantity/basis rescale is already committed and must stay whole (a panic here would defeat
+    /// the whole-action atomicity the engine's pre-validation guarantees; a caught panic on retry
+    /// could double-apply a partially-split hedging book). Only the ratio-driven fields can fail the
+    /// call (see `# Errors`); the derived `pnl_unrealised` degrades gracefully.
     ///
     /// ## The immediate post-split `pnl_unrealised` is approximate — do not use it for risk checks
     /// The recompute pairs `last_price` with the **post-split** basis. In live trading a split is
@@ -647,10 +723,14 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// split until the next real tick arrives.
     ///
     /// # Return value & caller obligations
-    /// Returns [`SplitResult`] whose `remainder` is the post-split fractional shares disposed
-    /// (`0` under `Fractional` / forward splits). The caller (handler) should emit it as an
-    /// observable cash-in-lieu output; **this method writes no balances** (crediting CIL from
-    /// inside the engine would double-count in live and bypass the mock exchange in backtest).
+    /// Returns `Ok(`[`SplitResult`]`)` whose `remainder` is the post-split fractional shares
+    /// disposed — `0` under [`Fractional`](SplitRoundingPolicy::Fractional), and for any split that
+    /// leaves a whole share count (e.g. every forward split applied to a *whole-share* position). It
+    /// can be **non-zero** for a forward split under [`Floor`](SplitRoundingPolicy::Floor) when the
+    /// starting `quantity_abs` is itself fractional (e.g. 10.3 shares, 2-for-1 → 20.6, floored to
+    /// 20, remainder 0.6). The caller (handler) should emit it as an observable cash-in-lieu output;
+    /// **this method writes no balances** (crediting CIL from inside the engine would double-count
+    /// in live and bypass the mock exchange in backtest).
     ///
     /// **Floor whole-position disposal:** under `Floor` a reverse split can round `quantity_abs`
     /// to `0` (e.g. 1 share, 1:10). When that happens this method still only rescales `self` and
@@ -670,52 +750,123 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// + pnl_realised` is not a faithful internal ledger across a `Floor` reverse split — only the
     /// wrapper, reconciling `remainder` against broker cash, closes that gap.
     ///
-    /// # Panics
-    /// Panics if `ratio` is not strictly positive (zero or negative). `ratio = split_to / split_from`,
-    /// both positive by definition. A zero ratio would panic in `Decimal` division regardless, but a
-    /// negative ratio divides silently and would corrupt `price_entry_average` / `quantity_abs_max`
-    /// (negative basis / high-water mark), so it is rejected eagerly here — in release builds too.
+    /// # Ratio validity — a type-level guarantee, not a runtime check
+    /// `ratio` is a [`SplitRatio`], so it is strictly positive (`> 0`) *by construction* — the
+    /// degenerate-ratio failure mode is eliminated through the type system, not re-checked here.
+    /// (A validated `SplitRatio` is what `CorporateActionKind::stock_split` and the
+    /// `EngineEvent::CorporateAction` handler already thread through, so callers always hold one.)
+    ///
+    /// # Errors
+    /// Returns [`SplitError::Overflow`] if the split arithmetic overflows `Decimal` — an extreme
+    /// ratio or quantity driving `quantity_abs × ratio`, `price_entry_average ÷ ratio`, or
+    /// `quantity_abs_max × ratio` past `Decimal::MAX`. All three are computed **before** any field
+    /// is written, so on `Err` the [`Position`] is left **unmutated** and the caller can reject the
+    /// action atomically (see [`Position::validate_split`] to pre-validate a batch of positions).
     pub fn apply_split(
         &mut self,
-        ratio: Decimal,
+        ratio: SplitRatio,
         policy: SplitRoundingPolicy,
         last_price: Option<Decimal>,
-    ) -> SplitResult {
-        // Hard assert (not `debug_assert!`): `ratio` is caller-supplied external data, and a negative
-        // value would silently corrupt state in release rather than panic. Observable failure > silent.
-        assert!(
-            ratio > Decimal::ZERO,
-            "split ratio must be strictly positive (split_to / split_from), got {ratio}"
-        );
+    ) -> Result<SplitResult, SplitError> {
+        // `ratio` is a `SplitRatio` (`> 0` by construction), so no runtime sign check is needed.
+        // Compute the rescaled fields first; an overflow returns `Err` with `self` untouched.
+        let computed = self.compute_split(ratio.get(), policy)?;
 
+        // All arithmetic succeeded — commit atomically.
+        self.price_entry_average = computed.price_entry_average;
+        self.quantity_abs = computed.quantity_abs;
+        // High-water mark scales UNFLOORED even under Floor (see `compute_split`).
+        self.quantity_abs_max = computed.quantity_abs_max;
+
+        // Eagerly recompute unrealised PnL from the supplied price so a risk check between the
+        // split and the next market tick never reads a stale pre-split value. `None` (no market
+        // data yet) ⇒ 0. An extreme `last_price` whose recompute overflows `Decimal` ALSO ⇒ 0
+        // (flagged on the result) rather than a panic: the split (quantity/basis) is already
+        // committed and must stay atomic, and `pnl_unrealised` is a derived, self-correcting
+        // display value — panicking here would defeat the whole-action atomicity the engine's
+        // pre-validation guarantees (a mid-loop panic could leave a hedging book half-split and
+        // double-apply on retry). It self-corrects on the next market tick.
+        let pnl_unrealised_overflowed = match last_price {
+            Some(price) => match self.checked_pnl_unrealised(price) {
+                Some(pnl) => {
+                    self.pnl_unrealised = pnl;
+                    false
+                }
+                None => {
+                    self.pnl_unrealised = Decimal::ZERO;
+                    true
+                }
+            },
+            None => {
+                self.pnl_unrealised = Decimal::ZERO;
+                false
+            }
+        };
+
+        Ok(SplitResult {
+            remainder: computed.remainder,
+            pnl_unrealised_overflowed,
+        })
+    }
+
+    /// Validate that [`apply_split`](Self::apply_split) would succeed for this position **without
+    /// mutating it**, returning [`SplitError::Overflow`] iff the split arithmetic would overflow
+    /// `Decimal`.
+    ///
+    /// The engine calls this over **every** position an action affects *before* mutating any, so a
+    /// corporate action applies to the whole instrument atomically or not at all — an overflowing
+    /// feed can never leave a subset of positions rescaled.
+    pub fn validate_split(
+        &self,
+        ratio: SplitRatio,
+        policy: SplitRoundingPolicy,
+    ) -> Result<(), SplitError> {
+        self.compute_split(ratio.get(), policy).map(drop)
+    }
+
+    /// Pure split arithmetic — the single source of the rescaling math, shared by
+    /// [`apply_split`](Self::apply_split) (which commits it) and
+    /// [`validate_split`](Self::validate_split) (which discards it). Computes every rescaled field
+    /// with **checked** `Decimal` arithmetic and mutates nothing; returns [`SplitError::Overflow`]
+    /// if any product/quotient exceeds `Decimal::MAX`.
+    fn compute_split(
+        &self,
+        ratio: Decimal,
+        policy: SplitRoundingPolicy,
+    ) -> Result<SplitComputed, SplitError> {
         // Scaled (unfloored) quantity on the new share scale.
-        let scaled_quantity = self.quantity_abs * ratio;
-        let new_quantity = match policy {
+        let scaled_quantity = self
+            .quantity_abs
+            .checked_mul(ratio)
+            .ok_or(SplitError::Overflow)?;
+        let quantity_abs = match policy {
             SplitRoundingPolicy::Floor => scaled_quantity.floor(),
             SplitRoundingPolicy::Fractional => scaled_quantity,
         };
 
-        // Post-split fractional shares disposed, expressed in POST-split share units (the scaled
-        // quantity minus the floored quantity). Zero under `Fractional`, and for any split leaving
-        // a whole share count (all forward splits from a whole-share base).
-        let remainder = scaled_quantity - new_quantity;
+        // Post-split fractional shares disposed, in POST-split units (scaled minus floored).
+        // `scaled_quantity >= quantity_abs` (floor never increases it; equal under `Fractional`),
+        // so this subtraction is a value in `[0, 1)` and cannot overflow.
+        let remainder = scaled_quantity - quantity_abs;
 
-        // Notional-preserving per-share basis: old_avg / ratio (≡ old_notional ÷ the *unfloored*
-        // scaled quantity), independent of rounding.
-        self.price_entry_average /= ratio;
-        self.quantity_abs = new_quantity;
-        // High-water mark scales UNFLOORED even under Floor — it is a proportion denominator
+        // Notional-preserving per-share basis: old_avg / ratio, independent of rounding.
+        let price_entry_average = self
+            .price_entry_average
+            .checked_div(ratio)
+            .ok_or(SplitError::Overflow)?;
+        // High-water mark scales UNFLOORED even under Floor — a proportion denominator
         // (exit fees, returns), not a share lot.
-        self.quantity_abs_max *= ratio;
+        let quantity_abs_max = self
+            .quantity_abs_max
+            .checked_mul(ratio)
+            .ok_or(SplitError::Overflow)?;
 
-        // Eagerly recompute unrealised PnL from the supplied price so a risk check between the
-        // split and the next market tick never reads a stale pre-split value. None ⇒ 0.
-        match last_price {
-            Some(price) => self.update_pnl_unrealised(price),
-            None => self.pnl_unrealised = Decimal::ZERO,
-        }
-
-        SplitResult { remainder }
+        Ok(SplitComputed {
+            quantity_abs,
+            price_entry_average,
+            quantity_abs_max,
+            remainder,
+        })
     }
 }
 
@@ -874,6 +1025,53 @@ pub fn calculate_pnl_unrealised(
     }
 }
 
+/// Checked twin of [`calculate_pnl_unrealised`]: identical math with `checked_*` `Decimal`
+/// arithmetic, returning `None` on overflow instead of panicking.
+///
+/// Used only on the corporate-action split path ([`Position::apply_split`]), where an extreme feed
+/// `last_price` must degrade the derived `pnl_unrealised` to `0` rather than panic part-way through
+/// an atomic multi-position adjustment. The per-market-tick path (`update_from_market` →
+/// [`calculate_pnl_unrealised`]) is deliberately left unchecked here; hardening that hot path for
+/// **all** callers is a separate follow-up (it needs its own policy for a persistent bad feed —
+/// what a live tick returns on overflow — rather than the split path's one-shot degrade-to-zero).
+///
+/// The exit-fee approximation reuses [`approximate_remaining_exit_fees`] **unchecked**, by design:
+/// the only unbounded, feed-controlled input on the split path is `price` (covered by the checked
+/// value terms above). The fee term is `(quantity_abs / quantity_abs_max) × fees_enter`, whose ratio
+/// stays `≤ 1` under the `quantity_abs ≤ quantity_abs_max` invariant that
+/// [`compute_split`](Position::compute_split) preserves (both scale by the same `ratio`; `Floor`
+/// only lowers `quantity_abs`), times a realised, bounded `fees_enter` — so it has no *reachable*
+/// overflow. It is deliberately not re-checked here: guarding that unreachable state would be
+/// over-engineering, and it keeps the per-tick [`calculate_pnl_unrealised`] path untouched.
+fn checked_calculate_pnl_unrealised(
+    position_side: Side,
+    price_entry_average: Decimal,
+    quantity_abs: Decimal,
+    quantity_abs_max: Decimal,
+    fees_enter: Decimal,
+    price: Decimal,
+    contract_size: Decimal,
+) -> Option<Decimal> {
+    let approx_exit_fees =
+        approximate_remaining_exit_fees(quantity_abs, quantity_abs_max, fees_enter);
+
+    let value_quote_current = quantity_abs
+        .checked_mul(price)?
+        .checked_mul(contract_size)?;
+    let value_quote_entry = quantity_abs
+        .checked_mul(price_entry_average)?
+        .checked_mul(contract_size)?;
+
+    match position_side {
+        Side::Buy => value_quote_current
+            .checked_sub(value_quote_entry)?
+            .checked_sub(approx_exit_fees),
+        Side::Sell => value_quote_entry
+            .checked_sub(value_quote_current)?
+            .checked_sub(approx_exit_fees),
+    }
+}
+
 /// Approximate the exit fees from closing a [`Position`] with `quantity_abs`.
 ///
 /// The `fees_enter` value was the fee cost to enter a [`Position`] of `quantity_abs_max`,
@@ -931,6 +1129,7 @@ pub fn calculate_pnl_return(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics acceptable
 mod tests {
     use super::*;
     use crate::test_utils::{time_plus_days, trade};
@@ -1748,6 +1947,12 @@ mod tests {
         }
     }
 
+    /// Build a validated [`SplitRatio`] from a raw `Decimal` for test call sites (panics on a
+    /// non-positive ratio, which is fine in test code — and unconstructible in real code).
+    fn sr(ratio: Decimal) -> SplitRatio {
+        SplitRatio::new(ratio).unwrap()
+    }
+
     #[test]
     fn test_apply_split() {
         use SplitRoundingPolicy::{Floor, Fractional};
@@ -1876,7 +2081,9 @@ mod tests {
             let fees_exit_before = p.fees_exit.clone();
             let time_update_before = p.time_exchange_update;
 
-            let result = p.apply_split(tc.ratio, tc.policy, Some(tc.last_price));
+            let result = p
+                .apply_split(sr(tc.ratio), tc.policy, Some(tc.last_price))
+                .unwrap();
 
             assert_eq!(p.quantity_abs, tc.expected_qty, "{}: quantity_abs", tc.name);
             assert_eq!(
@@ -1908,6 +2115,13 @@ mod tests {
             assert_eq!(
                 p.pnl_unrealised, expected_pnl,
                 "{}: pnl_unrealised",
+                tc.name
+            );
+            // The checked split-path recompute must match the unchecked `calculate_pnl_unrealised`
+            // above bit-for-bit on a normal price, and never spuriously flag an overflow.
+            assert!(
+                !result.pnl_unrealised_overflowed,
+                "{}: pnl did not overflow on a normal price",
                 tc.name
             );
             assert_ne!(
@@ -1954,7 +2168,9 @@ mod tests {
         // (post-split units) — NOT 1.0. apply_split only rescales self; the slot
         // removal + PositionExit is the handler's job (asserted at the handler/replica level).
         let mut p = split_position(Side::Buy, dec!(50), dec!(1), dec!(1), dec!(2));
-        let result = p.apply_split(dec!(0.1), SplitRoundingPolicy::Floor, Some(dec!(500)));
+        let result = p
+            .apply_split(sr(dec!(0.1)), SplitRoundingPolicy::Floor, Some(dec!(500)))
+            .unwrap();
 
         assert_eq!(p.quantity_abs, dec!(0), "position floors to zero");
         assert_eq!(
@@ -1982,7 +2198,8 @@ mod tests {
         //     digits — 100/1.5 does not terminate), NOT bit-exact. ---
         let mut p = split_position(Side::Buy, dec!(100), dec!(7), dec!(7), dec!(5));
         let old_notional = dec!(7) * dec!(100);
-        p.apply_split(dec!(1.5), SplitRoundingPolicy::Fractional, None);
+        p.apply_split(sr(dec!(1.5)), SplitRoundingPolicy::Fractional, None)
+            .unwrap();
         let new_notional = p.quantity_abs * p.price_entry_average;
         let tolerance = Decimal::new(1, 20); // 1e-20
         assert!(
@@ -1994,7 +2211,9 @@ mod tests {
         //     old_notional, exactly (avg/ratio terminates: 10/0.5 = 20). ---
         let mut p = split_position(Side::Buy, dec!(10), dec!(101), dec!(101), dec!(5));
         let old_notional = dec!(101) * dec!(10);
-        let result = p.apply_split(dec!(0.5), SplitRoundingPolicy::Floor, None);
+        let result = p
+            .apply_split(sr(dec!(0.5)), SplitRoundingPolicy::Floor, None)
+            .unwrap();
         let reconstructed =
             p.quantity_abs * p.price_entry_average + result.remainder * p.price_entry_average;
         assert_eq!(
@@ -2010,7 +2229,8 @@ mod tests {
         let fee_ratio_before = p.quantity_abs / p.quantity_abs_max; // 4/5 = 0.8
         let exit_fees_before =
             approximate_remaining_exit_fees(p.quantity_abs, p.quantity_abs_max, p.fees_enter.fees);
-        p.apply_split(dec!(1.5), SplitRoundingPolicy::Floor, None);
+        p.apply_split(sr(dec!(1.5)), SplitRoundingPolicy::Floor, None)
+            .unwrap();
         assert_eq!(
             p.quantity_abs,
             dec!(6),
@@ -2037,7 +2257,8 @@ mod tests {
         //     (avg ÷ r cancels max × r), so tear-sheet returns survive the split unchanged. ---
         let mut p = split_position(Side::Buy, dec!(90), dec!(4), dec!(5), dec!(10));
         let denom_before = p.price_entry_average * p.quantity_abs_max; // 90 × 5 = 450
-        p.apply_split(dec!(1.5), SplitRoundingPolicy::Floor, None);
+        p.apply_split(sr(dec!(1.5)), SplitRoundingPolicy::Floor, None)
+            .unwrap();
         let denom_after = p.price_entry_average * p.quantity_abs_max; // 60 × 7.5 = 450
         assert_eq!(
             denom_after, denom_before,
@@ -2050,11 +2271,159 @@ mod tests {
         // None last_price ⇒ pnl_unrealised = 0 (corrected on the next market tick); NOT scaled.
         let mut p = split_position(Side::Buy, dec!(100), dec!(10), dec!(10), dec!(5));
         p.pnl_unrealised = dec!(123.45);
-        let _ = p.apply_split(dec!(2), SplitRoundingPolicy::Floor, None);
+        let result = p
+            .apply_split(sr(dec!(2)), SplitRoundingPolicy::Floor, None)
+            .unwrap();
         assert_eq!(
             p.pnl_unrealised,
             Decimal::ZERO,
             "None last_price ⇒ pnl_unrealised = 0"
+        );
+        // A *missing* price is not an *overflow* — the flag distinguishes the two zero causes.
+        assert!(
+            !result.pnl_unrealised_overflowed,
+            "None last_price zeroes pnl but does NOT flag an overflow"
+        );
+    }
+
+    #[test]
+    fn test_apply_split_ratio_one_is_a_no_op() {
+        // ratio == 1 (a valid `SplitRatio`) leaves quantity/basis/high-water mark unchanged under
+        // both policies — the identity split. `pnl_unrealised` is still recomputed from last_price.
+        for policy in [SplitRoundingPolicy::Floor, SplitRoundingPolicy::Fractional] {
+            let mut p = split_position(Side::Buy, dec!(100), dec!(10), dec!(12), dec!(5));
+            let result = p.apply_split(sr(dec!(1)), policy, None).unwrap();
+            assert_eq!(
+                p.quantity_abs,
+                dec!(10),
+                "{policy:?}: quantity_abs unchanged"
+            );
+            assert_eq!(
+                p.quantity_abs_max,
+                dec!(12),
+                "{policy:?}: quantity_abs_max unchanged"
+            );
+            assert_eq!(
+                p.price_entry_average,
+                dec!(100),
+                "{policy:?}: price_entry_average unchanged"
+            );
+            assert_eq!(result.remainder, dec!(0), "{policy:?}: no remainder");
+        }
+    }
+
+    #[test]
+    fn test_apply_split_zero_quantity_position() {
+        // A zero-quantity position (e.g. a fully-closed slot awaiting cleanup) splits to a still-zero
+        // quantity with no remainder — the arithmetic must not panic or fabricate a fractional sliver.
+        let mut p = split_position(Side::Buy, dec!(100), dec!(0), dec!(0), dec!(0));
+        let result = p
+            .apply_split(sr(dec!(2)), SplitRoundingPolicy::Floor, None)
+            .unwrap();
+        assert_eq!(p.quantity_abs, dec!(0), "zero quantity stays zero");
+        assert_eq!(
+            p.quantity_abs_max,
+            dec!(0),
+            "zero high-water mark stays zero"
+        );
+        assert_eq!(
+            result.remainder,
+            dec!(0),
+            "no remainder from a zero position"
+        );
+    }
+
+    #[test]
+    fn test_apply_split_forward_floor_fractional_start_disposes_remainder() {
+        // L1 guard: a FORWARD split under `Floor` does NOT always leave remainder 0 — a fractional
+        // starting quantity_abs (reachable via a prior `Fractional`-policy split, or a fractional-
+        // share broker) floors to a non-zero remainder. 10.3 shares, 2-for-1 → 20.6, floor → 20,
+        // remainder 0.6. quantity_abs_max scales UNFLOORED (10.3 × 2 = 20.6).
+        let mut p = split_position(Side::Buy, dec!(100), dec!(10.3), dec!(10.3), dec!(5));
+        let result = p
+            .apply_split(sr(dec!(2)), SplitRoundingPolicy::Floor, None)
+            .unwrap();
+        assert_eq!(p.quantity_abs, dec!(20), "20.6 floored to 20");
+        assert_eq!(
+            result.remainder,
+            dec!(0.6),
+            "forward split under Floor disposes a non-zero remainder from a fractional start"
+        );
+        assert_eq!(
+            p.quantity_abs_max,
+            dec!(20.6),
+            "high-water mark scales unfloored"
+        );
+    }
+
+    #[test]
+    fn test_apply_split_ratio_overflow_is_err_and_leaves_position_unmutated() {
+        // A ratio-driven rescale that overflows `Decimal` (quantity_abs × ratio > Decimal::MAX)
+        // must return `Err(SplitError::Overflow)` with EVERY field left byte-for-byte unmutated —
+        // the all-or-nothing contract the engine's pre-validation relies on. `compute_split` runs
+        // before any commit, so not even `pnl_unrealised` (the sentinel 999) is touched.
+        let mut p = split_position(Side::Buy, dec!(100), Decimal::MAX, Decimal::MAX, dec!(5));
+        let before = p.clone();
+
+        let err = p
+            .apply_split(sr(dec!(2)), SplitRoundingPolicy::Floor, Some(dec!(120)))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SplitError::Overflow,
+            "overflow surfaces as Err, not panic"
+        );
+        assert_eq!(
+            p, before,
+            "position left fully unmutated on Err (all-or-nothing)"
+        );
+
+        // `validate_split` mirrors the same decision without mutating — the engine's pre-validation
+        // pass uses it to reject the whole action atomically.
+        assert_eq!(
+            p.validate_split(sr(dec!(2)), SplitRoundingPolicy::Floor),
+            Err(SplitError::Overflow),
+        );
+        assert_eq!(p, before, "validate_split never mutates");
+    }
+
+    #[test]
+    fn test_apply_split_extreme_last_price_degrades_pnl_to_zero_atomically() {
+        // (d) fail-soft: an extreme `last_price` whose pnl recompute overflows `Decimal` must NOT
+        // panic or fail the split. The ratio-driven rescale (10→20, 100→50, qmax 10→20) still
+        // applies atomically; only the derived `pnl_unrealised` degrades to 0 with the overflow
+        // flagged on the result, exactly like a `None` last_price. This is the M-A guarantee: a
+        // corrupt feed price can never leave a hedging book half-split mid-loop.
+        let mut p = split_position(Side::Buy, dec!(100), dec!(10), dec!(10), dec!(5));
+        p.pnl_unrealised = dec!(123.45); // sentinel that must be overwritten to 0
+
+        // quantity_abs × ratio = 20 (fine); 20 × Decimal::MAX overflows the pnl value term.
+        let result = p
+            .apply_split(sr(dec!(2)), SplitRoundingPolicy::Floor, Some(Decimal::MAX))
+            .unwrap();
+
+        assert!(
+            result.pnl_unrealised_overflowed,
+            "pnl overflow is flagged on the result for the caller to warn on"
+        );
+        assert_eq!(
+            result.remainder,
+            dec!(0),
+            "forward 2:1 on whole shares leaves no remainder"
+        );
+        assert_eq!(
+            p.pnl_unrealised,
+            Decimal::ZERO,
+            "overflowing pnl recompute ⇒ 0"
+        );
+        // The split itself still applied — atomic, not rejected.
+        assert_eq!(p.quantity_abs, dec!(20), "quantity still rescaled");
+        assert_eq!(p.price_entry_average, dec!(50), "basis still rescaled");
+        assert_eq!(
+            p.quantity_abs_max,
+            dec!(20),
+            "high-water mark still rescaled"
         );
     }
 }

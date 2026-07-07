@@ -16,7 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OpenOrdersAtSplit` (resting orders are reported, never engine-cancelled),
   and `UnsupportedCorporateAction`. Application is idempotent
   per-instrument via a caller-assigned action `id`; a reverse split that floors a position to zero
-  quantity closes it with a `PositionExit`.
+  quantity closes it with a `PositionExit`. `Position::apply_split` takes a validated `SplitRatio`
+  and is fallible (`Result<SplitResult, SplitError>`, with a companion `Position::validate_split`);
+  the engine **pre-validates** every affected position before mutating any, so an
+  arithmetically-unrepresentable ratio or a corrupted (non-integer) option contract count rejects the
+  whole action atomically — emitting `UnsupportedCorporateAction` with the new
+  `UnsupportedCorporateActionReason::ArithmeticOverflow` / `PositionStateInvalid` reasons, leaving the
+  `id` unrecorded and no position partially rescaled. The eager post-split `pnl_unrealised` recompute
+  degrades gracefully: an extreme last price that would overflow `Decimal` zeroes the (derived,
+  self-correcting) value and flags `SplitResult::pnl_unrealised_overflowed` rather than panicking
+  part-way through the adjustment, preserving that atomicity.
 - **Corporate-action handling for option positions on a splitting underlying** (`rustrade`,
   `rustrade-instrument`). When a split targets an underlying equity, the engine now also handles open
   option positions on that underlying. A **standard** split (a whole-number forward split, per the OCC
@@ -32,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method (`rustrade-instrument`) returns `Option<SplitAdjustmentKind>` (`Standard`/`NonStandard`),
   classifying the action per the OCC rule.
 - **Backtest auxiliary-event injection seam** (`rustrade`). New `AuxEventSource` trait, `NoAuxEvents`
-  (zero-cost default), and `AuxEventsInMemory` interleave non-market `EngineEvent`s (e.g. corporate
+  (negligible-overhead default), and `AuxEventsInMemory` interleave non-market `EngineEvent`s (e.g. corporate
   actions, contract expiries) with the market stream in simulated-time order during a backtest — the
   backtest equivalent of live trading's direct `EngineEvent` injection. The harness pre-merges the
   two sources into one time-ordered stream before the engine feed, so an injected event lands at the
@@ -127,7 +136,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AlpacaOptionsClient` constructor now reports a credential that cannot be encoded as an HTTP header
   value as `InvalidCredential`, where the credential-error path previously surfaced as `EnvVar`.
   `AlpacaRestError` is `#[non_exhaustive]`, so exhaustive matchers already require a wildcard arm;
-  only callers that branched on the specific credential-error variant need to update.
+  only callers that branched on the specific credential-error variant need to update. `AlpacaRestError`
+  also gains a `NotCloneable` variant: the shared retry helper now **returns** it (instead of
+  panicking) when a request body cannot be cloned for a retry — unreachable for the GET/query-string
+  requests the client issues today, but recoverable for a future streaming-body caller.
 - **`MarketDataInMemory::new` now hard-asserts sorted input** (`rustrade`). Construction `assert!`s —
   in all builds, not behind `debug_assert!` — that events are sorted ascending by
   `MarketEvent::time_exchange`; previously unsorted input was accepted silently and would yield a
