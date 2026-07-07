@@ -172,6 +172,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (unbounded namespace-declaration allocation in `NsReader`, a memory-exhaustion DoS). `quick-xml`
   backs the IBKR Flex XML parser behind the `ibkr` feature; the bump is API-compatible for the
   `Reader`/`de::from_str` surface in use.
+- Updated `crossbeam-epoch` to 0.9.20 to clear RUSTSEC-2026-0204 (invalid pointer dereference in the
+  `fmt::Pointer` impl for `Atomic`/`Shared` when the underlying pointer is null). A transitive
+  dependency (via `ibapi` and, in dev builds, `rayon`/`criterion`); the bump is a `Cargo.lock`-only
+  patch within the existing `0.9` constraint.
 
 ## [0.5.0] - 2026-06-19
 
