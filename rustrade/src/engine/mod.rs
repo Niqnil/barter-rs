@@ -418,8 +418,15 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     {
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
-        // Guard: idempotent — ignore duplicates after first processing.
+        // Guard: idempotent — ignore duplicates after first processing. Warn so the skip is
+        // observable in logs (this settlement path returns PositionExits, not EngineOutputs, so it
+        // has no audit-stream signal to emit — unlike process_corporate_action's duplicate-id path).
         if instrument_state.expiration_processed {
+            warn!(
+                instrument = ?key,
+                "ContractExpiry already processed — skipping (idempotent). Re-injecting the same \
+                 expiry is a no-op."
+            );
             return vec![];
         }
 
@@ -733,6 +740,15 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 "CorporateAction id already processed — skipping (idempotent). Ensure each \
                  action (incl. same-day corrections) carries a unique id."
             );
+            // Surface the idempotent skip on the output/audit stream (distinct from the
+            // rejection paths' UnsupportedCorporateAction — this is a non-mutating no-op, not a
+            // retryable rejection), so a consumer watching only the stream can tell it apart from a
+            // successful split that had nothing to adjust.
+            outputs.push(EngineOutput::CorporateActionAlreadyProcessed {
+                instrument: *key,
+                kind: kind.clone(),
+                id: id.clone(),
+            });
             return outputs;
         }
 
@@ -984,17 +1000,27 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 contract.strike /= ratio_decimal;
                 let strike_post_split = contract.strike;
 
-                // Unheld option: the strike correction above is the whole job — no positions to
-                // split, no observable (a silent registry fix; the user-chosen behaviour).
+                // Snapshot the option's resting orders as an observable BEFORE the unheld early-out
+                // and before adjusting any positions — a broker price-adjusts them, so the engine
+                // cancels nothing, but the wrapper must know (and a backtest MockExchange would
+                // otherwise fill a now-stale-premium resting order against the post-split print).
+                // Mirrors the equity leg, which snapshots regardless of position state: an UNHELD
+                // option can still carry a resting order to *open* a position, whose premium is now
+                // stale against the post-split strike, so it must be surfaced just the same.
+                let option_orders = snapshot_open_orders_at_split(&option_state.orders);
+
+                // Unheld option: the strike correction + resting-order snapshot above are the whole
+                // job — no positions to split. Still surface any resting orders (equity-leg parity),
+                // then move on; no per-position observable applies.
                 if option_state.position.positions.is_empty() {
+                    if !option_orders.is_empty() {
+                        outputs.push(EngineOutput::OpenOrdersAtSplit {
+                            instrument: opt_key,
+                            orders: option_orders,
+                        });
+                    }
                     continue;
                 }
-
-                // Snapshot the held option's resting orders as an observable BEFORE adjusting its
-                // positions — a broker price-adjusts them, so the engine cancels nothing, but the
-                // wrapper must know (and a backtest MockExchange would otherwise fill a
-                // now-stale-premium resting order against the post-split print).
-                let option_orders = snapshot_open_orders_at_split(&option_state.orders);
 
                 // The OPTION's own last price (premium) for the eager pnl_unrealised recompute —
                 // not the underlying equity's. None ⇒ 0 (+ warn), mirroring the equity path: the
@@ -1363,6 +1389,36 @@ pub enum EngineOutput<
         kind: CorporateActionKind,
         /// Why the action could not be processed.
         reason: UnsupportedCorporateActionReason,
+    },
+
+    /// Observable, **non-mutating** signal that a
+    /// [`CorporateAction`](crate::EngineEvent::CorporateAction) was skipped because its `id` had
+    /// already been processed (the handler's idempotency guard fired).
+    ///
+    /// This is deliberately a **distinct** variant from
+    /// [`EngineOutput::UnsupportedCorporateAction`], not a new reason under it: an idempotent skip
+    /// is the *opposite* of a rejection on both axes. The `id` **was** recorded — by a **prior,
+    /// successful** application — and the action is **not** retryable (re-submitting the same `id`
+    /// will always hit this same guard). Reporting it as `UnsupportedCorporateAction` would falsely
+    /// tell a consumer the action was not applied and remains retryable.
+    ///
+    /// Emitted so a consumer watching only the output/audit stream can distinguish "duplicate `id`,
+    /// correctly ignored" from "a successful split on an instrument with nothing to adjust" — both
+    /// otherwise produce no mutation observables.
+    ///
+    /// **No state was mutated** and no other observable accompanies this one. A consumer that folds
+    /// [`SplitRemainder`](Self::SplitRemainder) / [`PositionExit`](Self::PositionExit) /
+    /// [`OptionPositionAdjustedForSplit`](Self::OptionPositionAdjustedForSplit) into a mutation
+    /// tally must **not** count this variant.
+    CorporateActionAlreadyProcessed {
+        /// The instrument the duplicate action targeted.
+        instrument: InstrumentKey,
+        /// The re-submitted action's market-fact kind (carried verbatim for the consumer). This is
+        /// the kind of the duplicate event, which — should a caller violate the idempotency contract
+        /// by reusing an `id` with a different `kind` — is not necessarily the originally-applied one.
+        kind: CorporateActionKind,
+        /// The already-processed action `id` that was skipped.
+        id: SmolStr,
     },
 }
 

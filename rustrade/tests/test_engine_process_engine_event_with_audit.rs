@@ -1787,6 +1787,33 @@ fn test_corporate_action_idempotent() {
         "second (idempotent) application must re-emit no SplitRemainder/PositionExit"
     );
 
+    // The idempotent skip IS surfaced on the output/audit stream as exactly one
+    // CorporateActionAlreadyProcessed carrying the re-submitted event's instrument/kind/id — the
+    // observable that lets a stream-only consumer distinguish a duplicate-id skip from a successful
+    // split that had nothing to adjust.
+    assert_eq!(
+        second_outputs
+            .iter()
+            .filter(|o| matches!(o, EngineOutput::CorporateActionAlreadyProcessed { .. }))
+            .count(),
+        1,
+        "second (idempotent) application must emit exactly one CorporateActionAlreadyProcessed"
+    );
+    assert!(
+        second_outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::CorporateActionAlreadyProcessed { instrument, kind, id }
+                if *instrument == InstrumentIndex(0)
+                    && id.as_str() == "AAPL-2026-split"
+                    && matches!(
+                        kind,
+                        CorporateActionKind::StockSplit { ratio }
+                            if *ratio == SplitRatio::new(dec!(0.5)).unwrap()
+                    )
+        )),
+        "CorporateActionAlreadyProcessed must carry the re-submitted event's instrument/kind/id"
+    );
+
     // State unchanged by the second call (no double basis-adjust / re-dispose).
     let after_second = engine
         .state
@@ -2804,6 +2831,106 @@ fn test_corporate_action_option_replica_parity_standard_split() {
     let position = option_live.position.positions.values().next().unwrap();
     assert_eq!(position.quantity_abs, dec!(4));
     assert_eq!(position.price_entry_average, dec!(500));
+}
+
+/// Replica-parity for the **non-standard** option-split branch: a reverse (or fractional-forward)
+/// split leaves held options UNTOUCHED (the OCC assigns a new contract identity the engine cannot
+/// apply in place), so the replica's `adjust_options_in_place == false` skip branch must match the
+/// live handler byte-for-byte. Complements `test_corporate_action_option_replica_parity_standard_split`,
+/// which only exercises the Standard (mutating) branch — this covers the "skip" branch the author's
+/// comments worry could silently drift.
+#[test]
+fn test_corporate_action_option_replica_parity_non_standard_split() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    // Seed the replica from the exact pre-split state.
+    let pre_split_state = engine.state.clone();
+
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    // 1:2 reverse split (non-standard) on the Spot underlying (idx1).
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-1-2-reverse".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event.clone());
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_split_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event, &outputs);
+
+    // Gold-standard: full InstrumentState parity for BOTH the untouched option (idx0) and the split
+    // equity (idx1) — the replica's "skip" branch must reproduce live byte-for-byte.
+    for idx in [InstrumentIndex(0), InstrumentIndex(1)] {
+        let live = engine.state.instruments.instrument_index(&idx);
+        let replica = replica_manager
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&idx);
+        assert_eq!(replica, live, "replica/live divergence at {idx:?}");
+    }
+
+    // Non-vacuous: the LIVE handler actually took the non-standard branch — the held option was left
+    // UNTOUCHED (strike + position identical to pre-split) and an identity-change signal was emitted.
+    let option_live = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_live.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(
+        contract.strike,
+        dec!(50_000),
+        "a non-standard split must NOT touch the option strike"
+    );
+    let position = option_live.position.positions.values().next().unwrap();
+    assert_eq!(
+        position.quantity_abs,
+        dec!(2),
+        "held option position must be untouched"
+    );
+    assert_eq!(position.price_entry_average, dec!(1_000));
+    assert!(
+        outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::OptionPositionsRequireIdentityChange { .. })),
+        "a non-standard split with a held option must emit OptionPositionsRequireIdentityChange"
+    );
+    // The equity split itself WAS applied and its id recorded on the Spot target (idx1).
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .corporate_actions_processed
+            .contains("BTCUSD-1-2-reverse")
+    );
 }
 
 /// Build an engine with TWO BTC/USD call options on the same underlying plus the BTC/USD spot, for
@@ -4186,6 +4313,133 @@ fn test_corporate_action_unheld_option_strike_adjusted_then_settles_post_split()
     // Intrinsic 5_000 (= 30_000 − post-split strike 25_000), premium 1_000, 1 contract:
     // pnl = (5_000 − 1_000) × 1 = 4_000. Against the stale 50_000 strike it would be −1_000.
     assert_eq!(exited[0].pnl_realised, dec!(4_000));
+}
+
+/// An **unheld** option (zero positions) that carries a **resting order** must still have that order
+/// surfaced via `OpenOrdersAtSplit` when its underlying splits — mirroring the equity leg, which
+/// snapshots resting orders regardless of position state. A working order to *open* an option
+/// position is a realistic pre-split state; the standard split silently corrects the strike, so the
+/// resting order is now against the adjusted contract at a stale premium and the wrapper must be told
+/// (and a backtest MockExchange would otherwise fill it against the post-split print). Regression: the
+/// option loop previously `continue`d on `positions.is_empty()` BEFORE snapshotting orders.
+#[test]
+fn test_corporate_action_unheld_option_with_resting_order_surfaces_open_orders_at_split() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // Marks for the option (idx0) and spot underlying (idx1). NO option position is opened.
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+
+    // A resting order on the UNHELD option (idx0) — a working order to open a position.
+    engine.process(account_event_order_response(0, 1, Side::Buy, 1.0, 0.0));
+
+    // 2:1 standard forward split on the Spot underlying (idx1).
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // The resting order on the UNHELD option IS surfaced (the fix — equity-leg parity).
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OpenOrdersAtSplit { instrument, orders }
+                if *instrument == InstrumentIndex(0) && !orders.is_empty()
+        )),
+        "an unheld option's resting order must be surfaced via OpenOrdersAtSplit"
+    );
+
+    // No per-position observable (nothing was held to adjust) ...
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::OptionPositionAdjustedForSplit { .. })),
+        "an unheld option has no position to adjust"
+    );
+
+    // ... and the strike was still corrected (the registry fix runs regardless of position state).
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+}
+
+/// A **rejected** CorporateAction still advances the historical clock to its `effective_time` (the
+/// clock is processed before the handler validates the action), but this does NOT skew the clock for
+/// subsequent in-order events — a later market event still advances it. On the supported backtest
+/// path the merge enforces `effective_time == Timed::time` and emits the action only when
+/// `effective_time <= the next market event`, so `effective_time` is always ≤ every later event and a
+/// rejected action causes no "permanent skew". This locks that behavior in: moving the clock advance
+/// to accept-only would flip the second assertion and force a conscious re-decision.
+#[test]
+fn test_corporate_action_rejected_does_not_skew_clock() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    // idx0 = option, idx1 = spot. Targeting the option rejects with InstrumentKindNotSupported.
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+
+    // A pre-split market event establishes the clock near STARTING+1d (< effective_time).
+    let m1 = process_with_audit(&mut engine, market_event_trade(1, 1, dec!(60_000)));
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    assert!(m1.context.time < effective_time);
+
+    // A CorporateAction targeting the OPTION (idx0) → rejected (InstrumentKindNotSupported).
+    let ca_event = EngineEvent::CorporateAction {
+        id: "reject-me".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+    let ca_tick = process_with_audit(&mut engine, ca_event);
+    let ca_outputs = match &ca_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    // Non-vacuous: the action really was rejected (nothing mutated, id not recorded).
+    assert!(
+        ca_outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::UnsupportedCorporateAction {
+                reason: UnsupportedCorporateActionReason::InstrumentKindNotSupported,
+                ..
+            }
+        )),
+        "targeting the option must be rejected as InstrumentKindNotSupported"
+    );
+    // Despite the rejection, the clock advanced to effective_time (current, intended behavior).
+    assert!(
+        ca_tick.context.time >= effective_time,
+        "a rejected CorporateAction still advances the clock to effective_time"
+    );
+
+    // A later, in-order market event still advances the clock past effective_time — no skew.
+    let later_time = time_plus_days(STARTING_TIMESTAMP, 20);
+    let m2 = process_with_audit(&mut engine, market_event_trade(20, 1, dec!(70_000)));
+    assert!(
+        m2.context.time >= later_time,
+        "a later market event after a rejected action must still advance the clock (no permanent skew)"
+    );
+    assert!(
+        m2.context.time >= ca_tick.context.time,
+        "clock must remain monotonic non-decreasing across a rejected action"
+    );
 }
 
 /// A reverse split that floors a Hedging position to zero must prune the `position_ids` routing entry

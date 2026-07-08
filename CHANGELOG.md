@@ -14,8 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target Spot instrument via `Position::apply_split` and emitting observables — `SplitRemainder`
   (cash-in-lieu of the fractional sliver disposed under `SplitRoundingPolicy::Floor`),
   `OpenOrdersAtSplit` (resting orders are reported, never engine-cancelled),
-  and `UnsupportedCorporateAction`. Application is idempotent
-  per-instrument via a caller-assigned action `id`; a reverse split that floors a position to zero
+  `UnsupportedCorporateAction`, and `CorporateActionAlreadyProcessed`. Application is idempotent
+  per-instrument via a caller-assigned action `id` — a re-submitted `id` is a non-mutating no-op that
+  emits the observable `CorporateActionAlreadyProcessed` (distinct from the retryable
+  `UnsupportedCorporateAction` rejections, so an audit-stream consumer can tell an idempotent skip
+  from a successful split with nothing to adjust); a reverse split that floors a position to zero
   quantity closes it with a `PositionExit`. `Position::apply_split` takes a validated `SplitRatio`
   and is fallible (`Result<SplitResult, SplitError>`, with a companion `Position::validate_split`);
   the engine **pre-validates** every affected position before mutating any, so an
@@ -31,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option positions on that underlying. A **standard** split (a whole-number forward split, per the OCC
   option-adjustment rules) adjusts each option position **in place** — strike ÷ ratio, contract count
   × ratio, deliverable/multiplier unchanged — emitting one new `EngineOutput::OptionPositionAdjustedForSplit`
-  per adjusted position, **plus an `OpenOrdersAtSplit` for the adjusted option's own resting orders**
-  (now stale-priced; reported, never engine-cancelled, exactly as on the equity path). A **non-standard**
+  per adjusted position, **plus an `OpenOrdersAtSplit` for the option's own resting orders**
+  (now stale-priced; reported, never engine-cancelled, exactly as on the equity path — surfaced for
+  **held and unheld** options alike, since an unheld option can carry a working order to open a
+  position that the split silently re-strikes). A **non-standard**
   split (every reverse split, every fractional forward split) requires a new contract identity the
   engine does not register at runtime, so it emits the new `EngineOutput::OptionPositionsRequireIdentityChange`
   and leaves the options at their pre-split terms; the underlying equity split is still applied and its

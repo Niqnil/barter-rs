@@ -45,7 +45,7 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal_macros::dec;
 use rustrade::{
-    EngineEvent, SplitRoundingPolicy, Timed,
+    CorporateActionKind, EngineEvent, SplitRatio, SplitRoundingPolicy, Timed,
     backtest::{
         BacktestArgsConstant, BacktestArgsDynamic, aux_events::AuxEventsInMemory, backtest,
         market_data::MarketDataInMemory,
@@ -62,6 +62,7 @@ use rustrade::{
     },
     logging::init_logging,
     risk::DefaultRiskManager,
+    split_effective_instant,
     statistic::time::Daily,
     strategy::DefaultStrategy,
     system::config::SystemConfig,
@@ -71,11 +72,11 @@ use rustrade_data::{
     streams::consumer::MarketStreamEvent,
     subscription::trade::PublicTrade,
 };
+// `InstrumentIndex`/`ExchangeId`/`IndexedInstruments` are not re-exported at the crate root, so
+// this dependency remains for the index-building types; the corporate-action types now come from
+// the `rustrade` crate root (see the re-exports there).
 use rustrade_instrument::{
-    corporate_action::{CorporateActionKind, SplitRatio, split_effective_instant},
-    exchange::ExchangeId,
-    index::IndexedInstruments,
-    instrument::InstrumentIndex,
+    exchange::ExchangeId, index::IndexedInstruments, instrument::InstrumentIndex,
 };
 use rustrade_integration::{
     channel::{Tx, UnboundedTx},

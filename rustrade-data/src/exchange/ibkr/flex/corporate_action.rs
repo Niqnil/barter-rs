@@ -168,6 +168,28 @@ impl From<&str> for IbkrReorgType {
 /// Returns [`IbkrFlexError::Parse`] if the document is not well-formed XML or does not match the
 /// expected Flex statement shape.
 pub fn parse_corporate_actions(xml: &str) -> Result<Vec<IbkrFlexCorporateAction>, IbkrFlexError> {
+    // Assert the document is actually a `<FlexQueryResponse>` statement BEFORE deserializing.
+    // quick-xml's serde path does not verify the root element, and the raw structs use
+    // `#[serde(default)]`, so an IBKR error/status envelope (`<FlexStatementResponse>`, e.g. an
+    // "Invalid token" `ErrorCode 1003`) would otherwise deserialize into an all-defaults
+    // (empty) `RawFlexQueryResponse` and return `Ok(vec![])` — indistinguishable from a genuine
+    // statement with no Corporate Actions section, and contradicting this function's `# Errors`
+    // contract. Reuse the same root-element helper the blessed `GetStatement` path uses
+    // (`super::root_element_name`, which `super::classify_get_statement` also wraps).
+    match super::root_element_name(xml).as_deref() {
+        Some("FlexQueryResponse") => {}
+        Some(other) => {
+            return Err(IbkrFlexError::Parse(format!(
+                "expected Flex statement root <FlexQueryResponse>, found <{other}>"
+            )));
+        }
+        None => {
+            return Err(IbkrFlexError::Parse(
+                "empty or unreadable Flex statement document".to_owned(),
+            ));
+        }
+    }
+
     let response: RawFlexQueryResponse = quick_xml::de::from_str(xml)
         .map_err(|e| IbkrFlexError::Parse(format!("failed to parse Flex statement XML: {e}")))?;
 
@@ -574,6 +596,36 @@ mod tests {
     fn malformed_xml_is_an_error() {
         assert!(matches!(
             parse_corporate_actions("<FlexQueryResponse><not-closed>"),
+            Err(IbkrFlexError::Parse(_))
+        ));
+    }
+
+    /// An IBKR error/status envelope is a `<FlexStatementResponse>`, NOT a `<FlexQueryResponse>`
+    /// statement. Because `quick-xml` does not verify the root element and the raw structs use
+    /// `#[serde(default)]`, this previously deserialized into an all-defaults `RawFlexQueryResponse`
+    /// and returned `Ok(vec![])` — indistinguishable from a genuine statement with an empty Corporate
+    /// Actions section. It must now be a `Parse` error (honoring the `# Errors` contract), so a
+    /// caller re-parsing a persisted envelope standalone cannot mistake "invalid token" for "no
+    /// corporate actions".
+    #[test]
+    fn error_status_envelope_is_an_error_not_empty_vec() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <FlexStatementResponse timestamp="18 April, 2026 08:00 AM EDT">
+                <Status>Fail</Status>
+                <ErrorCode>1003</ErrorCode>
+                <ErrorMessage>Statement could not be generated at this time. Invalid token.</ErrorMessage>
+            </FlexStatementResponse>"#;
+        assert!(
+            matches!(parse_corporate_actions(xml), Err(IbkrFlexError::Parse(_))),
+            "a <FlexStatementResponse> error envelope must be a Parse error, not Ok(vec![])"
+        );
+    }
+
+    /// An empty / unreadable document is a `Parse` error, not a silent empty `Vec`.
+    #[test]
+    fn empty_document_is_an_error() {
+        assert!(matches!(
+            parse_corporate_actions(""),
             Err(IbkrFlexError::Parse(_))
         ));
     }

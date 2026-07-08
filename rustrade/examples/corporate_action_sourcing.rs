@@ -32,11 +32,11 @@
 use chrono::NaiveDate;
 use futures::{Stream, StreamExt};
 use rust_decimal_macros::dec;
-use rustrade::{EngineEvent, SplitRoundingPolicy};
-use rustrade_instrument::{
-    corporate_action::{CorporateAction, CorporateActionKind, split_effective_instant},
-    instrument::InstrumentIndex,
-};
+use rustrade::{CorporateActionKind, EngineEvent, SplitRoundingPolicy, split_effective_instant};
+// `CorporateAction` (the reference-data record) and `InstrumentIndex` are not re-exported at the
+// crate root, so this dependency remains for them; `CorporateActionKind`/`split_effective_instant`
+// now come from the `rustrade` crate root.
+use rustrade_instrument::{corporate_action::CorporateAction, instrument::InstrumentIndex};
 use rustrade_integration::corporate_action::{CorporateActionFilter, StockSplitSource};
 use smol_str::SmolStr;
 
