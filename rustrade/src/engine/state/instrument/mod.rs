@@ -1,13 +1,16 @@
 use crate::{
-    engine::state::{
-        instrument::{data::InstrumentDataState, filter::InstrumentFilter},
-        order::{Orders, manager::OrderManager},
-        position::{OmsMode, PositionExited, PositionManager},
+    engine::{
+        UnsupportedCorporateActionReason,
+        state::{
+            instrument::{data::InstrumentDataState, filter::InstrumentFilter},
+            order::{Orders, manager::OrderManager},
+            position::{OmsMode, PositionExited, PositionManager, SplitRoundingPolicy},
+        },
     },
     statistic::summary::instrument::TearSheetGenerator,
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Either;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
@@ -23,15 +26,18 @@ use rustrade_execution::{
 use rustrade_instrument::{
     Keyed,
     asset::{AssetIndex, name::AssetNameExchange},
+    corporate_action::SplitRatio,
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{
         Instrument, InstrumentIndex,
+        kind::InstrumentKind,
         name::{InstrumentNameExchange, InstrumentNameInternal},
     },
 };
 use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::fmt::Debug;
 use tracing::{debug, warn};
 
@@ -103,6 +109,72 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
         self.0
             .get_mut(key)
             .unwrap_or_else(|| panic!("InstrumentStates does not contain: {key}"))
+    }
+
+    /// Pre-validate a stock split against **every** position it would mutate, **without mutating
+    /// anything**, so `process_corporate_action` (and its audit replica) can reject an
+    /// un-applicable action *atomically* — no partial rescaling on an overflowing feed or a
+    /// corrupted option contract count.
+    ///
+    /// Single-sourced so the live handler and the audit replica reach the identical decision by
+    /// construction (not by hand-mirrored vigilance). Checks, in the same order the handler mutates:
+    /// - every open position on the splitting `equity` can be rescaled without `Decimal` overflow
+    ///   (equity quantities may legitimately be fractional, so there is no integer check here);
+    /// - iff `adjust_options_in_place` (a standard, whole-number forward split), every **held**
+    ///   option position on the same underlying holds an **integer** contract count (a non-integer
+    ///   count is state corruption) and can be rescaled without overflow.
+    ///
+    /// Returns the [`UnsupportedCorporateActionReason`] the caller should surface on the first
+    /// failure, or `Ok(())` when the whole action can be applied. Non-standard splits touch no
+    /// option state, so only the equity positions are validated for them.
+    pub(crate) fn validate_corporate_action_split(
+        &self,
+        equity: &InstrumentIndex,
+        ratio: SplitRatio,
+        policy: SplitRoundingPolicy,
+        adjust_options_in_place: bool,
+    ) -> Result<(), UnsupportedCorporateActionReason> {
+        // Equity positions: overflow only. A fractional equity quantity is legitimate (fractional-
+        // share brokers), so there is no integer invariant to check here — unlike option contracts.
+        let equity_state = self.instrument_index(equity);
+        for position in equity_state.position.positions.values() {
+            position
+                .validate_split(ratio, policy)
+                .map_err(|_overflow| UnsupportedCorporateActionReason::ArithmeticOverflow)?;
+        }
+
+        // Non-standard splits leave all option state untouched (the handler only emits a signal),
+        // so there is nothing further to validate.
+        if !adjust_options_in_place {
+            return Ok(());
+        }
+
+        // Standard split: mirror the handler's held-option scan (base + quote + exchange identity)
+        // and enforce the integer-contract invariant + overflow-safety on every held option
+        // position BEFORE the handler mutates any of them.
+        let base = equity_state.instrument.underlying.base;
+        let quote = equity_state.instrument.underlying.quote;
+        let exchange = equity_state.instrument.exchange;
+        for option_state in self
+            .0
+            .values()
+            .filter(|state| state.is_option_on_underlying(&base, &quote, &exchange))
+        {
+            for position in option_state.position.positions.values() {
+                // Option contract counts are whole; a non-integer count is corruption the handler
+                // must not silently floor/carry. Surfaced as an observable rejection, not a panic.
+                if !position.quantity_abs.fract().is_zero() {
+                    return Err(UnsupportedCorporateActionReason::PositionStateInvalid);
+                }
+                // Held option legs are rescaled with `Fractional` (the integer invariant above makes
+                // the equity `policy` a no-op), matching the handler's per-option `apply_split`.
+                position
+                    .validate_split(ratio, SplitRoundingPolicy::Fractional)
+                    .map_err(|_overflow| UnsupportedCorporateActionReason::ArithmeticOverflow)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Return an `Iterator` of references to `InstrumentState`s being tracked, optionally filtered
@@ -293,6 +365,32 @@ pub struct InstrumentState<
     #[serde(default)]
     pub expiration_processed: bool,
 
+    /// Set of corporate-action `id`s already applied to this instrument (idempotency key).
+    ///
+    /// A `CorporateAction` event carries a caller-assigned unique `id`; the handler records it
+    /// here once applied and skips (with a warning) any `id` already present. Scope is
+    /// per-instrument — naturally bounded by the number of corporate actions an instrument sees,
+    /// so no global store / LRU is required. This per-instrument-set keyed on `id` alone is
+    /// intentional and sufficient for stock splits (a split event targets a single instrument);
+    /// revisit for future multi-instrument actions (e.g. spin-offs).
+    ///
+    /// Rejected actions (unsupported instrument/action kind) are deliberately **not** recorded,
+    /// so they remain retryable once support is added.
+    ///
+    /// A hash set (insertion order is never read — only `contains`/`insert`), consistent with the
+    /// sibling `FnvHashMap` routing fields below.
+    ///
+    /// # Schema migration
+    ///
+    /// `#[serde(default)]` lets snapshots taken before this field existed deserialize with an empty
+    /// set. Consequence: a consumer that snapshots an `InstrumentState` **after** applying a
+    /// corporate action, then reloads it and re-injects the **same** action `id`, finds the set
+    /// empty and applies the action twice (quantity doubled again, basis halved again). Idempotency
+    /// holds within a live session; deduping replay across a pre-field snapshot is the consumer's
+    /// responsibility (e.g. pre-populate this set with already-applied ids on upgrade).
+    #[serde(default)]
+    pub corporate_actions_processed: FnvHashSet<SmolStr>,
+
     /// Maps `ClientOrderId` → `PositionId` for hedging-mode fill routing.
     ///
     /// Populated by `InFlightRequestRecorder::record_in_flight_open` when an order carrying
@@ -340,6 +438,54 @@ pub struct InstrumentState<
 impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     InstrumentState<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 {
+    /// `true` if this is an **option** written on the underlying `(base, quote)` traded on
+    /// `exchange` — held or not. A standard (whole-number forward) split must divide the strike of
+    /// **every** such registered option, not only those currently holding a position: the
+    /// instrument set is fixed at construction, so an option that is unheld at split time can still
+    /// have a position opened later and then settle at expiry against its strike. Leaving an unheld
+    /// option on its pre-split strike would mis-settle that future position.
+    ///
+    /// Single-sources the option scan shared by the live engine handler
+    /// (`process_corporate_action`) and the audit replica, so the predicate cannot drift between
+    /// them. [`Self::is_affected_option_on_underlying`] layers the holds-a-position gate on top.
+    pub(crate) fn is_option_on_underlying(
+        &self,
+        base: &AssetKey,
+        quote: &AssetKey,
+        exchange: &ExchangeKey,
+    ) -> bool
+    where
+        AssetKey: PartialEq,
+        ExchangeKey: PartialEq,
+    {
+        matches!(&self.instrument.kind, InstrumentKind::Option(_))
+            && self.instrument.underlying.base == *base
+            && self.instrument.underlying.quote == *quote
+            && self.instrument.exchange == *exchange
+    }
+
+    /// `true` if this is an **option** on the underlying `(base, quote)` traded on `exchange` that
+    /// currently **holds at least one open position** — i.e. the options whose held positions a
+    /// corporate action must event-adjust (per-position `apply_split` + observables) or, on a
+    /// non-standard split, flag for a wrapper-side identity change.
+    ///
+    /// This is [`Self::is_option_on_underlying`] plus the non-empty-position gate. The strike
+    /// correction on a standard split uses the broader [`Self::is_option_on_underlying`] (it must
+    /// also reach unheld options); this narrower predicate selects the options that carry a
+    /// position event.
+    pub(crate) fn is_affected_option_on_underlying(
+        &self,
+        base: &AssetKey,
+        quote: &AssetKey,
+        exchange: &ExchangeKey,
+    ) -> bool
+    where
+        AssetKey: PartialEq,
+        ExchangeKey: PartialEq,
+    {
+        self.is_option_on_underlying(base, quote, exchange) && !self.position.positions.is_empty()
+    }
+
     /// Updates the instrument state using an account snapshot from the exchange.
     ///
     /// This updates active orders for the instrument, using timestamps where relevant to ensure
@@ -799,6 +945,7 @@ where
         data: _,
         fee_model: _,
         expiration_processed: _,
+        corporate_actions_processed: _,
         position_ids: _,
         pending_fills: _,
         exchange_id_to_cid: _,
@@ -876,6 +1023,7 @@ where
                         data: instrument_data_init(instrument),
                         fee_model: FeeModelConfig::default(),
                         expiration_processed: false,
+                        corporate_actions_processed: FnvHashSet::default(),
                         position_ids: FnvHashMap::default(),
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),

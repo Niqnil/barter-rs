@@ -45,7 +45,19 @@ where
     /// Handles to auxiliary system components (execution components, event forwarding, etc.).
     pub handles: SystemAuxillaryHandles,
 
-    /// Transmitter for sending events to the `Engine`.
+    /// Transmitter for sending events directly to the `Engine`, bypassing any market/aux merge.
+    ///
+    /// # Ordering obligation (historical / backtest engines)
+    /// Events injected here do **not** pass through the backtest harness's time-ordering asserts
+    /// (`merge_market_with_aux` / `assert_aux_corporate_action_effective_times`). A
+    /// [`HistoricalClock`](crate::engine::clock::HistoricalClock) advances monotonically off each
+    /// event's `time_exchange` and never rewinds, so the caller must feed events in ascending
+    /// simulated-time order — including any injected
+    /// [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction), whose `effective_time`
+    /// the clock advances to *before* the action is validated. Injecting an out-of-order event moves
+    /// the clock forward (observably, via out-of-order logs) and subsequent earlier events will then
+    /// not advance it. A [`LiveClock`](crate::engine::clock::LiveClock) is unaffected (it reads
+    /// `Utc::now()`).
     pub feed_tx: UnboundedTx<Event>,
 
     /// Optional audit snapshot with updates (present when audit sending is enabled).
