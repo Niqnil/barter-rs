@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use rustrade_instrument::instrument::kind::option::{OptionExercise, OptionKind};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Maximum contracts per page (Alpaca API limit).
 const MAX_PAGE_SIZE: usize = 10_000;
@@ -160,8 +160,10 @@ impl AlpacaOptionContractQuery {
             ));
         }
         if let Some(style) = self.style {
-            // Alpaca only supports American and European styles; Bermudan is silently
-            // omitted from the request (the API would reject it).
+            // Alpaca only supports American and European styles. Bermudan has no API filter, so it
+            // is omitted here rather than silently returning an unfiltered result set the caller did
+            // not ask for. The omission is warned about once per logical query in `fetch_contracts`
+            // (this builder runs once per page, so warning here would repeat up to MAX_PAGES times).
             let style_str = match style {
                 OptionExercise::American => Some("american"),
                 OptionExercise::European => Some("european"),
@@ -284,12 +286,23 @@ impl AlpacaOptionsClient {
         let mut page_token: Option<String> = None;
         let mut pages = 0usize;
 
+        // Warn once per logical query (not once per page) if the caller requested a style Alpaca
+        // cannot filter on. `to_query_params` silently omits the `style` param in that case; this
+        // is where the caller learns their filter was dropped.
+        if query.style == Some(OptionExercise::Bermudan) {
+            warn!(
+                style = ?OptionExercise::Bermudan,
+                "AlpacaOptionContractQuery: exercise style is not supported by Alpaca; \
+                 omitting the `style` filter (results will not be style-restricted)"
+            );
+        }
+
         loop {
             if pages >= MAX_PAGES {
-                debug!(
+                warn!(
                     pages,
                     contracts = all_contracts.len(),
-                    "reached max pages limit"
+                    "Alpaca option contracts hit the max-pages safety limit; returning truncated results"
                 );
                 break;
             }
@@ -300,10 +313,10 @@ impl AlpacaOptionsClient {
                 params.push(("page_token", token.clone()));
             }
 
-            let url = format!("{}/v2/options/contracts", self.broker_base);
-            let request = self.http.get(&url).query(&params);
+            let url = format!("{}/v2/options/contracts", self.rest.broker_base());
+            let request = self.rest.get(&url).query(&params);
 
-            let response: ContractsResponse = self.request_with_retry(request).await?;
+            let response: ContractsResponse = self.rest.request_with_retry(request).await?;
 
             let contracts = response.option_contracts.unwrap_or_default();
             let count = contracts.len();
