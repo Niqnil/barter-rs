@@ -220,9 +220,11 @@ pub enum EngineEvent<
     /// - A same-day **correction** is expressed as two distinct events with distinct `id`s — a
     ///   reversal (`ratio = 1 / old`) followed by the corrected split — so neither is suppressed
     ///   by the idempotency guard.
-    /// - Do **not** inject a `ratio == 1` no-op "split". It is a non-event: the engine applies it as
-    ///   a no-op, yet it still classifies as non-standard and emits
-    ///   `OptionPositionsRequireIdentityChange` for any option positions on the underlying —
+    /// - Do **not** inject a `ratio == 1` no-op "split". It is a non-event, yet it is not silent: it
+    ///   still classifies as non-standard and emits `OptionPositionsRequireIdentityChange` for any
+    ///   option positions on the underlying, and — under [`SplitRoundingPolicy::Floor`] — it floors
+    ///   any pre-existing *fractional* equity `quantity_abs` down to a whole share count, emitting a
+    ///   spurious `SplitRemainder` for a sliver no real corporate action disposed. Both are
     ///   misleading noise for what changed nothing.
     ///
     /// # Backtest ordering caveat — inject chronologically

@@ -366,6 +366,10 @@ where
 /// - Aux events win ties (`aux.time <= market.time`), so an injected event at the same instant as a
 ///   market event is processed first — e.g. a stock split adjusts positions before any fill stamped
 ///   at that instant.
+/// - Between two **aux** events at the same instant, ordering follows their original
+///   [`AuxEventSource`] order: the aux side is consumed as a stable, in-order iterator and the merge
+///   never reorders equal-time aux events. Inject aux events already in the order you want ties
+///   broken.
 /// - A [`MarketStreamEvent::Reconnecting`] carries no timestamp; its ordering inherits the prior
 ///   market event's `time_exchange` (`last_market_time`), falling back to the seed only if it leads.
 ///   For an in-memory backtest no `Reconnecting` events occur, so the carry-forward is purely

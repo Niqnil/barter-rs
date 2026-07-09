@@ -858,8 +858,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             .keys()
             .cloned()
             .collect();
-        // Pre-size: up to a SplitRemainder + a PositionExit per position, plus the equity
-        // OpenOrdersAtSplit and the option-handling observable(s).
+        // Pre-size for the equity leg: up to a SplitRemainder + a PositionExit per position, plus the
+        // equity OpenOrdersAtSplit and one option-handling observable. This is a lower-bound hint, not
+        // an exact count — the standard-option path may push further OptionPositionAdjustedForSplit /
+        // per-option OpenOrdersAtSplit outputs, which the `Vec` accommodates by growing as needed.
         outputs.reserve(position_ids.len() * 2 + 2);
 
         for pos_id in position_ids {

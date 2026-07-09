@@ -156,12 +156,35 @@ impl CorporateActionKind {
     /// Note: `ratio` is computed at `rust_decimal`'s 28-significant-digit precision, so an inexact
     /// quotient (e.g. 1-for-3) is rounded there — identical to how the engine's `apply_split`
     /// consumes it.
+    ///
+    /// # Argument order
+    /// The order is **`split_to` then `split_from`** — a 2-for-1 forward split is
+    /// `stock_split(2, 1)`, *not* `stock_split(1, 2)`. Both parameters are [`Decimal`], so the
+    /// compiler cannot catch a swap, and there is no runtime signal either: passing them reversed
+    /// silently yields the reciprocal ratio — turning a forward split into a reverse split (or vice
+    /// versa) — which is still a valid [`SplitRatio`]. The call site is the only place this
+    /// convention is enforced, so keep the arguments in `to, from` order.
+    ///
+    /// ```
+    /// use rustrade_instrument::corporate_action::{CorporateActionKind, SplitAdjustmentKind};
+    /// use rust_decimal::Decimal;
+    ///
+    /// // 2-for-1 forward split: split_to = 2, split_from = 1 → ratio 2 (shares scale up).
+    /// let forward = CorporateActionKind::stock_split(Decimal::from(2), Decimal::from(1)).unwrap();
+    /// assert_eq!(forward.split_kind(), Some(SplitAdjustmentKind::Standard));
+    ///
+    /// // Arguments swapped: ratio 0.5 — a *reverse* split, accepted silently. Order matters.
+    /// let swapped = CorporateActionKind::stock_split(Decimal::from(1), Decimal::from(2)).unwrap();
+    /// assert_eq!(swapped.split_kind(), Some(SplitAdjustmentKind::NonStandard));
+    /// ```
     #[must_use]
     pub fn stock_split(split_to: Decimal, split_from: Decimal) -> Option<Self> {
         let positive = |d: Decimal| d > Decimal::ZERO;
         if !positive(split_to) || !positive(split_from) {
             return None;
         }
+        // `checked_div` can only return `None` via overflow here: the zero divisor is already
+        // excluded by the `positive()` guard above, so division-by-zero never reaches this point.
         split_to
             .checked_div(split_from)
             .and_then(SplitRatio::new)
@@ -179,9 +202,11 @@ impl CorporateActionKind {
     ///   dividend, spin-off, …).
     ///
     /// A `StockSplit`'s `ratio` is **standard** iff it is a whole number strictly greater than one
-    /// (`ratio > 1 && ratio.fract() == 0`). A non-positive `ratio` cannot occur:
-    /// [`CorporateActionKind::stock_split`] rejects it at construction and `Position::apply_split`
-    /// asserts it, so this is only ever reached with a positive `ratio`.
+    /// (`ratio > 1 && ratio.fract() == 0`). A non-positive `ratio` cannot occur: the field is a
+    /// [`SplitRatio`], whose own type invariant is `> 0` (enforced at construction and on
+    /// deserialization), so this classifier is only ever reached with a positive `ratio` — no local
+    /// runtime check is needed. Downstream consumers of the same `ratio` (including
+    /// `Position::apply_split`) likewise rely on this type-level guarantee rather than re-checking it.
     #[must_use]
     pub fn split_kind(&self) -> Option<SplitAdjustmentKind> {
         // No `_` catch-all: `CorporateActionKind` is `#[non_exhaustive]`, so adding a future
