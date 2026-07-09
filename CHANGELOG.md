@@ -161,6 +161,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   global float form: fields that must serialize as floats now need an explicit
   `#[serde(with = "rust_decimal::serde::float")]` (or `float_option`). The integration clients that
   require it already carry this attribute.
+- **IBKR historical tick fetches now surface mid-stream errors** (`rustrade-data`, feature-gated
+  `ibkr`). Bumping `ibapi` to 3.2.0 adopts its new `SubscriptionItem` tick envelope, which exposes
+  IB errors mid-stream that the previous pin (3.0.1) dropped silently. On such an error,
+  `fetch_historical_ticks` and `fetch_historical_bid_ask` now log a `warn!` and stop, returning the
+  ticks collected so far rather than an unexplained short batch. **Breaking**: both methods now
+  return `HistoricalTicks<T>` instead of `Vec<T>` — a `#[non_exhaustive]` struct exposing the
+  collected `ticks` plus a `truncation_error: Option<String>` carrying the formatted IB error when a
+  fetch was cut short, so callers can distinguish a confirmed mid-stream error from a normal short
+  end-of-data batch (and see *why*) programmatically instead of by parsing logs. `HistoricalTicks<T>`
+  also implements `IntoIterator` (yielding the ticks) for callers that only need the data. Migration:
+  read `.ticks` for the previous `Vec<T>`, or iterate the value directly.
 
 ### Removed
 
