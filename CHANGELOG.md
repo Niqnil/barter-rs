@@ -187,6 +187,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fees` only when no quote-equivalent is derivable), matching the realised-PnL convention. Fixes a
   dimensionally-inconsistent `pnl_unrealised` when the entry fee was paid in a base asset (e.g. BTC)
   rather than the quote asset. (#165)
+- **`Position::pnl_unrealised` recompute no longer panics on an extreme price** (`rustrade`). The
+  per-tick recompute now routes through checked `Decimal` arithmetic instead of the panicking
+  unchecked path, so a corrupted feed price near `Decimal::MAX` can no longer bring down the engine.
+  On overflow the market path **holds** the last-good value (a tick does not change the cost basis,
+  so the prior estimate beats a fabricated `0`) and logs a `warn!`, while the post-trade and split
+  paths degrade to `0` (the basis has just changed). **Breaking:** `Position::update_pnl_unrealised`
+  now returns `#[must_use] PnlUnrealisedUpdate { Updated, Overflowed }` (was `()`); direct callers
+  must bind the result. (#177)
 
 ### Security
 

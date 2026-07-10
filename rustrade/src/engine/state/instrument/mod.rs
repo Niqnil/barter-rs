@@ -4,7 +4,9 @@ use crate::{
         state::{
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
             order::{Orders, manager::OrderManager},
-            position::{OmsMode, PositionExited, PositionManager, SplitRoundingPolicy},
+            position::{
+                OmsMode, PnlUnrealisedUpdate, PositionExited, PositionManager, SplitRoundingPolicy,
+            },
         },
     },
     statistic::summary::instrument::TearSheetGenerator,
@@ -903,13 +905,17 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 
     /// Updates the instrument state based on a new market event.
     ///
-    /// If the market event has a price associated with it (eg/ `PublicTrade`, `OrderBookL1`), any
-    /// open [`Position`](super::position::Position) `pnl_unrealised` is re-calculated.
+    /// If the market event has a price associated with it (eg/ `PublicTrade`, `OrderBookL1`), each
+    /// open [`Position`](super::position::Position) has its `pnl_unrealised` re-calculated and its
+    /// `time_exchange_update` advanced to the event's exchange timestamp.
     pub fn update_from_market(
         &mut self,
         event: &MarketEvent<InstrumentKey, InstrumentData::MarketEventKind>,
     ) where
         InstrumentData: InstrumentDataState<ExchangeKey, AssetKey, InstrumentKey>,
+        // For the overflow `warn!` diagnostic context; satisfied by the concrete `InstrumentIndex`
+        // the engine drives this with.
+        InstrumentKey: std::fmt::Debug,
     {
         self.data.process(event);
 
@@ -918,7 +924,19 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         };
 
         for position in self.position.positions.values_mut() {
-            position.update_pnl_unrealised(price);
+            // A market fact landed regardless of whether the derived PnL turned out to be
+            // representable, so advance the update clock unconditionally. This also finally
+            // honours `Position::time_exchange_update`'s documented contract that a market-price
+            // update advances it (previously no code did).
+            position.time_exchange_update = event.time_exchange;
+
+            if let PnlUnrealisedUpdate::Overflowed = position.update_pnl_unrealised(price) {
+                warn!(
+                    instrument = ?event.instrument,
+                    %price,
+                    "pnl_unrealised recompute overflowed Decimal; holding last-good value"
+                );
+            }
         }
     }
 }
