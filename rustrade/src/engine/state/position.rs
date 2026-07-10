@@ -622,7 +622,10 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
             self.price_entry_average,
             self.quantity_abs,
             self.quantity_abs_max,
-            self.fees_enter.fees,
+            // Quote-equivalent entry fee for the exit-fee estimate, matching the realised-PnL
+            // convention (`Position::from` `:889`, closing-trade paths `:496`/`:540`). Falls back
+            // to raw `fees` only for third-party fee assets where no quote-equivalent is derivable.
+            self.fees_enter.fees_quote.unwrap_or(self.fees_enter.fees),
             price,
             self.contract_size,
         );
@@ -641,7 +644,9 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
             self.price_entry_average,
             self.quantity_abs,
             self.quantity_abs_max,
-            self.fees_enter.fees,
+            // Quote-equivalent entry fee (see `update_pnl_unrealised`), for dimensional
+            // consistency with the quote-denominated PnL terms.
+            self.fees_enter.fees_quote.unwrap_or(self.fees_enter.fees),
             price,
             self.contract_size,
         )
@@ -1623,6 +1628,82 @@ mod tests {
             dec!(100.0), // 100 shares per contract
         );
         assert_eq!(pnl, dec!(398.0));
+    }
+
+    #[test]
+    fn test_update_pnl_unrealised_uses_quote_equivalent_entry_fee() {
+        // Regression for the fee-units bug (#165): the per-tick `pnl_unrealised` exit-fee
+        // estimate must use the QUOTE-equivalent entry fee (`fees_quote`), not the raw
+        // fee-asset units (`fees`), so it is dimensionally consistent with the
+        // quote-denominated PnL terms — mirroring the realised-PnL paths.
+        //
+        // Base-asset fee: 0.001 BTC paid to enter 1 BTC @ $50,000, i.e. fees_quote = $50.
+        let mut position = Position {
+            instrument: InstrumentNameInternal::new("btc_usdt"),
+            side: Side::Buy,
+            price_entry_average: dec!(50_000.0),
+            quantity_abs: dec!(1.0),
+            quantity_abs_max: dec!(1.0),
+            pnl_unrealised: dec!(0.0),
+            pnl_realised: dec!(0.0),
+            fees_enter: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.001),            // raw fee in BASE asset units (BTC)
+                fees_quote: Some(dec!(50.0)), // quote-equivalent (0.001 BTC × $50,000)
+            },
+            fees_exit: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
+            },
+            time_enter: DateTime::<Utc>::MIN_UTC,
+            time_exchange_update: DateTime::<Utc>::MIN_UTC,
+            trades: vec![TradeId::new("t")],
+            contract_size: Decimal::ONE,
+        };
+
+        position.update_pnl_unrealised(dec!(51_000.0));
+
+        // (51_000 − 50_000) × 1 − exit_fee, with exit_fee = (1/1) × fees_quote = $50.
+        //   correct (quote fee):   1_000 − 50    = 950.0
+        //   buggy  (raw base fee): 1_000 − 0.001 = 999.999
+        assert_eq!(position.pnl_unrealised, dec!(950.0));
+    }
+
+    #[test]
+    fn test_update_pnl_unrealised_falls_back_to_raw_fee_when_quote_absent() {
+        // Documented residual (out of scope for #165): a third-party fee asset with no
+        // derivable quote-equivalent (`fees_quote == None`, e.g. a BNB fee) falls back to the
+        // raw `fees` on BOTH the realised and unrealised paths — accurate quote-denominated
+        // handling needs external price data the library does not carry.
+        let mut position = Position {
+            instrument: InstrumentNameInternal::new("btc_usdt"),
+            side: Side::Buy,
+            price_entry_average: dec!(50_000.0),
+            quantity_abs: dec!(1.0),
+            quantity_abs_max: dec!(1.0),
+            pnl_unrealised: dec!(0.0),
+            pnl_realised: dec!(0.0),
+            fees_enter: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(2.0),
+                fees_quote: None, // no quote-equivalent derivable
+            },
+            fees_exit: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
+            },
+            time_enter: DateTime::<Utc>::MIN_UTC,
+            time_exchange_update: DateTime::<Utc>::MIN_UTC,
+            trades: vec![TradeId::new("t")],
+            contract_size: Decimal::ONE,
+        };
+
+        position.update_pnl_unrealised(dec!(51_000.0));
+
+        // fees_quote is None ⇒ fall back to raw fees (2.0): 1_000 − 2 = 998.0.
+        assert_eq!(position.pnl_unrealised, dec!(998.0));
     }
 
     #[test]

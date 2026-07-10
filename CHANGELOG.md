@@ -180,6 +180,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `OptionPositionsRequireIdentityChange` (non-standard, wrapper-handled). Relevant only to code
   tracking this unreleased development line, where both the old and new variants are pre-release.
 
+### Fixed
+
+- **`Position::pnl_unrealised` fee units** (`rustrade`). The per-tick unrealised-PnL exit-fee
+  estimate now uses the quote-equivalent entry fee (`fees_enter.fees_quote`, falling back to raw
+  `fees` only when no quote-equivalent is derivable), matching the realised-PnL convention. Fixes a
+  dimensionally-inconsistent `pnl_unrealised` when the entry fee was paid in a base asset (e.g. BTC)
+  rather than the quote asset. (#165)
+
 ### Security
 
 - Upgraded `anyhow` to 1.0.103 and `quick-xml` to 0.41.0 to clear three RUSTSEC advisories:
