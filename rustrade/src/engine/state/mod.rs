@@ -196,7 +196,10 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// - Sets the market data [`ConnectivityState`](connectivity::ConnectivityState) to
     ///   [`Health::Healthy`](connectivity::Health::Healthy) if it was not previously.
     /// - Updates the `GlobalData` with the `MarketEvent`.
-    /// - Updates the associated [`InstrumentDataState`] with the `MarketEvent`.
+    /// - Refreshes the associated instrument via
+    ///   [`InstrumentState::update_from_market`](instrument::InstrumentState::update_from_market),
+    ///   which updates its [`InstrumentDataState`] and then, for each open position, re-computes
+    ///   `pnl_unrealised` and advances `time_exchange_update` from the new market price.
     pub fn update_from_market(
         &mut self,
         event: &MarketEvent<InstrumentIndex, InstrumentData::MarketEventKind>,
@@ -211,7 +214,10 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         let instrument_state = self.instruments.instrument_index_mut(&event.instrument);
 
         self.global.process(event);
-        instrument_state.data.process(event);
+        // Refreshes `data` (via `self.data.process`) AND re-computes each open position's
+        // `pnl_unrealised` + advances `time_exchange_update` — previously only `data.process` ran,
+        // leaving `pnl_unrealised` stale between fills despite its documented per-tick contract.
+        instrument_state.update_from_market(event);
     }
 }
 

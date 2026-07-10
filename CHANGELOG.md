@@ -195,6 +195,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths degrade to `0` (the basis has just changed). **Breaking:** `Position::update_pnl_unrealised`
   now returns `#[must_use] PnlUnrealisedUpdate { Updated, Overflowed }` (was `()`); direct callers
   must bind the result. (#177)
+- **`Position::pnl_unrealised` now updates on market ticks** (`rustrade`). `EngineState::update_from_market`
+  previously refreshed only the instrument's market-data state, never the open positions, so
+  `pnl_unrealised` stayed frozen at its last post-fill value (e.g. `0` for a freshly opened position)
+  no matter how far the market moved — contradicting the field's documented per-tick contract. It now
+  routes through `InstrumentState::update_from_market`, so every open position is revalued and its
+  `time_exchange_update` advanced on each priced market event. The audit-replica path shares this
+  method and revalues identically. (#186)
 
 ### Security
 
