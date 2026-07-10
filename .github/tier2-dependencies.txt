@@ -12,7 +12,7 @@
 # Pinned entries include: # review-date | risk-factors
 # The auto-merge workflow reads this file and applies 'tier-2' label.
 
-ibapi=2.11.0  # 2026-04-18 | Financial protocol, community-maintained, no official SDK
+ibapi=3.2.0  # 2026-07-09 | Financial protocol, community-maintained, no official SDK. Reviewed 3.0.1->3.2.0: zero unsafe, no build.rs, dependency tree byte-identical vs 3.0.1 (only the version line differs), only opens a caller-supplied TWS socket + opt-in local recorder dir (IBAPI_RECORDING_DIR).
 binance-sdk=52.0.0  # 2026-06-04 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)

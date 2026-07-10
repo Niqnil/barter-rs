@@ -449,7 +449,7 @@ async fn test_historical_ticks_trade() {
         result.err()
     );
 
-    let trades = result.unwrap();
+    let trades = result.unwrap().ticks;
     println!("Received {} trade ticks", trades.len());
 
     // May be empty outside market hours
@@ -502,7 +502,7 @@ async fn test_historical_ticks_bid_ask() {
         result.err()
     );
 
-    let quotes = result.unwrap();
+    let quotes = result.unwrap().ticks;
     println!("Received {} bid/ask ticks", quotes.len());
 
     // May be empty outside market hours
@@ -569,7 +569,8 @@ async fn test_historical_ticks_with_time_range() {
 
     // This may fail if the date is too old or no data available
     match result {
-        Ok(trades) => {
+        Ok(fetched) => {
+            let trades = fetched.ticks;
             println!("Received {} trade ticks", trades.len());
             for trade in trades.iter().take(3) {
                 println!("  Trade: price={:.2} amount={}", trade.price, trade.amount);
