@@ -913,15 +913,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         event: &MarketEvent<InstrumentKey, InstrumentData::MarketEventKind>,
     ) where
         InstrumentData: InstrumentDataState<ExchangeKey, AssetKey, InstrumentKey>,
-        // For the overflow `warn!` diagnostic context; satisfied by the concrete `InstrumentIndex`
-        // the engine drives this with.
-        InstrumentKey: std::fmt::Debug,
     {
         self.data.process(event);
 
         let Some(price) = self.data.price() else {
             return;
         };
+
+        // The event is dispatched to this instrument, so `self.instrument` names it. Unlike the
+        // generic `InstrumentKey`, `InstrumentNameInternal` is unconditionally `Display` — so the
+        // diagnostic needs no `Debug` bound on the public method and logs a readable name
+        // (`btc_usdt`) rather than an opaque index.
+        let instrument = &self.instrument.name_internal;
 
         for position in self.position.positions.values_mut() {
             // A market fact landed regardless of whether the derived PnL turned out to be
@@ -930,9 +933,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             // update advances it (previously no code did).
             position.time_exchange_update = event.time_exchange;
 
-            if let PnlUnrealisedUpdate::Overflowed = position.update_pnl_unrealised(price) {
+            if position.update_pnl_unrealised(price) == PnlUnrealisedUpdate::Overflowed {
                 warn!(
-                    instrument = ?event.instrument,
+                    %instrument,
                     %price,
                     "pnl_unrealised recompute overflowed Decimal; holding last-good value"
                 );

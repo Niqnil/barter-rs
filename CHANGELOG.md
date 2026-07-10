@@ -202,6 +202,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes through `InstrumentState::update_from_market`, so every open position is revalued and its
   `time_exchange_update` advanced on each priced market event. The audit-replica path shares this
   method and revalues identically. (#186)
+- **Public `calculate_pnl_unrealised` no longer panics on `Decimal` overflow** (`rustrade`). The free
+  function `engine::state::position::calculate_pnl_unrealised` now performs checked arithmetic and
+  returns `Option<Decimal>` (`None` on overflow); the previously-private checked twin is folded into
+  it, leaving a single public arithmetic core that every `pnl_unrealised` recompute routes through.
+  Removes a latent panic vector for external callers that computed unrealised PnL directly.
+  **Breaking:** the return type changed from `Decimal` to `Option<Decimal>`; callers must handle
+  `None`.
+- **`Position::pnl_realised` accumulation no longer panics on `Decimal` overflow** (`rustrade`).
+  `calculate_pnl_realised` and `calculate_pnl_return` now use checked arithmetic and return
+  `Option<Decimal>` (`None` on overflow). `Position::update_pnl_realised` checks both the closed
+  delta and its accumulation into the running total, and on overflow **holds** the last-good
+  cumulative `pnl_realised` (the failing close's contribution is not applied — there is no safe
+  fallback for a monotonic ledger) and logs a `warn!`; the entry-fee deduction on the position-
+  increase path and the statistics `PnLReturns::update` accumulation are hardened the same way, with
+  the returns path skipping the affected data point. **Breaking:** `calculate_pnl_realised` and
+  `calculate_pnl_return` now return `Option<Decimal>` (was `Decimal`); `Position::update_pnl_realised`
+  now returns `#[must_use] PnlRealisedUpdate { Updated, Overflowed }` (was `()`); direct callers must
+  handle the new return values.
 
 ### Security
 
