@@ -10,7 +10,7 @@ use rustrade_instrument::{
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Order Management System mode governing how positions are tracked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -102,6 +102,44 @@ pub enum SplitError {
     /// (the feed produced an unrepresentable ratio/quantity) rather than proceed.
     #[error("split arithmetic overflowed Decimal (ratio or quantity too large to represent)")]
     Overflow,
+}
+
+/// Outcome of [`Position::update_pnl_unrealised`]: whether the checked `pnl_unrealised` recompute
+/// succeeded or overflowed `Decimal`.
+///
+/// `#[must_use]` so a caller cannot silently ignore an overflow (the per-tick market path warns on
+/// it); `#[non_exhaustive]` per library convention, so a future outcome can be added without
+/// breaking downstream exhaustive matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+#[non_exhaustive]
+pub enum PnlUnrealisedUpdate {
+    /// The checked recompute succeeded and `pnl_unrealised` was updated to the new value.
+    Updated,
+    /// The checked recompute overflowed `Decimal`; the previous `pnl_unrealised` was **held**
+    /// unchanged (the basis is unaltered on a market tick, so the last-good value beats a
+    /// fabricated `0`). See [`Position::update_pnl_unrealised`].
+    Overflowed,
+}
+
+/// Outcome of [`Position::update_pnl_realised`]: whether the checked `pnl_realised` update
+/// succeeded or overflowed `Decimal`.
+///
+/// `#[must_use]` so a caller cannot silently ignore an overflow (`update_pnl_realised` itself warns
+/// on it); `#[non_exhaustive]` per library convention, so a future outcome can be added without
+/// breaking downstream exhaustive matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+#[non_exhaustive]
+pub enum PnlRealisedUpdate {
+    /// The checked update succeeded and the cumulative `pnl_realised` was advanced.
+    Updated,
+    /// The checked update overflowed `Decimal`; the previous cumulative `pnl_realised` was **held**
+    /// unchanged and this close's realised contribution was **not** applied. Unlike the unrealised
+    /// path there is no safe fallback for a booked, monotonic ledger — `0` would erase real
+    /// accumulated PnL and saturating would freeze a meaningless ceiling — so the last-good total
+    /// is kept. See [`Position::update_pnl_realised`].
+    Overflowed,
 }
 
 /// The rescaled field values a split produces, computed by [`Position::compute_split`] without
@@ -493,7 +531,19 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 // quote-equivalent. Downstream is responsible for applying a converted
                 // fee impact when accurate quote-denominated P&L is required for those
                 // assets (see `AssetFees::fees_quote` doc).
-                self.pnl_realised -= trade.fees.fees_quote.unwrap_or(trade.fees.fees);
+                //
+                // Checked, hold-last-good on overflow (consistent with `update_pnl_realised`): a
+                // deduction that can't be represented holds the prior cumulative value rather than
+                // panicking. Unreachable without a `~Decimal::MAX` cumulative PnL.
+                let entry_fee = trade.fees.fees_quote.unwrap_or(trade.fees.fees);
+                match self.pnl_realised.checked_sub(entry_fee) {
+                    Some(new_total) => self.pnl_realised = new_total,
+                    None => warn!(
+                        %entry_fee,
+                        pnl_realised_held = %self.pnl_realised,
+                        "pnl_realised entry-fee deduction overflowed Decimal; holding last-good value"
+                    ),
+                }
                 self.fees_enter.fees += trade.fees.fees;
                 self.fees_enter.fees_quote =
                     match (self.fees_enter.fees_quote, trade.fees.fees_quote) {
@@ -501,7 +551,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                         _ => None,
                     };
                 self.time_exchange_update = trade.time_exchange;
-                self.update_pnl_unrealised(trade.price);
+                self.update_pnl_unrealised_post_trade(trade.price);
 
                 (Some(self), None)
             }
@@ -510,7 +560,8 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 // Use quote-equivalent fee for P&L; fall back to raw fees.fees for
                 // third-party fee assets (caller must layer their own conversion).
                 let closed_fee_quote = trade.fees.fees_quote.unwrap_or(trade.fees.fees);
-                self.update_pnl_realised(trade.quantity, trade.price, closed_fee_quote);
+                // Overflow is held + warned inside `update_pnl_realised`; observed via logs here.
+                let _ = self.update_pnl_realised(trade.quantity, trade.price, closed_fee_quote);
 
                 // Update remaining Position state
                 self.quantity_abs -= trade.quantity.abs();
@@ -523,7 +574,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 self.time_exchange_update = trade.time_exchange;
 
                 // Update pnl_unrealised for remaining Position
-                self.update_pnl_unrealised(trade.price);
+                self.update_pnl_unrealised_post_trade(trade.price);
 
                 (Some(self), None)
             }
@@ -538,8 +589,9 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 };
                 self.time_exchange_update = trade.time_exchange;
                 let closed_fee_quote = trade.fees.fees_quote.unwrap_or(trade.fees.fees);
-                self.update_pnl_realised(trade.quantity, trade.price, closed_fee_quote);
-                self.update_pnl_unrealised(trade.price);
+                // Overflow is held + warned inside `update_pnl_realised`; observed via logs here.
+                let _ = self.update_pnl_realised(trade.quantity, trade.price, closed_fee_quote);
+                self.update_pnl_unrealised_post_trade(trade.price);
 
                 (None, Some(PositionExited::from(self)))
             }
@@ -581,13 +633,14 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                     _ => None,
                 };
                 self.time_exchange_update = trade.time_exchange;
-                self.update_pnl_realised(
+                // Overflow is held + warned inside `update_pnl_realised`; observed via logs here.
+                let _ = self.update_pnl_realised(
                     self.quantity_abs,
                     trade.price,
                     fee_exit_quote.unwrap_or(fee_exit),
                 );
                 self.quantity_abs = Decimal::ZERO;
-                self.update_pnl_unrealised(trade.price);
+                self.update_pnl_unrealised_post_trade(trade.price);
 
                 // Propagate contract_size from closing position to the new flipped position
                 let mut next_position = Self::from(&next_position_trade);
@@ -611,58 +664,124 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         );
     }
 
-    /// Update [`Position::pnl_unrealised`](Position) with the estimated PnL from closing
-    /// the [`Position`] at the provided price.
+    /// Recompute [`Position::pnl_unrealised`](Position) — the estimated PnL from closing the
+    /// [`Position`] at `price` — using **checked** `Decimal` arithmetic.
     ///
-    /// Note that this could be called with a recent [`Trade`] price, or a price generated from
-    /// a model based on public market data.
-    pub fn update_pnl_unrealised(&mut self, price: Decimal) {
-        self.pnl_unrealised = calculate_pnl_unrealised(
-            self.side,
-            self.price_entry_average,
-            self.quantity_abs,
-            self.quantity_abs_max,
-            self.fees_enter.fees,
-            price,
-            self.contract_size,
-        );
+    /// This is the per-market-tick path: it is called for every open position on every price
+    /// update (via [`InstrumentState::update_from_market`](super::instrument::InstrumentState::update_from_market)),
+    /// so it must never panic on an extreme feed `price`. On success the new value is stored and
+    /// [`PnlUnrealisedUpdate::Updated`] is returned; on `Decimal` overflow **nothing is mutated**
+    /// (the previous `pnl_unrealised` is held) and [`PnlUnrealisedUpdate::Overflowed`] is returned.
+    ///
+    /// Hold-last-good is deliberate: a market tick does not change the position's cost basis, so
+    /// the prior value remains a valid (if marginally stale) estimate and beats a fabricated `0`
+    /// that would misreport a real open loss as flat. This differs from the post-trade and split
+    /// paths, where the basis has *just* changed and so overflow degrades to `0` instead (see
+    /// `update_pnl_unrealised_post_trade` and [`apply_split`](Self::apply_split)).
+    ///
+    /// The price may be a recent [`Trade`] price or one derived from a model over public market
+    /// data. The `#[must_use]` return lets the caller observe overflow (the market caller emits a
+    /// `warn!`).
+    pub fn update_pnl_unrealised(&mut self, price: Decimal) -> PnlUnrealisedUpdate {
+        match self.checked_pnl_unrealised(price) {
+            Some(pnl) => {
+                self.pnl_unrealised = pnl;
+                PnlUnrealisedUpdate::Updated
+            }
+            None => PnlUnrealisedUpdate::Overflowed,
+        }
     }
 
-    /// Checked, non-mutating twin of [`update_pnl_unrealised`](Self::update_pnl_unrealised):
-    /// computes the unrealised PnL at `price`, returning `None` if the `Decimal` arithmetic
-    /// overflows instead of panicking.
+    /// Recompute [`Position::pnl_unrealised`](Position) after a trade fill has just changed the
+    /// position's cost basis, degrading to `0` on `Decimal` overflow.
     ///
-    /// Used by [`apply_split`](Self::apply_split) to degrade the eager post-split `pnl_unrealised`
-    /// recompute to `0` on an extreme `last_price` rather than panic mid-way through an atomic
-    /// multi-position corporate-action adjustment. See [`checked_calculate_pnl_unrealised`].
+    /// Unlike the per-tick [`update_pnl_unrealised`](Self::update_pnl_unrealised) (which holds the
+    /// last-good value), the basis has *just* been rewritten here, so there is no valid prior value
+    /// to hold — an overflow degrades to `0`, mirroring the split path
+    /// ([`apply_split`](Self::apply_split)). The value self-corrects on the next market tick.
+    ///
+    /// Overflow is provably unreachable at 2 of the 4 trade call sites — the exact-close and
+    /// position-flip paths zero `quantity_abs` before calling, so the checked value terms are `0`
+    /// regardless of `price` — and needs a `price ≈ Decimal::MAX` at the other two (the increase
+    /// and partial-reduce paths), so degrade-to-`0` is a defensive floor rather than an expected
+    /// path.
+    fn update_pnl_unrealised_post_trade(&mut self, price: Decimal) {
+        self.pnl_unrealised = self.checked_pnl_unrealised(price).unwrap_or(Decimal::ZERO);
+    }
+
+    /// Checked, non-mutating core shared by every `pnl_unrealised` recompute: computes the
+    /// unrealised PnL at `price`, returning `None` if the `Decimal` arithmetic overflows instead
+    /// of panicking.
+    ///
+    /// Callers pick the overflow fallback that fits their basis state:
+    /// - [`update_pnl_unrealised`](Self::update_pnl_unrealised) (per market tick) — *holds* the
+    ///   last-good value (basis unchanged).
+    /// - [`update_pnl_unrealised_post_trade`](Self::update_pnl_unrealised_post_trade) and
+    ///   [`apply_split`](Self::apply_split) — degrade to `0` (basis just changed).
+    ///
+    /// See [`calculate_pnl_unrealised`].
     fn checked_pnl_unrealised(&self, price: Decimal) -> Option<Decimal> {
-        checked_calculate_pnl_unrealised(
+        calculate_pnl_unrealised(
             self.side,
             self.price_entry_average,
             self.quantity_abs,
             self.quantity_abs_max,
-            self.fees_enter.fees,
+            // Quote-equivalent entry fee (see `update_pnl_unrealised`), for dimensional
+            // consistency with the quote-denominated PnL terms.
+            self.fees_enter.fees_quote.unwrap_or(self.fees_enter.fees),
             price,
             self.contract_size,
         )
     }
 
-    /// Updates the [`Position`] `pnl_realised` from a closed portion of the [`Position`] quantity.
+    /// Update the [`Position`] `pnl_realised` from a closed portion of the [`Position`] quantity,
+    /// using **checked** `Decimal` arithmetic on both the closed-quantity PnL and the running-total
+    /// accumulation.
+    ///
+    /// On success the cumulative `pnl_realised` is advanced and [`PnlRealisedUpdate::Updated`] is
+    /// returned. On `Decimal` overflow of *either* step **nothing is mutated** — the last-good
+    /// cumulative value is **held**, a `warn!` is emitted, and [`PnlRealisedUpdate::Overflowed`] is
+    /// returned. Holding is the only sound fallback for a booked, monotonic ledger (`0` would erase
+    /// real accumulated PnL; saturating would freeze a meaningless ceiling). The one documented
+    /// cost is that the failing close's realised contribution is dropped rather than retried — this
+    /// needs a `> Decimal::MAX` (~7.9e28) notional and is effectively unreachable with real data.
     pub fn update_pnl_realised(
         &mut self,
         closed_quantity: Decimal,
         closed_price: Decimal,
         closed_fee: Decimal,
-    ) {
-        // Update total Position pnl_realised with closed quantity PnL
-        self.pnl_realised += calculate_pnl_realised(
+    ) -> PnlRealisedUpdate {
+        // Check both the closed-quantity delta AND its accumulation into the running total; a small
+        // delta could still overflow a `pnl_realised` already near `Decimal::MAX`.
+        let updated = calculate_pnl_realised(
             self.side,
             self.price_entry_average,
             closed_quantity,
             closed_price,
             closed_fee,
             self.contract_size,
-        );
+        )
+        .and_then(|delta| self.pnl_realised.checked_add(delta));
+
+        match updated {
+            Some(new_total) => {
+                self.pnl_realised = new_total;
+                PnlRealisedUpdate::Updated
+            }
+            None => {
+                warn!(
+                    side = ?self.side,
+                    price_entry_average = %self.price_entry_average,
+                    %closed_quantity,
+                    %closed_price,
+                    %closed_fee,
+                    pnl_realised_held = %self.pnl_realised,
+                    "pnl_realised recompute/accumulation overflowed Decimal; holding last-good \
+                     cumulative value (this close's realised contribution was not applied)"
+                );
+                PnlRealisedUpdate::Overflowed
+            }
+        }
     }
 
     /// Apply a stock split / reverse split to this [`Position`] in place, returning the
@@ -1000,50 +1119,26 @@ fn calculate_price_entry_average(
 }
 
 /// Calculate the estimated unrealised PnL from closing a [`Position`] `quantity_abs` at the
-/// provided price.
+/// provided `price`, using **checked** `Decimal` arithmetic — returning `None` on overflow
+/// instead of panicking.
+///
+/// This is the single arithmetic core behind every `pnl_unrealised` recompute reached through the
+/// engine — the per-market-tick path ([`Position::update_pnl_unrealised`]), the post-trade path
+/// (`update_pnl_unrealised_post_trade`) and the corporate-action split path
+/// ([`Position::apply_split`]) all route through `Position::checked_pnl_unrealised` into here.
+/// Each caller chooses its own overflow fallback (hold-last-good on a tick, degrade-to-`0` once the
+/// basis has changed).
 ///
 /// The `contract_size` multiplier converts price-based PnL to actual dollar PnL for derivatives.
 /// For spot instruments, pass `Decimal::ONE`.
+///
+/// The exit-fee approximation reuses `approximate_remaining_exit_fees` **unchecked**, by design:
+/// the only unbounded, feed-controlled input is `price` (covered by the checked value terms below).
+/// The fee term is `(quantity_abs / quantity_abs_max) × fees_enter`, whose ratio stays `≤ 1` under
+/// the `quantity_abs ≤ quantity_abs_max` invariant that `compute_split` preserves (both scale by the
+/// same `ratio`; `Floor` only lowers `quantity_abs`), times a realised, bounded `fees_enter` — so it
+/// has no *reachable* overflow, and guarding it would be over-engineering.
 pub fn calculate_pnl_unrealised(
-    position_side: Side,
-    price_entry_average: Decimal,
-    quantity_abs: Decimal,
-    quantity_abs_max: Decimal,
-    fees_enter: Decimal,
-    price: Decimal,
-    contract_size: Decimal,
-) -> Decimal {
-    let approx_exit_fees =
-        approximate_remaining_exit_fees(quantity_abs, quantity_abs_max, fees_enter);
-
-    let value_quote_current = quantity_abs * price * contract_size;
-    let value_quote_entry = quantity_abs * price_entry_average * contract_size;
-
-    match position_side {
-        Side::Buy => value_quote_current - value_quote_entry - approx_exit_fees,
-        Side::Sell => value_quote_entry - value_quote_current - approx_exit_fees,
-    }
-}
-
-/// Checked twin of [`calculate_pnl_unrealised`]: identical math with `checked_*` `Decimal`
-/// arithmetic, returning `None` on overflow instead of panicking.
-///
-/// Used only on the corporate-action split path ([`Position::apply_split`]), where an extreme feed
-/// `last_price` must degrade the derived `pnl_unrealised` to `0` rather than panic part-way through
-/// an atomic multi-position adjustment. The per-market-tick path (`update_from_market` →
-/// [`calculate_pnl_unrealised`]) is deliberately left unchecked here; hardening that hot path for
-/// **all** callers is a separate follow-up (it needs its own policy for a persistent bad feed —
-/// what a live tick returns on overflow — rather than the split path's one-shot degrade-to-zero).
-///
-/// The exit-fee approximation reuses [`approximate_remaining_exit_fees`] **unchecked**, by design:
-/// the only unbounded, feed-controlled input on the split path is `price` (covered by the checked
-/// value terms above). The fee term is `(quantity_abs / quantity_abs_max) × fees_enter`, whose ratio
-/// stays `≤ 1` under the `quantity_abs ≤ quantity_abs_max` invariant that
-/// [`compute_split`](Position::compute_split) preserves (both scale by the same `ratio`; `Floor`
-/// only lowers `quantity_abs`), times a realised, bounded `fees_enter` — so it has no *reachable*
-/// overflow. It is deliberately not re-checked here: guarding that unreachable state would be
-/// over-engineering, and it keeps the per-tick [`calculate_pnl_unrealised`] path untouched.
-fn checked_calculate_pnl_unrealised(
     position_side: Side,
     price_entry_average: Decimal,
     quantity_abs: Decimal,
@@ -1089,7 +1184,8 @@ fn approximate_remaining_exit_fees(
 }
 
 /// Calculate the realised PnL generated from closing the provided [`Position`] quantity, at the
-/// specified price and closing fee.
+/// specified price and closing fee, using **checked** `Decimal` arithmetic — returning `None` on
+/// overflow instead of panicking.
 ///
 /// The `contract_size` multiplier converts price-based PnL to actual dollar PnL for derivatives.
 /// For spot instruments, pass `Decimal::ONE`. For standard equity options (100 shares/contract),
@@ -1101,31 +1197,46 @@ pub fn calculate_pnl_realised(
     closed_price: Decimal,
     closed_fee: Decimal,
     contract_size: Decimal,
-) -> Decimal {
+) -> Option<Decimal> {
     let close_quantity = closed_quantity.abs();
-    let value_quote_closed = close_quantity * closed_price * contract_size;
-    let value_quote_entry = close_quantity * price_entry_average * contract_size;
+    let value_quote_closed = close_quantity
+        .checked_mul(closed_price)?
+        .checked_mul(contract_size)?;
+    let value_quote_entry = close_quantity
+        .checked_mul(price_entry_average)?
+        .checked_mul(contract_size)?;
 
     match position_side {
-        Side::Buy => value_quote_closed - value_quote_entry - closed_fee,
-        Side::Sell => value_quote_entry - value_quote_closed - closed_fee,
+        Side::Buy => value_quote_closed
+            .checked_sub(value_quote_entry)?
+            .checked_sub(closed_fee),
+        Side::Sell => value_quote_entry
+            .checked_sub(value_quote_closed)?
+            .checked_sub(closed_fee),
     }
 }
 
-/// Calculate the PnL returns.
+/// Calculate the PnL returns, using **checked** `Decimal` arithmetic — returning `None` on overflow
+/// instead of panicking.
 ///
 /// Returns = pnl_realised / cost_of_investment
+///
+/// A zero cost-of-investment basis (zero entry price or zero max quantity) is a legitimate,
+/// non-error case and yields `Some(Decimal::ZERO)`; `None` signals an arithmetic result that cannot
+/// be represented as a `Decimal` (overflow of the `price_entry_average × quantity_abs_max` basis, or
+/// of the division).
 ///
 /// See docs: <https://www.investopedia.com/articles/basics/10/guide-to-calculating-roi.asp>
 pub fn calculate_pnl_return(
     pnl_realised: Decimal,
     price_entry_average: Decimal,
     quantity_abs_max: Decimal,
-) -> Decimal {
+) -> Option<Decimal> {
     if price_entry_average.is_zero() || quantity_abs_max.is_zero() {
-        return Decimal::ZERO;
+        return Some(Decimal::ZERO);
     }
-    pnl_realised / (price_entry_average * quantity_abs_max)
+    let cost_of_investment = price_entry_average.checked_mul(quantity_abs_max)?;
+    pnl_realised.checked_div(cost_of_investment)
 }
 
 #[cfg(test)]
@@ -1135,6 +1246,29 @@ mod tests {
     use crate::test_utils::{time_plus_days, trade};
     use rust_decimal_macros::dec;
     use rustrade_instrument::{asset::QuoteAsset, instrument::name::InstrumentNameInternal};
+
+    /// Independent, unchecked re-implementation of the `pnl_unrealised` formula, kept solely as a
+    /// cross-check oracle: the production **checked** [`calculate_pnl_unrealised`] (reached via the
+    /// split path) must match this separately-written naive formula bit-for-bit on non-overflowing
+    /// inputs. Deliberately not sharing code with the production function so the two can disagree.
+    fn naive_calculate_pnl_unrealised(
+        position_side: Side,
+        price_entry_average: Decimal,
+        quantity_abs: Decimal,
+        quantity_abs_max: Decimal,
+        fees_enter: Decimal,
+        price: Decimal,
+        contract_size: Decimal,
+    ) -> Decimal {
+        let approx_exit_fees =
+            approximate_remaining_exit_fees(quantity_abs, quantity_abs_max, fees_enter);
+        let value_quote_current = quantity_abs * price * contract_size;
+        let value_quote_entry = quantity_abs * price_entry_average * contract_size;
+        match position_side {
+            Side::Buy => value_quote_current - value_quote_entry - approx_exit_fees,
+            Side::Sell => value_quote_entry - value_quote_current - approx_exit_fees,
+        }
+    }
 
     #[test]
     fn test_position_update_from_trade() {
@@ -1591,7 +1725,7 @@ mod tests {
                 Decimal::ONE,
             );
 
-            assert_eq!(actual, test.expected, "TC{} failed", index);
+            assert_eq!(actual, Some(test.expected), "TC{} failed", index);
         }
     }
 
@@ -1609,7 +1743,7 @@ mod tests {
             dec!(15.0),  // current price per share
             dec!(100.0), // 100 shares per contract
         );
-        assert_eq!(pnl, dec!(499.0));
+        assert_eq!(pnl, Some(dec!(499.0)));
 
         // Short 2 puts sold at $5/share, current price $3/share, $2 entry fee
         // Unrealised PnL = (5 - 3) * 2 * 100 - 2 = 398
@@ -1622,7 +1756,133 @@ mod tests {
             dec!(3.0),   // current price per share
             dec!(100.0), // 100 shares per contract
         );
-        assert_eq!(pnl, dec!(398.0));
+        assert_eq!(pnl, Some(dec!(398.0)));
+    }
+
+    #[test]
+    fn test_update_pnl_unrealised_uses_quote_equivalent_entry_fee() {
+        // Regression for the fee-units bug (#165): the per-tick `pnl_unrealised` exit-fee
+        // estimate must use the QUOTE-equivalent entry fee (`fees_quote`), not the raw
+        // fee-asset units (`fees`), so it is dimensionally consistent with the
+        // quote-denominated PnL terms — mirroring the realised-PnL paths.
+        //
+        // Base-asset fee: 0.001 BTC paid to enter 1 BTC @ $50,000, i.e. fees_quote = $50.
+        let mut position = Position {
+            instrument: InstrumentNameInternal::new("btc_usdt"),
+            side: Side::Buy,
+            price_entry_average: dec!(50_000.0),
+            quantity_abs: dec!(1.0),
+            quantity_abs_max: dec!(1.0),
+            pnl_unrealised: dec!(0.0),
+            pnl_realised: dec!(0.0),
+            fees_enter: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.001),            // raw fee in BASE asset units (BTC)
+                fees_quote: Some(dec!(50.0)), // quote-equivalent (0.001 BTC × $50,000)
+            },
+            fees_exit: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
+            },
+            time_enter: DateTime::<Utc>::MIN_UTC,
+            time_exchange_update: DateTime::<Utc>::MIN_UTC,
+            trades: vec![TradeId::new("t")],
+            contract_size: Decimal::ONE,
+        };
+
+        assert_eq!(
+            position.update_pnl_unrealised(dec!(51_000.0)),
+            PnlUnrealisedUpdate::Updated
+        );
+
+        // (51_000 − 50_000) × 1 − exit_fee, with exit_fee = (1/1) × fees_quote = $50.
+        //   correct (quote fee):   1_000 − 50    = 950.0
+        //   buggy  (raw base fee): 1_000 − 0.001 = 999.999
+        assert_eq!(position.pnl_unrealised, dec!(950.0));
+    }
+
+    #[test]
+    fn test_update_pnl_unrealised_falls_back_to_raw_fee_when_quote_absent() {
+        // Documented residual (out of scope for #165): a third-party fee asset with no
+        // derivable quote-equivalent (`fees_quote == None`, e.g. a BNB fee) falls back to the
+        // raw `fees` on BOTH the realised and unrealised paths — accurate quote-denominated
+        // handling needs external price data the library does not carry.
+        let mut position = Position {
+            instrument: InstrumentNameInternal::new("btc_usdt"),
+            side: Side::Buy,
+            price_entry_average: dec!(50_000.0),
+            quantity_abs: dec!(1.0),
+            quantity_abs_max: dec!(1.0),
+            pnl_unrealised: dec!(0.0),
+            pnl_realised: dec!(0.0),
+            fees_enter: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(2.0),
+                fees_quote: None, // no quote-equivalent derivable
+            },
+            fees_exit: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
+            },
+            time_enter: DateTime::<Utc>::MIN_UTC,
+            time_exchange_update: DateTime::<Utc>::MIN_UTC,
+            trades: vec![TradeId::new("t")],
+            contract_size: Decimal::ONE,
+        };
+
+        assert_eq!(
+            position.update_pnl_unrealised(dec!(51_000.0)),
+            PnlUnrealisedUpdate::Updated
+        );
+
+        // fees_quote is None ⇒ fall back to raw fees (2.0): 1_000 − 2 = 998.0.
+        assert_eq!(position.pnl_unrealised, dec!(998.0));
+    }
+
+    #[test]
+    fn test_update_pnl_unrealised_holds_last_good_on_overflow() {
+        // Regression for the overflow-safety contract (#177): on the per-market-tick path an
+        // extreme feed `price` that overflows `Decimal` must NOT panic, must report
+        // `PnlUnrealisedUpdate::Overflowed`, and must leave the prior `pnl_unrealised`
+        // byte-for-byte unchanged (hold-last-good — a market tick does not change the cost basis,
+        // so the last good value beats a fabricated `0` that would misreport a real open loss as
+        // flat). This exercises the novel `Overflowed` branch the other unit tests never reach.
+        let sentinel = dec!(-123.45); // a real held open loss carried from the last good tick
+        let mut position = Position {
+            instrument: InstrumentNameInternal::new("btc_usdt"),
+            side: Side::Buy,
+            price_entry_average: dec!(100.0),
+            // quantity_abs > 1 so `quantity_abs × price` overflows at `price ≈ Decimal::MAX`
+            // (with quantity_abs == 1 the first checked multiply cannot exceed `Decimal::MAX`).
+            quantity_abs: dec!(2.0),
+            quantity_abs_max: dec!(2.0),
+            pnl_unrealised: sentinel,
+            pnl_realised: dec!(0.0),
+            fees_enter: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
+            },
+            fees_exit: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
+            },
+            time_enter: DateTime::<Utc>::MIN_UTC,
+            time_exchange_update: DateTime::<Utc>::MIN_UTC,
+            trades: vec![TradeId::new("t")],
+            contract_size: Decimal::ONE,
+        };
+
+        // `2 × Decimal::MAX` overflows the first checked multiply ⇒ no panic, `Overflowed`.
+        assert_eq!(
+            position.update_pnl_unrealised(Decimal::MAX),
+            PnlUnrealisedUpdate::Overflowed
+        );
+        // Hold-last-good: the previous value is untouched, not zeroed.
+        assert_eq!(position.pnl_unrealised, sentinel);
     }
 
     #[test]
@@ -1816,7 +2076,7 @@ mod tests {
                 Decimal::ONE,
             );
 
-            assert_eq!(actual, test.expected, "TC{} failed", index);
+            assert_eq!(actual, Some(test.expected), "TC{} failed", index);
         }
     }
 
@@ -1833,7 +2093,7 @@ mod tests {
             dec!(1.0),   // $1 fee
             dec!(100.0), // 100 shares per contract
         );
-        assert_eq!(pnl, dec!(499.0));
+        assert_eq!(pnl, Some(dec!(499.0)));
 
         // SHORT option scenario: sell 2 puts at $5/share, buy back at $3/share, $2 fee
         // PnL = (5 - 3) * 2 * 100 - 2 = 398
@@ -1845,7 +2105,49 @@ mod tests {
             dec!(2.0),   // $2 fee
             dec!(100.0), // 100 shares per contract
         );
-        assert_eq!(pnl, dec!(398.0));
+        assert_eq!(pnl, Some(dec!(398.0)));
+    }
+
+    #[test]
+    fn test_update_pnl_realised_holds_last_good_on_overflow() {
+        // Regression for the realised overflow-safety contract: realised PnL is a booked,
+        // cumulative ledger value, so on `Decimal` overflow of either the close-delta computation
+        // or the running-total accumulation, `update_pnl_realised` must NOT panic, must report
+        // `PnlRealisedUpdate::Overflowed`, and must hold the prior cumulative `pnl_realised`
+        // unchanged (0 would erase real booked PnL; saturating would freeze a meaningless ceiling).
+        // Requires a `~Decimal::MAX` notional — unreachable with real data.
+        let sentinel = dec!(1_234.56); // real booked PnL accumulated from prior closes
+        let mut position = Position {
+            instrument: InstrumentNameInternal::new("btc_usdt"),
+            side: Side::Buy,
+            price_entry_average: dec!(100.0),
+            quantity_abs: dec!(5.0),
+            quantity_abs_max: dec!(5.0),
+            pnl_unrealised: dec!(0.0),
+            pnl_realised: sentinel,
+            fees_enter: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
+            },
+            fees_exit: AssetFees {
+                asset: QuoteAsset,
+                fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
+            },
+            time_enter: DateTime::<Utc>::MIN_UTC,
+            time_exchange_update: DateTime::<Utc>::MIN_UTC,
+            trades: vec![TradeId::new("t")],
+            contract_size: Decimal::ONE,
+        };
+
+        // closed_quantity 2 × closed_price Decimal::MAX overflows the delta's first checked multiply.
+        assert_eq!(
+            position.update_pnl_realised(dec!(2.0), Decimal::MAX, dec!(0.0)),
+            PnlRealisedUpdate::Overflowed
+        );
+        // Hold-last-good: the booked cumulative value is untouched.
+        assert_eq!(position.pnl_realised, sentinel);
     }
 
     #[test]
@@ -1909,7 +2211,7 @@ mod tests {
                 test.quantity_abs_max,
             );
 
-            assert_eq!(actual, test.expected, "TC{} failed", index);
+            assert_eq!(actual, Some(test.expected), "TC{} failed", index);
         }
     }
 
@@ -2103,7 +2405,7 @@ mod tests {
             );
 
             // pnl_unrealised eagerly recomputed from last_price using the POST-split fields.
-            let expected_pnl = calculate_pnl_unrealised(
+            let expected_pnl = naive_calculate_pnl_unrealised(
                 tc.side,
                 tc.expected_avg,
                 tc.expected_qty,
@@ -2117,7 +2419,7 @@ mod tests {
                 "{}: pnl_unrealised",
                 tc.name
             );
-            // The checked split-path recompute must match the unchecked `calculate_pnl_unrealised`
+            // The checked split-path recompute must match the independent naive re-implementation
             // above bit-for-bit on a normal price, and never spuriously flag an overflow.
             assert!(
                 !result.pnl_unrealised_overflowed,

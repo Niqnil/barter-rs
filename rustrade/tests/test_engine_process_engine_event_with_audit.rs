@@ -746,6 +746,68 @@ fn test_engine_process_engine_event_with_audit() {
     assert_eq!(eth_btc_sheet.pnl, dec!(-0.065));
 }
 
+/// Regression for #186: an open position's `pnl_unrealised` (and `time_exchange_update`) must
+/// refresh on **every market tick**, not only on trade fills.
+///
+/// Before the wiring fix, `EngineState::update_from_market` called only
+/// `instrument_state.data.process(event)` and never `InstrumentState::update_from_market` (its only
+/// caller repo-wide), so `pnl_unrealised` stayed frozen at its post-fill value between fills — `0`
+/// for a freshly opened position, regardless of how far the market moved. This drives a bare market
+/// tick (no trade) through the real engine dispatch and asserts the position revalues.
+#[test]
+fn test_pnl_unrealised_updates_on_market_tick() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    let read_btc_position = |engine: &TestEngine| {
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .get(&PositionId::NETTING)
+            .cloned()
+            .expect("btc_usdt netting position should be open")
+    };
+
+    // Seed the account snapshot, then a first market price so btc_usdt is Healthy and priced.
+    // (Bind the snapshot first — it borrows `engine.state` immutably, which cannot overlap the
+    // `&mut engine` the call needs.)
+    let snapshot = account_event_snapshot(&engine.state.assets);
+    let _ = process_with_audit(&mut engine, snapshot);
+    let _ = process_with_audit(&mut engine, market_event_trade(1, 0, dec!(10_000)));
+
+    // Open a 1-unit btc_usdt LONG at 10_000 via an account Trade at day 2 (fees_quote = 10% of
+    // notional = 1_000 usdt). `Position::from` seeds `pnl_unrealised = 0` — it is NOT recomputed on
+    // open — so the position starts flat and only a later revaluation can move it.
+    let _ = process_with_audit(
+        &mut engine,
+        account_event_trade(0, 2, Side::Buy, 10_000.0, 1.0),
+    );
+
+    let opened = read_btc_position(&engine);
+    assert_eq!(opened.pnl_unrealised, dec!(0));
+    assert_eq!(
+        opened.time_exchange_update,
+        time_plus_days(STARTING_TIMESTAMP, 2)
+    );
+
+    // A bare market tick at 20_000 (day 5, no trade) must now revalue the open position AND advance
+    // its update clock — the exact refresh the pre-#186 engine skipped.
+    let _ = process_with_audit(&mut engine, market_event_trade(5, 0, dec!(20_000)));
+
+    let ticked = read_btc_position(&engine);
+    // (20_000 − 10_000) × 1 − exit_fee, exit_fee = (qty/qty_max) × fees_enter.fees_quote
+    //   = (1/1) × 1_000 = 1_000  ⇒  10_000 − 1_000 = 9_000.
+    assert_eq!(ticked.pnl_unrealised, dec!(9_000));
+    // Advanced to the tick's exchange time — proving a market tick, not a trade, refreshed it.
+    assert_eq!(
+        ticked.time_exchange_update,
+        time_plus_days(STARTING_TIMESTAMP, 5)
+    );
+}
+
 /// Routes a `BalanceStreamUpdate` (the WS-sourced partial) end-to-end through
 /// `EngineState::update_from_account` → `AssetState::apply_balance_update`, asserting both the
 /// resulting balance state and the audit trail.

@@ -180,6 +180,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `OptionPositionsRequireIdentityChange` (non-standard, wrapper-handled). Relevant only to code
   tracking this unreleased development line, where both the old and new variants are pre-release.
 
+### Fixed
+
+- **`Position::pnl_unrealised` fee units** (`rustrade`). The per-tick unrealised-PnL exit-fee
+  estimate now uses the quote-equivalent entry fee (`fees_enter.fees_quote`, falling back to raw
+  `fees` only when no quote-equivalent is derivable), matching the realised-PnL convention. Fixes a
+  dimensionally-inconsistent `pnl_unrealised` when the entry fee was paid in a base asset (e.g. BTC)
+  rather than the quote asset. (#165)
+- **`Position::pnl_unrealised` recompute no longer panics on an extreme price** (`rustrade`). The
+  per-tick recompute now routes through checked `Decimal` arithmetic instead of the panicking
+  unchecked path, so a corrupted feed price near `Decimal::MAX` can no longer bring down the engine.
+  On overflow the market path **holds** the last-good value (a tick does not change the cost basis,
+  so the prior estimate beats a fabricated `0`) and logs a `warn!`, while the post-trade and split
+  paths degrade to `0` (the basis has just changed). **Breaking:** `Position::update_pnl_unrealised`
+  now returns `#[must_use] PnlUnrealisedUpdate { Updated, Overflowed }` (was `()`); direct callers
+  must bind the result. (#177)
+- **`Position::pnl_unrealised` now updates on market ticks** (`rustrade`). `EngineState::update_from_market`
+  previously refreshed only the instrument's market-data state, never the open positions, so
+  `pnl_unrealised` stayed frozen at its last post-fill value (e.g. `0` for a freshly opened position)
+  no matter how far the market moved — contradicting the field's documented per-tick contract. It now
+  routes through `InstrumentState::update_from_market`, so every open position is revalued and its
+  `time_exchange_update` advanced on each priced market event. The audit-replica path shares this
+  method and revalues identically. (#186)
+- **Public `calculate_pnl_unrealised` no longer panics on `Decimal` overflow** (`rustrade`). The free
+  function `engine::state::position::calculate_pnl_unrealised` now performs checked arithmetic and
+  returns `Option<Decimal>` (`None` on overflow); the previously-private checked twin is folded into
+  it, leaving a single public arithmetic core that every `pnl_unrealised` recompute routes through.
+  Removes a latent panic vector for external callers that computed unrealised PnL directly.
+  **Breaking:** the return type changed from `Decimal` to `Option<Decimal>`; callers must handle
+  `None`.
+- **`Position::pnl_realised` accumulation no longer panics on `Decimal` overflow** (`rustrade`).
+  `calculate_pnl_realised` and `calculate_pnl_return` now use checked arithmetic and return
+  `Option<Decimal>` (`None` on overflow). `Position::update_pnl_realised` checks both the closed
+  delta and its accumulation into the running total, and on overflow **holds** the last-good
+  cumulative `pnl_realised` (the failing close's contribution is not applied — there is no safe
+  fallback for a monotonic ledger) and logs a `warn!`; the entry-fee deduction on the position-
+  increase path and the statistics `PnLReturns::update` accumulation are hardened the same way, with
+  the returns path skipping the affected data point. **Breaking:** `calculate_pnl_realised` and
+  `calculate_pnl_return` now return `Option<Decimal>` (was `Decimal`); `Position::update_pnl_realised`
+  now returns `#[must_use] PnlRealisedUpdate { Updated, Overflowed }` (was `()`); direct callers must
+  handle the new return values.
+
 ### Security
 
 - Upgraded `anyhow` to 1.0.103 and `quick-xml` to 0.41.0 to clear three RUSTSEC advisories:
