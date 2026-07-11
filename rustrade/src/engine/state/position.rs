@@ -142,10 +142,22 @@ pub enum PnlRealisedUpdate {
     Overflowed,
 }
 
-/// The rescaled field values a split produces, computed by [`Position::compute_split`] without
-/// mutating the position — committed by [`Position::apply_split`], discarded by
-/// [`Position::validate_split`].
-struct SplitComputed {
+/// The rescaled field values a split produces, pre-computed by [`Position::prepare_split`] without
+/// mutating the position, then written by [`Position::commit_split`].
+///
+/// Carrying the pre-computed values lets the corporate-action handler run **all** fallible split
+/// arithmetic up front (the engine's atomic pre-validation pass), then commit every affected
+/// position infallibly — so a mid-commit `Decimal` overflow is impossible *by construction* rather
+/// than merely caught by an `unreachable!`.
+///
+/// `pub(crate)`: the handler's pre-validation ([`InstrumentStates::prepare_corporate_action_split`])
+/// carries a batch of these in its [`SplitPlan`]; the fields stay private so only [`Position`] can
+/// read them back (via [`Position::commit_split`]).
+///
+/// [`InstrumentStates::prepare_corporate_action_split`]: super::instrument::InstrumentStates::prepare_corporate_action_split
+/// [`SplitPlan`]: super::instrument::SplitPlan
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedSplit {
     quantity_abs: Decimal,
     price_entry_average: Decimal,
     quantity_abs_max: Decimal,
@@ -880,22 +892,47 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// ratio or quantity driving `quantity_abs × ratio`, `price_entry_average ÷ ratio`, or
     /// `quantity_abs_max × ratio` past `Decimal::MAX`. All three are computed **before** any field
     /// is written, so on `Err` the [`Position`] is left **unmutated** and the caller can reject the
-    /// action atomically (see [`Position::validate_split`] to pre-validate a batch of positions).
+    /// action atomically (see [`Position::validate_split`] to pre-check a single position without
+    /// mutating it).
     pub fn apply_split(
         &mut self,
         ratio: SplitRatio,
         policy: SplitRoundingPolicy,
         last_price: Option<Decimal>,
     ) -> Result<SplitResult, SplitError> {
-        // `ratio` is a `SplitRatio` (`> 0` by construction), so no runtime sign check is needed.
-        // Compute the rescaled fields first; an overflow returns `Err` with `self` untouched.
-        let computed = self.compute_split(ratio.get(), policy)?;
+        // Two-phase: prepare (fallible arithmetic, no mutation) then commit (infallible). Kept as a
+        // single call for callers that apply one position in isolation; the corporate-action handler
+        // instead batches `prepare_split` across every affected position (atomic pre-validation) via
+        // `InstrumentStates::prepare_corporate_action_split`, then commits each with `commit_split`,
+        // so a mid-batch overflow can never leave a subset of positions rescaled.
+        let prepared = self.prepare_split(ratio, policy)?;
+        Ok(self.commit_split(prepared, last_price))
+    }
 
-        // All arithmetic succeeded — commit atomically.
-        self.price_entry_average = computed.price_entry_average;
-        self.quantity_abs = computed.quantity_abs;
-        // High-water mark scales UNFLOORED even under Floor (see `compute_split`).
-        self.quantity_abs_max = computed.quantity_abs_max;
+    /// Write a [`PreparedSplit`] (from [`prepare_split`](Self::prepare_split)) to this position,
+    /// **infallibly**. The fallible split arithmetic already ran in `prepare_split`, so this only
+    /// commits the pre-computed rescaled fields and performs the eager, self-correcting
+    /// `pnl_unrealised` recompute.
+    ///
+    /// Splitting apply into prepare + commit lets the engine pre-validate a whole batch of positions
+    /// *before* mutating any (see [`apply_split`](Self::apply_split)); a partial-commit-then-overflow
+    /// is then impossible by construction.
+    ///
+    /// `last_price` drives the eager unrealised-PnL recompute exactly as in
+    /// [`apply_split`](Self::apply_split): `None` ⇒ `pnl_unrealised = 0`; an extreme price whose
+    /// recompute overflows `Decimal` ALSO ⇒ `0` with [`SplitResult::pnl_unrealised_overflowed`] set —
+    /// never a panic (the quantity/basis rescale is already committed and must stay atomic). The
+    /// value self-corrects on the next market tick.
+    pub(crate) fn commit_split(
+        &mut self,
+        prepared: PreparedSplit,
+        last_price: Option<Decimal>,
+    ) -> SplitResult {
+        // All arithmetic already succeeded in `prepare_split` — commit atomically.
+        self.price_entry_average = prepared.price_entry_average;
+        self.quantity_abs = prepared.quantity_abs;
+        // High-water mark scales UNFLOORED even under Floor (see `prepare_split`).
+        self.quantity_abs_max = prepared.quantity_abs_max;
 
         // Eagerly recompute unrealised PnL from the supplied price so a risk check between the
         // split and the next market tick never reads a stale pre-split value. `None` (no market
@@ -922,37 +959,47 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
             }
         };
 
-        Ok(SplitResult {
-            remainder: computed.remainder,
+        SplitResult {
+            remainder: prepared.remainder,
             pnl_unrealised_overflowed,
-        })
+        }
     }
 
     /// Validate that [`apply_split`](Self::apply_split) would succeed for this position **without
     /// mutating it**, returning [`SplitError::Overflow`] iff the split arithmetic would overflow
     /// `Decimal`.
     ///
-    /// The engine calls this over **every** position an action affects *before* mutating any, so a
-    /// corporate action applies to the whole instrument atomically or not at all — an overflowing
-    /// feed can never leave a subset of positions rescaled.
+    /// A standalone, single-position convenience: it runs the same checked split arithmetic and
+    /// discards the result. The engine's own corporate-action path does **not** call this — it
+    /// pre-computes the whole action atomically across every affected position (and every option
+    /// strike) *before* mutating any, so an overflowing feed can never leave a subset of positions
+    /// rescaled.
     pub fn validate_split(
         &self,
         ratio: SplitRatio,
         policy: SplitRoundingPolicy,
     ) -> Result<(), SplitError> {
-        self.compute_split(ratio.get(), policy).map(drop)
+        self.prepare_split(ratio, policy).map(drop)
     }
 
-    /// Pure split arithmetic — the single source of the rescaling math, shared by
-    /// [`apply_split`](Self::apply_split) (which commits it) and
-    /// [`validate_split`](Self::validate_split) (which discards it). Computes every rescaled field
-    /// with **checked** `Decimal` arithmetic and mutates nothing; returns [`SplitError::Overflow`]
-    /// if any product/quotient exceeds `Decimal::MAX`.
-    fn compute_split(
+    /// Pre-compute a split's rescaled fields with **checked** `Decimal` arithmetic, **without
+    /// mutating** the position — the single source of the rescaling math, shared by
+    /// [`apply_split`](Self::apply_split) / [`commit_split`](Self::commit_split) (which write it) and
+    /// [`validate_split`](Self::validate_split) (which discards it). Returns [`SplitError::Overflow`]
+    /// if any product/quotient exceeds `Decimal::MAX`, leaving nothing to commit.
+    ///
+    /// `pub(crate)` so the engine's atomic pre-validation
+    /// ([`InstrumentStates::prepare_corporate_action_split`](super::instrument::InstrumentStates::prepare_corporate_action_split))
+    /// can pre-compute every affected position *before* [`commit_split`](Self::commit_split) mutates
+    /// any.
+    pub(crate) fn prepare_split(
         &self,
-        ratio: Decimal,
+        ratio: SplitRatio,
         policy: SplitRoundingPolicy,
-    ) -> Result<SplitComputed, SplitError> {
+    ) -> Result<PreparedSplit, SplitError> {
+        // `ratio` is a `SplitRatio` (`> 0` by construction), so no runtime sign check is needed.
+        let ratio = ratio.get();
+
         // Scaled (unfloored) quantity on the new share scale.
         let scaled_quantity = self
             .quantity_abs
@@ -980,7 +1027,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
             .checked_mul(ratio)
             .ok_or(SplitError::Overflow)?;
 
-        Ok(SplitComputed {
+        Ok(PreparedSplit {
             quantity_abs,
             price_entry_average,
             quantity_abs_max,
@@ -1135,7 +1182,7 @@ fn calculate_price_entry_average(
 /// The exit-fee approximation reuses `approximate_remaining_exit_fees` **unchecked**, by design:
 /// the only unbounded, feed-controlled input is `price` (covered by the checked value terms below).
 /// The fee term is `(quantity_abs / quantity_abs_max) × fees_enter`, whose ratio stays `≤ 1` under
-/// the `quantity_abs ≤ quantity_abs_max` invariant that `compute_split` preserves (both scale by the
+/// the `quantity_abs ≤ quantity_abs_max` invariant that `prepare_split` preserves (both scale by the
 /// same `ratio`; `Floor` only lowers `quantity_abs`), times a realised, bounded `fees_enter` — so it
 /// has no *reachable* overflow, and guarding it would be over-engineering.
 pub fn calculate_pnl_unrealised(
@@ -2662,7 +2709,7 @@ mod tests {
     fn test_apply_split_ratio_overflow_is_err_and_leaves_position_unmutated() {
         // A ratio-driven rescale that overflows `Decimal` (quantity_abs × ratio > Decimal::MAX)
         // must return `Err(SplitError::Overflow)` with EVERY field left byte-for-byte unmutated —
-        // the all-or-nothing contract the engine's pre-validation relies on. `compute_split` runs
+        // the all-or-nothing contract the engine's pre-validation relies on. `prepare_split` runs
         // before any commit, so not even `pnl_unrealised` (the sentinel 999) is touched.
         let mut p = split_position(Side::Buy, dec!(100), Decimal::MAX, Decimal::MAX, dec!(5));
         let before = p.clone();

@@ -21,11 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from a successful split with nothing to adjust); a reverse split that floors a position to zero
   quantity closes it with a `PositionExit`. `Position::apply_split` takes a validated `SplitRatio`
   and is fallible (`Result<SplitResult, SplitError>`, with a companion `Position::validate_split`);
-  the engine **pre-validates** every affected position before mutating any, so an
-  arithmetically-unrepresentable ratio or a corrupted (non-integer) option contract count rejects the
-  whole action atomically — emitting `UnsupportedCorporateAction` with the new
+  the engine **pre-computes** every affected position rescale and option-strike division before
+  committing any (a two-phase prepare/commit, single-sourced across the live handler and the audit
+  replica), so an arithmetically-unrepresentable ratio, an option strike that would overflow on
+  division, or a corrupted (non-integer) option contract count rejects the whole action atomically —
+  emitting `UnsupportedCorporateAction` with the new
   `UnsupportedCorporateActionReason::ArithmeticOverflow` / `PositionStateInvalid` reasons, leaving the
-  `id` unrecorded and no position partially rescaled. The eager post-split `pnl_unrealised` recompute
+  `id` unrecorded and nothing partially mutated. The eager post-split `pnl_unrealised` recompute
   degrades gracefully: an extreme last price that would overflow `Decimal` zeroes the (derived,
   self-correcting) value and flags `SplitResult::pnl_unrealised_overflowed` rather than panicking
   part-way through the adjustment, preserving that atomicity.
