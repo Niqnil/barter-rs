@@ -679,15 +679,18 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///    - action kind is not a stock split ⇒ [`UnsupportedCorporateActionReason::ActionKindNotSupported`]
     ///      (the compiler-mandated arm for the `#[non_exhaustive]` [`CorporateActionKind`]).
     /// 3. Snapshot resting orders into [`EngineOutput::OpenOrdersAtSplit`] (no cancellation).
-    /// 4. Apply the split to every open position per
-    ///    [`Position::apply_split`](crate::engine::state::position::Position::apply_split); emit one
+    /// 4. Apply the split to every open position — the same per-position rescale as
+    ///    [`Position::apply_split`](crate::engine::state::position::Position::apply_split), but the
+    ///    handler does **not** call it directly: it pre-computes every affected position atomically
+    ///    (prepare) then writes each infallibly (commit), so a mid-batch overflow rejects the whole
+    ///    action rather than leaving a subset rescaled. Emit one
     ///    [`EngineOutput::SplitRemainder`] per position that disposed a fractional sliver. A
     ///    position floored to zero quantity is removed and folded as an
     ///    [`EngineOutput::PositionExit`].
     /// 5. Scan for option positions on the same underlying and handle them per the OCC
     ///    standard/non-standard rule ([`CorporateActionKind::split_kind`]):
     ///    - **standard** (whole-number forward split) ⇒ adjust each option **in place**
-    ///      (strike ÷ `ratio`, contracts × `ratio` per
+    ///      (strike ÷ `ratio`, contracts × `ratio` — the same rescale as
     ///      [`Position::apply_split`](crate::engine::state::position::Position::apply_split), multiplier
     ///      unchanged), emitting one [`EngineOutput::OptionPositionAdjustedForSplit`] per position
     ///      plus — if the option has resting orders — an [`EngineOutput::OpenOrdersAtSplit`] for them
@@ -879,10 +882,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             let position = split_plan_position_mut(
                 &mut instrument_state.position.positions,
                 &pos_id,
-                "equity",
-                key,
-                id,
-                ratio,
+                SplitCommitContext {
+                    leg: "equity",
+                    instrument: key,
+                    id,
+                    ratio,
+                },
             );
 
             let side = position.side;
@@ -1042,10 +1047,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     let position = split_plan_position_mut(
                         &mut option_state.position.positions,
                         &pos_id,
-                        "option",
-                        &opt_key,
-                        id,
-                        ratio,
+                        SplitCommitContext {
+                            leg: "option",
+                            instrument: &opt_key,
+                            id,
+                            ratio,
+                        },
                     );
 
                     // Infallible: Step 2c pre-computed (and overflow-checked) this option leg's
@@ -1191,6 +1198,22 @@ fn option_split_adjust_in_place(
     })
 }
 
+/// Diagnostic context threaded into [`split_plan_position_mut`]'s cold `unreachable!` path. Every
+/// field feeds **only** the panic message; grouping them here keeps the hot lookup signature down to
+/// the map and the position id. `leg` and `instrument` distinguish which of the four commit loops (live +
+/// replica × equity + option) diverged; `id` and `ratio` identify the split.
+pub(crate) struct SplitCommitContext<'a, InstrumentKey> {
+    /// Which commit loop hit the divergence: `"equity"`, `"option"`, `"replica equity"`, or
+    /// `"replica option"`.
+    pub leg: &'a str,
+    /// The underlying/option instrument key whose positions map the plan indexed.
+    pub instrument: &'a InstrumentKey,
+    /// The corporate-action `id` being committed.
+    pub id: &'a SmolStr,
+    /// The (validated, strictly positive) split ratio.
+    pub ratio: SplitRatio,
+}
+
 /// Look up a position the pre-validated [`SplitPlan`](crate::engine::state::instrument::SplitPlan)
 /// committed the handler to rescaling, panicking loudly if it is absent.
 ///
@@ -1202,16 +1225,14 @@ fn option_split_adjust_in_place(
 ///
 /// `#[track_caller]` so the panic reports the **calling** commit loop's location, not this shared
 /// helper's — preserving the per-site diagnosability of the four distinct `unreachable!`s it replaces.
-/// `context` (e.g. `"equity"` / `"replica option"`) and `instrument` carry each site's distinguishing
-/// category and key, preserving per-site diagnosability under one shared, normalized message template.
+/// The [`SplitCommitContext`] carries each site's distinguishing `leg` (e.g. `"equity"` /
+/// `"replica option"`) and `instrument` key, preserving per-site diagnosability under one shared,
+/// normalized message template.
 #[track_caller]
 pub(crate) fn split_plan_position_mut<'m, AssetKey, InstrumentKey>(
     positions: &'m mut IndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
     pos_id: &PositionId,
-    context: &str,
-    instrument: &InstrumentKey,
-    id: &SmolStr,
-    ratio: SplitRatio,
+    context: SplitCommitContext<'_, InstrumentKey>,
 ) -> &'m mut Position<AssetKey, InstrumentKey>
 where
     InstrumentKey: Debug,
@@ -1220,10 +1241,18 @@ where
         Some(position) => position,
         // Plan/state divergence = corruption (see above): `unreachable!`, matching the sibling
         // invariant checks and the four inline `unreachable!`s this helper replaces.
-        None => unreachable!(
-            "SplitPlan carried {context} position id {pos_id:?} absent from instrument \
-             {instrument:?}'s positions map (id={id}, ratio={ratio})"
-        ),
+        None => {
+            let SplitCommitContext {
+                leg,
+                instrument,
+                id,
+                ratio,
+            } = context;
+            unreachable!(
+                "SplitPlan carried {leg} position id {pos_id:?} absent from instrument \
+                 {instrument:?}'s positions map (id={id}, ratio={ratio})"
+            )
+        }
     }
 }
 
@@ -1348,8 +1377,9 @@ pub enum EngineOutput<
 
     /// Observable record that a **standard** (OCC even / whole-number-forward) split on an
     /// underlying equity was applied to one option position on that underlying **in place**: the
-    /// option's strike was divided by `ratio`, its contract count multiplied by `ratio` (via
-    /// [`Position::apply_split`](crate::engine::state::position::Position::apply_split)), and its
+    /// option's strike was divided by `ratio`, its contract count multiplied by `ratio` (the same
+    /// rescale as [`Position::apply_split`](crate::engine::state::position::Position::apply_split),
+    /// which the handler does not call directly), and its
     /// cost basis divided by `ratio`. The deliverable/multiplier (`contract_size`) is **unchanged**
     /// — the OCC standard rule keeps the same contract identity, so the engine's ledger stays valid
     /// without any instrument re-registration.

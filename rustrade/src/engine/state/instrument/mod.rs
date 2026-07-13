@@ -181,9 +181,11 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
         let equity_state = self.instrument_index(equity);
         let mut equity_positions = Vec::with_capacity(equity_state.position.positions.len());
         for (pos_id, position) in &equity_state.position.positions {
-            // Match the variant explicitly (not `|_|`): `SplitError` is `#[non_exhaustive]`, so if a
-            // future non-overflow cause is added this mapping fails to compile here rather than
-            // silently mislabelling it `ArithmeticOverflow`.
+            // Match the variant explicitly (not `|_|`): the irrefutable `|SplitError::Overflow|`
+            // closure pattern stops compiling (E0005) if a future non-overflow variant is added, so a
+            // new cause surfaces here as a compile error rather than being silently mislabelled
+            // `ArithmeticOverflow`. (Ordinary intra-crate exhaustiveness — `#[non_exhaustive]` only
+            // governs downstream crates.)
             let prepared =
                 position
                     .prepare_split(ratio, policy)
@@ -243,7 +245,7 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
                 // Held option legs rescale with `Fractional` (the integer invariant above makes the
                 // equity `policy` a no-op), matching the handler's per-option commit. Variant match
                 // (not `|_|`) so a future `SplitError` variant is a compile error here, not a silent
-                // `ArithmeticOverflow` mislabel.
+                // `ArithmeticOverflow` mislabel — same intra-crate exhaustiveness as the equity leg above.
                 let prepared = position
                     .prepare_split(ratio, SplitRoundingPolicy::Fractional)
                     .map_err(|SplitError::Overflow| {
@@ -554,7 +556,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 
     /// `true` if this is an **option** on the underlying `(base, quote)` traded on `exchange` that
     /// currently **holds at least one open position** — i.e. the options whose held positions a
-    /// corporate action must event-adjust (per-position `apply_split` + observables) or, on a
+    /// corporate action must event-adjust (per-position rescale + observables) or, on a
     /// non-standard split, flag for a wrapper-side identity change.
     ///
     /// This is [`Self::is_option_on_underlying`] plus the non-empty-position gate. The strike

@@ -1,7 +1,7 @@
 use crate::{
     EngineEvent,
     engine::{
-        EngineMeta, EngineOutput, Processor,
+        EngineMeta, EngineOutput, Processor, SplitCommitContext,
         audit::{AuditTick, EngineAudit, ProcessAudit, context::EngineContext},
         classify_option_split, split_plan_position_mut,
         state::{EngineState, instrument::data::InstrumentDataState},
@@ -345,10 +345,12 @@ where
                     let position = split_plan_position_mut(
                         &mut instrument_state.position.positions,
                         &pos_id,
-                        "replica equity",
-                        &instrument,
-                        &id,
-                        ratio,
+                        SplitCommitContext {
+                            leg: "replica equity",
+                            instrument: &instrument,
+                            id: &id,
+                            ratio,
+                        },
                     );
                     // Infallible: the shared prepare pass already computed (and overflow-checked)
                     // this position's rescale into `prepared`. The replica discards the returned
@@ -431,10 +433,12 @@ where
                             let position = split_plan_position_mut(
                                 &mut option_state.position.positions,
                                 &pos_id,
-                                "replica option",
-                                &opt_key,
-                                &id,
-                                ratio,
+                                SplitCommitContext {
+                                    leg: "replica option",
+                                    instrument: &opt_key,
+                                    id: &id,
+                                    ratio,
+                                },
                             );
                             // Infallible: the shared prepare pass pre-computed this option leg's
                             // rescale into `prepared` (with `Fractional`, as the live handler does —
