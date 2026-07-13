@@ -139,6 +139,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameters cannot carry a default, so callers that spell the generics explicitly (turbofish, or a
   fully type-annotated function pointer) must account for the extra argument. Callers that rely on
   inference are unaffected.
+- **`backtest` now returns `BacktestResult { summary, engine_state }`, not a bare `BacktestSummary`**
+  (`rustrade`). The terminal `EngineState` is returned alongside the summary so callers can inspect
+  post-run state directly — open positions, balances, instrument state — which the aggregate
+  `TradingSummary` (closed-position statistics only) cannot express. This makes the net effect of a
+  notional-preserving corporate action assertable through the public async `backtest` path (e.g. a
+  stock split's rescaling of a position left open at shutdown). **Breaking**: replace `summary` with
+  `result.summary` at the call site (e.g. `backtest(..).await?.summary`); the new terminal state is
+  `result.engine_state`. `run_backtests` is **unchanged** — it still returns `MultiBacktestSummary`
+  and does not retain per-run `EngineState` (drive `backtest` directly when the terminal state is
+  needed).
 - **Alpaca client error variants** (`rustrade-data`, feature-gated `alpaca`). `AlpacaOptionsError` is
   now a type alias of the shared `AlpacaRestError`, which adds an `InvalidCredential` variant. The
   `AlpacaOptionsClient` constructor now reports a credential that cannot be encoded as an HTTP header
