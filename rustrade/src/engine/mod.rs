@@ -872,8 +872,16 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
 
         for (pos_id, prepared) in split_plan.equity_positions {
             let instrument_state = self.state.instruments.instrument_index_mut(key);
+            // The plan collected `pos_id` from this same positions map in a single-threaded engine
+            // (only Step 3's read-only order snapshot ran since), so the re-borrow cannot miss; fail
+            // loudly — matching the option leg below — rather than silently dropping a position the
+            // pre-validated `SplitPlan` already committed us to rescaling (a missing id here is a
+            // plan/state divergence = corruption, which must crash, never silently continue).
             let Some(position) = instrument_state.position.positions.get_mut(&pos_id) else {
-                continue;
+                unreachable!(
+                    "SplitPlan carried equity position id {pos_id:?} absent from instrument \
+                     {key:?}'s positions map (id={id}, ratio={ratio})"
+                );
             };
 
             let side = position.side;
@@ -974,7 +982,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // instruments (`is_option_on_underlying`), so the `else` is a structural invariant;
                 // fail loudly rather than silently misadjust if it is ever broken.
                 let InstrumentKind::Option(ref mut contract) = option_state.instrument.kind else {
-                    unreachable!("SplitPlan carried a non-Option instrument {opt_key:?}");
+                    unreachable!(
+                        "SplitPlan carried a non-Option instrument {opt_key:?} \
+                         (id={id}, ratio={ratio})"
+                    );
                 };
                 let strike_pre_split = contract.strike;
                 contract.strike = opt_plan.strike_post_split;
@@ -1030,8 +1041,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     // OptionPositionAdjustedForSplit whose contract asserts the position WAS adjusted.
                     let Some(position) = option_state.position.positions.get_mut(&pos_id) else {
                         unreachable!(
-                            "SplitPlan carried position id {pos_id:?} absent from this option's \
-                             positions map"
+                            "SplitPlan carried position id {pos_id:?} absent from option \
+                             {opt_key:?}'s positions map (id={id}, ratio={ratio})"
                         );
                     };
 

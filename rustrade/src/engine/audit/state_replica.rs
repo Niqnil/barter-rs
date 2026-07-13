@@ -337,12 +337,21 @@ where
                         .replica_engine_state_mut()
                         .instruments
                         .instrument_index_mut(&instrument);
-                    if let Some(position) = instrument_state.position.positions.get_mut(&pos_id) {
-                        // Infallible: the shared prepare pass already computed (and overflow-checked)
-                        // this position's rescale into `prepared`. The replica discards the returned
-                        // `SplitResult` — it mirrors state, not outputs.
-                        position.commit_split(prepared, last_price);
-                    }
+                    // Fail loudly on a missing id (matching the live handler + the option leg below):
+                    // the plan collected `pos_id` from this same replayed positions map, so a miss is
+                    // a plan/state divergence = corruption, which must crash rather than silently
+                    // drop a position and let replica state drift from the live engine.
+                    let Some(position) = instrument_state.position.positions.get_mut(&pos_id)
+                    else {
+                        unreachable!(
+                            "replica: SplitPlan carried equity position id {pos_id:?} absent from \
+                             instrument {instrument:?}'s positions map (id={id}, ratio={ratio})"
+                        );
+                    };
+                    // Infallible: the shared prepare pass already computed (and overflow-checked)
+                    // this position's rescale into `prepared`. The replica discards the returned
+                    // `SplitResult` — it mirrors state, not outputs.
+                    position.commit_split(prepared, last_price);
                 }
 
                 // Mirror Floor-to-zero closes from the live `PositionExit` outputs: remove the slot
@@ -402,7 +411,8 @@ where
                         let InstrumentKind::Option(ref mut contract) = option_state.instrument.kind
                         else {
                             unreachable!(
-                                "replica: SplitPlan carried a non-Option instrument {opt_key:?}"
+                                "replica: SplitPlan carried a non-Option instrument {opt_key:?} \
+                                 (id={id}, ratio={ratio})"
                             );
                         };
                         contract.strike = opt_plan.strike_post_split;
@@ -421,7 +431,7 @@ where
                             else {
                                 unreachable!(
                                     "replica: SplitPlan carried position id {pos_id:?} absent from \
-                                     this option's positions map"
+                                     option {opt_key:?}'s positions map (id={id}, ratio={ratio})"
                                 );
                             };
                             // Infallible: the shared prepare pass pre-computed this option leg's

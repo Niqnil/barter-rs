@@ -224,7 +224,7 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
             // structural invariant, mirroring the handler's loud arm.
             let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
                 unreachable!(
-                    "is_option_on_underlying matched a non-Option instrument {:?}",
+                    "is_option_on_underlying matched a non-Option instrument {:?} (ratio={ratio})",
                     option_state.key
                 );
             };
