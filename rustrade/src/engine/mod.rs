@@ -16,7 +16,7 @@ use crate::{
             EngineState,
             instrument::data::InstrumentDataState,
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
-            position::{PositionExited, PositionId, SplitRoundingPolicy},
+            position::{Position, PositionExited, PositionId, SplitRoundingPolicy},
             trading::TradingState,
         },
     },
@@ -31,6 +31,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
+use indexmap::IndexMap;
 use rust_decimal::Decimal;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::{
@@ -872,17 +873,17 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
 
         for (pos_id, prepared) in split_plan.equity_positions {
             let instrument_state = self.state.instruments.instrument_index_mut(key);
-            // The plan collected `pos_id` from this same positions map in a single-threaded engine
-            // (only Step 3's read-only order snapshot ran since), so the re-borrow cannot miss; fail
-            // loudly — matching the option leg below — rather than silently dropping a position the
-            // pre-validated `SplitPlan` already committed us to rescaling (a missing id here is a
-            // plan/state divergence = corruption, which must crash, never silently continue).
-            let Some(position) = instrument_state.position.positions.get_mut(&pos_id) else {
-                unreachable!(
-                    "SplitPlan carried equity position id {pos_id:?} absent from instrument \
-                     {key:?}'s positions map (id={id}, ratio={ratio})"
-                );
-            };
+            // Fail loudly on a missing id (see `split_plan_position_mut`): the plan collected
+            // `pos_id` from this same map (only Step 3's read-only order snapshot ran since), so a
+            // miss is plan/state corruption that must crash, never silently continue.
+            let position = split_plan_position_mut(
+                &mut instrument_state.position.positions,
+                &pos_id,
+                "equity",
+                key,
+                id,
+                ratio,
+            );
 
             let side = position.side;
             // Infallible: Step 2c pre-computed (and overflow-checked) this position's rescale into
@@ -1035,16 +1036,17 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // not govern option legs) having already rejected any non-integer contract count as
                 // `PositionStateInvalid`.
                 for (pos_id, prepared) in opt_plan.positions {
-                    // The plan collected `pos_id` from this same positions map in a single-threaded
-                    // engine, so the re-borrow cannot miss; fail loudly (matching the strike-adjust
-                    // `unreachable!` above) if that ever changes, rather than silently skipping an
+                    // Fail loudly on a missing id (see `split_plan_position_mut`), matching the
+                    // strike-adjust `unreachable!` above rather than silently skipping an
                     // OptionPositionAdjustedForSplit whose contract asserts the position WAS adjusted.
-                    let Some(position) = option_state.position.positions.get_mut(&pos_id) else {
-                        unreachable!(
-                            "SplitPlan carried position id {pos_id:?} absent from option \
-                             {opt_key:?}'s positions map (id={id}, ratio={ratio})"
-                        );
-                    };
+                    let position = split_plan_position_mut(
+                        &mut option_state.position.positions,
+                        &pos_id,
+                        "option",
+                        &opt_key,
+                        id,
+                        ratio,
+                    );
 
                     // Infallible: Step 2c pre-computed (and overflow-checked) this option leg's
                     // rescale into `prepared`; the commit only writes fields + the self-correcting
@@ -1141,35 +1143,87 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     }
 }
 
-/// Classify a stock split for **option** handling: `true` ⇒ the engine can adjust the affected
-/// options **in place** (a standard whole-number forward split, OCC Art. VI §11); `false` ⇒ it must
-/// leave them at pre-split terms and signal a downstream identity change (every reverse split, every
-/// fractional forward split, and the `ratio == 1` no-op).
+/// Collapse a stock split's OCC [`SplitAdjustmentKind`] into the engine **policy** decision of
+/// whether this engine can adjust affected option positions **in place**:
+/// - `Ok(true)` — a **standard** whole-number forward split (OCC Art. VI §11): strike ÷ ratio,
+///   contracts × ratio, same contract identity ⇒ adjustable in place;
+/// - `Ok(false)` — a **non-standard** split (every reverse split, every fractional forward split, and
+///   the `ratio == 1` no-op): the OCC assigns a new contract identity the engine cannot represent ⇒
+///   leave the options at pre-split terms;
+/// - `Err(other)` — the kind is not a split (unreachable once `StockSplit` is destructured) **or** a
+///   future `#[non_exhaustive]` [`SplitAdjustmentKind`] variant this engine does not yet classify.
+///   The conservative fallback (treat as non-standard) and any logging are the **caller's** choice, so
+///   this stays pure and side-effect-free — letting the live handler `warn!` while the audit replica
+///   (which re-derives state silently) does not.
 ///
-/// [`SplitAdjustmentKind`] is `#[non_exhaustive]` and defined in another crate, so it cannot be
-/// matched exhaustively here — a future variant will **not** raise a compile error. Rather than let
-/// one silently take the non-standard path, this names the known classifications and routes anything
-/// unexpected through the conservative non-standard path with a `warn!` (observable over silent). The
-/// `None` arm (kind is not a split) is unreachable at the call site — the `StockSplit` is destructured
-/// before this runs — but is folded into the same conservative branch.
+/// Single-sourced so the live [`Engine::process_corporate_action`] and the audit replica reach the
+/// identical Standard→in-place decision by construction rather than by two hand-mirrored matches. This
+/// is engine **policy**, not an OCC/domain fact (the fact is [`CorporateActionKind::split_kind`]), so
+/// it lives here in the engine crate, `pub(crate)`.
+pub(crate) fn classify_option_split(
+    kind: &CorporateActionKind,
+) -> Result<bool, Option<SplitAdjustmentKind>> {
+    match kind.split_kind() {
+        Some(SplitAdjustmentKind::Standard) => Ok(true),
+        Some(SplitAdjustmentKind::NonStandard) => Ok(false),
+        other => Err(other),
+    }
+}
+
+/// The live handler's thin wrapper over [`classify_option_split`]: same Standard→`true` /
+/// non-standard→`false` decision, but `warn!`ing (observable over silent) when the classification is
+/// an unexpected/future variant before conservatively taking the non-standard path. The audit replica
+/// calls [`classify_option_split`] directly (no `warn!` — the live engine already logged it).
 fn option_split_adjust_in_place(
     id: &SmolStr,
     key: &InstrumentIndex,
     kind: &CorporateActionKind,
 ) -> bool {
-    match kind.split_kind() {
-        Some(SplitAdjustmentKind::Standard) => true,
-        Some(SplitAdjustmentKind::NonStandard) => false,
-        other => {
-            warn!(
-                %id,
-                instrument = ?key,
-                classification = ?other,
-                "CorporateAction: unexpected option split classification — handling conservatively \
-                 as non-standard (engine cannot adjust options in place)."
-            );
-            false
-        }
+    classify_option_split(kind).unwrap_or_else(|other| {
+        warn!(
+            %id,
+            instrument = ?key,
+            classification = ?other,
+            "CorporateAction: unexpected option split classification — handling conservatively \
+             as non-standard (engine cannot adjust options in place)."
+        );
+        false
+    })
+}
+
+/// Look up a position the pre-validated [`SplitPlan`](crate::engine::state::instrument::SplitPlan)
+/// committed the handler to rescaling, panicking loudly if it is absent.
+///
+/// The plan collected `pos_id` from this same positions map earlier in the same single-threaded
+/// commit, so a miss is a plan/state divergence = state corruption, which **must** crash rather than
+/// silently drop a position and let the live engine and its audit replica drift (per CQRS: a
+/// post-validation application failure is corruption, never a retryable domain error). Shared by all
+/// four split commit loops (live + replica × equity + option) so they fail identically.
+///
+/// `#[track_caller]` so the panic reports the **calling** commit loop's location, not this shared
+/// helper's — preserving the per-site diagnosability of the four distinct `unreachable!`s it replaces.
+/// `context` (e.g. `"equity"` / `"replica option"`) and `instrument` carry each site's distinguishing
+/// category and key, preserving per-site diagnosability under one shared, normalized message template.
+#[track_caller]
+pub(crate) fn split_plan_position_mut<'m, AssetKey, InstrumentKey>(
+    positions: &'m mut IndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
+    pos_id: &PositionId,
+    context: &str,
+    instrument: &InstrumentKey,
+    id: &SmolStr,
+    ratio: SplitRatio,
+) -> &'m mut Position<AssetKey, InstrumentKey>
+where
+    InstrumentKey: Debug,
+{
+    match positions.get_mut(pos_id) {
+        Some(position) => position,
+        // Plan/state divergence = corruption (see above): `unreachable!`, matching the sibling
+        // invariant checks and the four inline `unreachable!`s this helper replaces.
+        None => unreachable!(
+            "SplitPlan carried {context} position id {pos_id:?} absent from instrument \
+             {instrument:?}'s positions map (id={id}, ratio={ratio})"
+        ),
     }
 }
 

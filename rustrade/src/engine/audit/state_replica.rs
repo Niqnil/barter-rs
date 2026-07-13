@@ -3,6 +3,7 @@ use crate::{
     engine::{
         EngineMeta, EngineOutput, Processor,
         audit::{AuditTick, EngineAudit, ProcessAudit, context::EngineContext},
+        classify_option_split, split_plan_position_mut,
         state::{EngineState, instrument::data::InstrumentDataState},
     },
     execution::AccountStreamEvent,
@@ -12,7 +13,7 @@ use rustrade_integration::collection::none_one_or_many::NoneOneOrMany;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::AccountEvent;
 use rustrade_instrument::{
-    corporate_action::{CorporateActionKind, SplitAdjustmentKind},
+    corporate_action::CorporateActionKind,
     instrument::{InstrumentIndex, kind::InstrumentKind},
 };
 use rustrade_integration::Terminal;
@@ -289,15 +290,16 @@ where
                 // division) now lives in the shared prepare pass, so — like the live handler — the
                 // replica no longer extracts the inner `Decimal` here.
 
-                // Classify for option handling ONCE, up front (mirrors the live handler's Step 2c).
-                // `SplitAdjustmentKind` is `#[non_exhaustive]` (another crate) and cannot be matched
-                // exhaustively here; only a Standard split mutates option state in the replica —
-                // NonStandard, any future variant, and the unreachable None deliberately skip (the
-                // live handler emits only a signal output for them, which the replica — mirroring
-                // state, not outputs — has nothing to apply). Hoisted above the mutation so
-                // pre-validation and application share one classification and cannot drift.
-                let adjust_options_in_place =
-                    matches!(kind.split_kind(), Some(SplitAdjustmentKind::Standard));
+                // Classify for option handling ONCE, up front (mirrors the live handler's Step 2c),
+                // via the shared `classify_option_split` so the replica and the live handler collapse
+                // `SplitAdjustmentKind` into the same Standard→adjust-in-place decision by
+                // construction. Only a Standard split mutates option state here; NonStandard, any
+                // future `#[non_exhaustive]` variant, and the unreachable non-split (all `Err(_)` ⇒
+                // `false`) deliberately skip — the live handler emits only a signal output for them,
+                // which the replica (mirroring state, not outputs) has nothing to apply. No `warn!`
+                // (the live engine already logged it). Hoisted above the mutation so pre-validation
+                // and application share one classification and cannot drift.
+                let adjust_options_in_place = classify_option_split(&kind).unwrap_or(false);
 
                 // Pre-compute the whole action BEFORE mutating anything, mirroring the live
                 // handler's Step 2c: if the live engine rejected it (Decimal overflow — equity,
@@ -337,17 +339,17 @@ where
                         .replica_engine_state_mut()
                         .instruments
                         .instrument_index_mut(&instrument);
-                    // Fail loudly on a missing id (matching the live handler + the option leg below):
-                    // the plan collected `pos_id` from this same replayed positions map, so a miss is
-                    // a plan/state divergence = corruption, which must crash rather than silently
-                    // drop a position and let replica state drift from the live engine.
-                    let Some(position) = instrument_state.position.positions.get_mut(&pos_id)
-                    else {
-                        unreachable!(
-                            "replica: SplitPlan carried equity position id {pos_id:?} absent from \
-                             instrument {instrument:?}'s positions map (id={id}, ratio={ratio})"
-                        );
-                    };
+                    // Fail loudly on a missing id (see `split_plan_position_mut`): the plan collected
+                    // `pos_id` from this same replayed map, so a miss is plan/state corruption that
+                    // must crash rather than let replica state drift from the live engine.
+                    let position = split_plan_position_mut(
+                        &mut instrument_state.position.positions,
+                        &pos_id,
+                        "replica equity",
+                        &instrument,
+                        &id,
+                        ratio,
+                    );
                     // Infallible: the shared prepare pass already computed (and overflow-checked)
                     // this position's rescale into `prepared`. The replica discards the returned
                     // `SplitResult` — it mirrors state, not outputs.
@@ -424,16 +426,16 @@ where
                         }
                         let option_last_price = option_state.data.price();
                         for (pos_id, prepared) in opt_plan.positions {
-                            // The plan collected `pos_id` from this map; fail loudly (matching the
-                            // strike-adjust `unreachable!` above) if that ever changes, mirroring the
-                            // live handler.
-                            let Some(position) = option_state.position.positions.get_mut(&pos_id)
-                            else {
-                                unreachable!(
-                                    "replica: SplitPlan carried position id {pos_id:?} absent from \
-                                     option {opt_key:?}'s positions map (id={id}, ratio={ratio})"
-                                );
-                            };
+                            // Fail loudly on a missing id (see `split_plan_position_mut`), mirroring
+                            // the live handler.
+                            let position = split_plan_position_mut(
+                                &mut option_state.position.positions,
+                                &pos_id,
+                                "replica option",
+                                &opt_key,
+                                &id,
+                                ratio,
+                            );
                             // Infallible: the shared prepare pass pre-computed this option leg's
                             // rescale into `prepared` (with `Fractional`, as the live handler does —
                             // the equity's whole-share-lot policy does not govern option legs). The
