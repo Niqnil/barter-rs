@@ -2602,8 +2602,8 @@ fn test_corporate_action_option_non_standard_no_open_orders_at_split() {
 /// non-integer contract count (state corruption): the engine emits
 /// `UnsupportedCorporateAction { reason: PositionStateInvalid }`, mutates **nothing** (option strike
 /// and the corrupt quantity are left as-is), and does **not** record the `id` — so the action stays
-/// retryable once the position is reconciled. Directly exercises the read-only pre-validation pass
-/// (`validate_corporate_action_split`) and the new rejection reason.
+/// retryable once the position is reconciled. Directly exercises the read-only pre-computation pass
+/// (`prepare_corporate_action_split`) and the new rejection reason.
 #[test]
 fn test_corporate_action_pre_validation_rejects_non_integer_option_contracts() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();
@@ -2712,8 +2712,8 @@ fn test_corporate_action_pre_validation_rejects_non_integer_option_contracts() {
 /// emits `UnsupportedCorporateAction { reason: ArithmeticOverflow }`, mutates **nothing**, and does
 /// **not** record the `id`. The end-to-end handler counterpart to the unit-level
 /// `position::tests::test_apply_split_ratio_overflow_is_err_and_leaves_position_unmutated` —
-/// exercising the overflow branch of the read-only pre-validation pass
-/// (`validate_corporate_action_split`) through the full `process_corporate_action` path.
+/// exercising the overflow branch of the read-only pre-computation pass
+/// (`prepare_corporate_action_split`) through the full `process_corporate_action` path.
 #[test]
 fn test_corporate_action_pre_validation_rejects_arithmetic_overflow() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();
@@ -2817,9 +2817,135 @@ fn test_corporate_action_pre_validation_rejects_arithmetic_overflow() {
     );
 }
 
+/// A **standard** split on an underlying whose option leg would overflow `Decimal` on rescale is
+/// rejected **atomically** — the option's strike is left at its pre-split value rather than being
+/// divided in place before the overflow. This is the option-path analog of
+/// `test_corporate_action_pre_validation_rejects_arithmetic_overflow` (which plants the overflow on
+/// the equity leg), and it exercises the fix that extended the read-only pre-computation pass
+/// (`prepare_corporate_action_split`) to cover **every option on the underlying** before any
+/// mutation: the handler used to divide `contract.strike` in place first, then panic when a held
+/// option position could not be rescaled, leaving a half-adjusted strike behind.
+///
+/// Note on the strike arithmetic itself: a standard split's `ratio` is always a whole number ≥ 2
+/// (OCC classification, `SplitAdjustmentKind::Standard`), so `strike ÷ ratio` only ever *shrinks*
+/// the strike and cannot itself overflow — its `checked_div` is defence-in-depth. The reachable
+/// option-leg overflow is the position's `quantity_abs × ratio`, planted here on a held option; the
+/// pre-computation still rejects the whole action before the strike (or anything else) is touched.
+#[test]
+fn test_corporate_action_pre_validation_rejects_option_leg_overflow() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // Marks for the option (idx0) and the spot underlying (idx1); open a small long call on the
+    // option so it is HELD (an unheld option's only split arithmetic is the strike division, which
+    // cannot overflow — see the doc comment).
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    // PLANT an adversarial contract count a forward split cannot rescale without overflowing
+    // `Decimal` (`Decimal::MAX × 2` has no representation). It is still a whole number, so it passes
+    // the integer-contract invariant and is rejected on the overflow branch, not `PositionStateInvalid`.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .position
+        .positions
+        .values_mut()
+        .next()
+        .expect("option position should exist")
+        .quantity_abs = Decimal::MAX;
+
+    // 2:1 STANDARD forward split on the Spot underlying (idx1). Pre-computation reaches the option
+    // scan (standard classification), pre-checks the strike (fine), then overflows on the option
+    // position rescale — rejecting the whole action.
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-option-overflow-2-1".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // Exactly the rejection observable, attributed to the splitting equity with the overflow reason.
+    let rejections: Vec<_> = outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::UnsupportedCorporateAction {
+                instrument, reason, ..
+            } => Some((*instrument, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejections.len(), 1, "expected exactly one rejection");
+    assert_eq!(rejections[0].0, InstrumentIndex(1));
+    assert_eq!(
+        rejections[0].1,
+        UnsupportedCorporateActionReason::ArithmeticOverflow
+    );
+
+    // Atomic — the key #181 assertion: the option's STRIKE was NOT divided in place. Before the fix
+    // the handler halved it (50_000 → 25_000) before hitting the un-rescalable position; now the
+    // whole action is rejected before any strike or position is touched.
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(
+        contract.strike,
+        dec!(50_000),
+        "the option strike must be left at its pre-split value (no partial in-place division)"
+    );
+    let position = option_state
+        .position
+        .positions
+        .values()
+        .next()
+        .expect("option position should persist");
+    assert_eq!(
+        position.quantity_abs,
+        Decimal::MAX,
+        "the planted contract count must be left as-is (no partial rescale)"
+    );
+
+    // The `id` was NOT recorded on the Spot target ⇒ retryable once the feed is corrected.
+    assert!(
+        !engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .corporate_actions_processed
+            .contains("BTCUSD-option-overflow-2-1"),
+        "a rejected action must not record its id"
+    );
+
+    // No option adjustment, remainder, or open-orders snapshot leaked through the rejection.
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OptionPositionAdjustedForSplit { .. }
+                | EngineOutput::SplitRemainder { .. }
+                | EngineOutput::OpenOrdersAtSplit { .. }
+        )),
+        "a rejected split must emit no option adjustment, remainder, or open-orders snapshot"
+    );
+}
+
 /// Live engine vs audit-replica parity for a **standard** option adjustment: the replica
-/// event-replays the in-place strike division + per-position `apply_split` deterministically (no
-/// output-mirror). Full `InstrumentState` equality for BOTH the option (idx0) and the spot (idx1)
+/// commits the pre-computed `SplitPlan` (post-split strike + per-position rescale) deterministically
+/// (no output-mirror). Full `InstrumentState` equality for BOTH the option (idx0) and the spot (idx1)
 /// guards against the handler and the replica drifting apart on the option path.
 #[test]
 fn test_corporate_action_option_replica_parity_standard_split() {
