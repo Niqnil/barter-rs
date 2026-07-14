@@ -1449,6 +1449,54 @@ fn test_contract_expiry_itm_call() {
     );
 }
 
+/// Regression for #166: `ContractExpiry` advances the `HistoricalClock` to the expiring
+/// instrument's `expiry` — engine-side ground truth on its `InstrumentKind` — so the synthetic
+/// settlement fill is stamped at the expiry instant rather than the prior market tick. The
+/// `ContractExpiry` event carries no timestamp on its payload (unlike `CorporateAction`'s
+/// `effective_time`), so the advance is derived in the handler from state, not the event.
+#[test]
+fn test_contract_expiry_advances_clock_to_expiry() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+
+    // The option's expiry, matching `build_option_engine`. The clock starts at
+    // `STARTING_TIMESTAMP` (MIN_UTC), far before this, so a genuine forward advance is exercised.
+    let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    // ITM call: spot (index 1) above strike (50_000) → settlement produces a closing fill.
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_option_position(&mut engine, dec!(1), dec!(2_000));
+
+    // Pre-expiry the clock reflects only the ~MIN_UTC market/open events, nowhere near 2030.
+    assert!(
+        engine.time() < expiry,
+        "precondition: clock has not yet advanced to expiry"
+    );
+
+    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    assert_eq!(exited.len(), 1);
+
+    // The settlement fill is stamped at ~expiry: its `time_exit` derives from the synthetic
+    // trade's `time_exchange = self.time()`, read after the clock advanced. An exact `==` is
+    // impossible by construction — `HistoricalClock::time()` adds the sub-second wall-clock delta
+    // since the advance — so a tight forward bound is the honest assertion (mirrors the
+    // `CorporateAction` clock test).
+    let fill_drift = exited[0].time_exit.signed_duration_since(expiry);
+    assert!(
+        fill_drift >= TimeDelta::zero() && fill_drift < TimeDelta::seconds(1),
+        "settlement fill stamped at ~expiry (drift {fill_drift})"
+    );
+
+    // The engine clock itself advanced to ~expiry (monotonic; no look-ahead beyond the expiry).
+    let clock_drift = engine.time().signed_duration_since(expiry);
+    assert!(
+        clock_drift >= TimeDelta::zero() && clock_drift < TimeDelta::seconds(1),
+        "clock advanced to ~expiry (drift {clock_drift})"
+    );
+}
+
 #[test]
 fn test_contract_expiry_idempotent() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();

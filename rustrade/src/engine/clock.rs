@@ -18,6 +18,29 @@ use tracing::{debug, error, warn};
 /// lookahead; see [`rustrade_data::event::MarketEvent::time_exchange`].
 pub trait EngineClock {
     fn time(&self) -> DateTime<Utc>;
+
+    /// Advance the clock's notion of "current time" to `time`, if `time` is later than the
+    /// current time (**monotonic** — never regresses).
+    ///
+    /// Used for engine events that carry no timestamp in their payload but whose effective
+    /// instant is derivable from engine state — e.g. [`EngineEvent::ContractExpiry`], whose
+    /// handler resolves the expiring instrument's `expiry` and advances the clock to it so a
+    /// backtest stamps the synthetic settlement fill at the expiry instant rather than the prior
+    /// market tick. Events that already carry their instant on the payload (e.g.
+    /// [`EngineEvent::CorporateAction`]'s `effective_time`) advance the clock via the normal
+    /// [`TimeExchange`] path in [`Processor::process`](crate::engine::Processor::process) and do
+    /// not use this method.
+    ///
+    /// The default implementation is a no-op, correct for clocks that derive time externally
+    /// (e.g. [`LiveClock`], which reads `Utc::now()`). [`HistoricalClock`] overrides it.
+    ///
+    /// # Implementors
+    /// If your [`time`](Self::time) is derived from the timestamps of processed events (like
+    /// [`HistoricalClock`]) rather than a live wall-clock source, you **must** override this
+    /// method. The default no-op would otherwise silently prevent payload-timeless events such as
+    /// [`EngineEvent::ContractExpiry`] from advancing your clock to their derived instant —
+    /// reproducing the stale-stamp bug this method exists to fix.
+    fn advance_to(&self, _time: DateTime<Utc>) {}
 }
 
 /// Defines how to extract an "exchange timestamp" from an event.
@@ -86,6 +109,21 @@ impl EngineClock for HistoricalClock {
         match delta_since_last_event_live_time {
             delta if delta.num_milliseconds() >= 0 => time_exchange_last.add(delta),
             _ => time_exchange_last,
+        }
+    }
+
+    fn advance_to(&self, time: DateTime<Utc>) {
+        let mut lock = self.inner.write();
+        // Monotonic: only advance strictly forwards; an earlier — or equal — `time` is a no-op, so
+        // the clock never regresses and repeated advances to the same instant (e.g. several
+        // instruments expiring together) don't keep re-basing the wall-clock delta. This is
+        // stricter than `process`'s in-order branch (`>=`, which re-anchors on an equal
+        // `time_exchange`) — here there is no boundary event to stamp, so the strict `>` is the
+        // cheaper, equivalent choice. On a genuine advance the `time_live_last_event` reset re-bases
+        // the wall-clock delta so `time()` reads from the new `time_exchange_last`.
+        if time > lock.time_exchange_last {
+            lock.time_exchange_last = time;
+            lock.time_live_last_event = Utc::now();
         }
     }
 }
@@ -404,5 +442,23 @@ mod tests {
             intraday_later,
             "an earlier midnight split must not regress time_exchange_last"
         );
+    }
+
+    #[test]
+    fn test_historical_clock_advance_to_is_monotonic() {
+        let base = DateTime::<Utc>::MIN_UTC;
+        let later = base + TimeDelta::days(365);
+
+        // Advancing forward moves time_exchange_last to the target (the ContractExpiry use-case:
+        // jump the clock to a far-future contract expiry before stamping the settlement fill).
+        let clock = HistoricalClock::new(base);
+        clock.advance_to(later);
+        assert_eq!(clock.inner.read().time_exchange_last, later);
+
+        // Advancing to an earlier — or equal — instant is a no-op: the clock never regresses.
+        clock.advance_to(base);
+        assert_eq!(clock.inner.read().time_exchange_last, later);
+        clock.advance_to(later);
+        assert_eq!(clock.inner.read().time_exchange_last, later);
     }
 }

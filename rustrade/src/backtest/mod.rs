@@ -6,8 +6,8 @@ use crate::{EngineEvent, Timed};
 use crate::{
     backtest::{
         aux_events::{
-            AuxEventSource, NoAuxEvents, assert_aux_corporate_action_effective_times,
-            assert_aux_events_sorted,
+            AuxEventSource, NoAuxEvents, assert_aux_contract_expiry_times,
+            assert_aux_corporate_action_effective_times, assert_aux_events_sorted,
         },
         market_data::BacktestMarketData,
         summary::{BacktestResult, BacktestSummary, MultiBacktestSummary},
@@ -301,6 +301,13 @@ where
     // cannot see the wrapping `Timed`, so this pre-merge site is the only place to catch it. Hard
     // panic, handful-sized scan. See [`assert_aux_corporate_action_effective_times`].
     assert_aux_corporate_action_effective_times(&aux);
+    // Enforce the third `AuxEventSource` obligation: every injected `ContractExpiry`'s wrapping
+    // `Timed::time` must equal its target instrument's own `expiry` (engine-side ground truth on the
+    // `InstrumentKind`). The instant is not on the payload, so — like the corporate-action check —
+    // the handler cannot see the wrapping `Timed`; a mismatch would order the expiry at one instant
+    // but settle it at another (silent look-ahead). Hard panic, handful-sized scan. See
+    // [`assert_aux_contract_expiry_times`].
+    assert_aux_contract_expiry_times(&aux, &args_constant.instruments);
 
     // Seed the clock from the earliest of the first market event and the first aux event, so an aux
     // event scheduled before the first market tick still orders and stamps correctly.
