@@ -115,7 +115,7 @@ async fn main() {
         risk: DefaultRiskManager::<EngineState<DefaultGlobalData, CandleInstrumentData>>::default(),
     };
 
-    let summary = backtest(args_constant, args_dynamic).await.unwrap();
+    let summary = backtest(args_constant, args_dynamic).await.unwrap().summary;
 
     println!("\nBacktest complete (BacktestId = {})", summary.id);
     summary.trading_summary.print_summary();

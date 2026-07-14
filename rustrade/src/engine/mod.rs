@@ -472,6 +472,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             _ => None,
         };
 
+        // Capture the contract expiry while `instrument_state` is already borrowed (used further
+        // below to advance the engine clock) — avoids a second `instrument_index` lookup for `kind`.
+        let expiry = instrument_state.instrument.kind.expiry();
+
         let spot_price = match option_spec {
             Some((base_key, quote_key, exchange)) => {
                 // Find the spot instrument on the same exchange whose underlying matches
@@ -555,6 +559,16 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             .keys()
             .cloned()
             .collect();
+
+        // Advance the engine clock to the contract's expiry instant before stamping the synthetic
+        // settlement trades below. The `ContractExpiry` event carries no timestamp on its payload
+        // (unlike `CorporateAction`, whose `effective_time` advances the clock via `TimeExchange`),
+        // so without this a backtest would stamp the settlement fill at the prior market tick. The
+        // expiry instant is engine-side ground truth on the instrument's kind (captured above).
+        // `advance_to` is monotonic and a no-op on `LiveClock`; non-expiring kinds yield `None`.
+        if let Some(expiry) = expiry {
+            self.clock.advance_to(expiry);
+        }
 
         // Engine clock time for all synthetic trades in this expiry batch.
         // Using self.time() (not Utc::now()) keeps backtests deterministic.

@@ -1,7 +1,8 @@
 use crate::{EngineEvent, Timed};
 use rustrade_data::event::DataKind;
 use rustrade_instrument::{
-    asset::AssetIndex, exchange::ExchangeIndex, instrument::InstrumentIndex,
+    asset::AssetIndex, exchange::ExchangeIndex, index::IndexedInstruments,
+    instrument::InstrumentIndex,
 };
 use std::sync::Arc;
 
@@ -30,16 +31,27 @@ use std::sync::Arc;
 ///   at another. The backtest harness **enforces** this pre-merge via
 ///   [`assert_aux_corporate_action_effective_times`] (a hard panic naming the offending event) — the
 ///   handler itself cannot see the wrapping `Timed`, so keep the two equal to pass the check.
+/// - For an [`EngineEvent::ContractExpiry`](crate::EngineEvent::ContractExpiry), the wrapping
+///   [`Timed::time`] MUST equal the target instrument's own `expiry` (engine-side ground truth on
+///   its `InstrumentKind`). Unlike `CorporateAction`, the instant is not on the payload — the merge
+///   positions the event by `Timed::time`, while the handler advances the clock to the instrument's
+///   `expiry` (see below). A mismatch would *order* the expiry at one instant but *settle* it at
+///   another. Enforced pre-merge via [`assert_aux_contract_expiry_times`] (a hard panic naming the
+///   offending event); non-expiring or unregistered targets are skipped.
 ///
-/// # Limitation — `ContractExpiry` does not advance the backtest clock
-/// [`EngineEvent::ContractExpiry`](crate::EngineEvent::ContractExpiry) carries no timestamp (unlike
-/// [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction), which carries
-/// `effective_time`). An injected expiry is therefore **ordered** correctly within the merged
-/// stream but does **not** advance the
-/// [`HistoricalClock`](crate::engine::clock::HistoricalClock): its synthetic settlement fill is
-/// stamped at the prior market tick, not the expiry instant. `CorporateAction` is unaffected (it
-/// advances the clock to its `effective_time`). If exact expiry-instant stamping matters, drive a
-/// market event at the expiry time alongside the injected `ContractExpiry`.
+/// # `ContractExpiry` clock advance
+/// [`EngineEvent::ContractExpiry`](crate::EngineEvent::ContractExpiry) carries no timestamp on its
+/// payload (unlike [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction), which
+/// carries `effective_time`). Its effective instant is instead engine-side ground truth: the
+/// handler resolves the expiring instrument's `expiry` from its `InstrumentKind` and advances the
+/// [`HistoricalClock`](crate::engine::clock::HistoricalClock) to it via
+/// [`EngineClock::advance_to`](crate::engine::clock::EngineClock::advance_to), so the synthetic
+/// settlement fill is stamped at the expiry instant rather than the prior market tick. As with
+/// `CorporateAction`, position the injected expiry in the merged stream by its [`Timed::time`]; the
+/// handler always settles at the instrument's own `expiry`, so keep the wrapping `Timed::time` equal
+/// to that `expiry` (a mismatch would *order* the expiry at one instant but *settle* it at another).
+/// The harness enforces this equality pre-merge — see the caller obligation above and
+/// [`assert_aux_contract_expiry_times`].
 pub trait AuxEventSource<
     MarketKind = DataKind,
     ExchangeKey = ExchangeIndex,
@@ -137,6 +149,49 @@ pub(crate) fn assert_aux_corporate_action_effective_times<
     }
 }
 
+/// Panic if any injected [`EngineEvent::ContractExpiry`] carries a wrapping [`Timed::time`] that
+/// differs from its target instrument's own `expiry` (the third [`AuxEventSource`] caller
+/// obligation).
+///
+/// Unlike [`assert_aux_corporate_action_effective_times`], the effective instant is **not** on the
+/// event payload — it is engine-side ground truth on the instrument's
+/// [`InstrumentKind`](rustrade_instrument::instrument::kind::InstrumentKind). The merge **positions**
+/// the expiry by `Timed::time`, while the handler advances the
+/// [`HistoricalClock`](crate::engine::clock::HistoricalClock) to the resolved `expiry` and stamps the
+/// synthetic settlement fill there. If the two disagree the expiry is *ordered* at one instant but
+/// *settled* at another — a silent look-ahead / stale-stamp bug with no failure point in a release
+/// build. This resolves each target via [`IndexedInstruments::find_instrument`] and enforces the
+/// equality at the same pre-merge site as [`assert_aux_events_sorted`] (a hard panic in all builds —
+/// the handler itself cannot see the wrapping `Timed`, so the harness is the only place this can be
+/// checked). Events whose target is non-expiring (`expiry() == None`) or not registered are skipped
+/// — those are not this check's concern (the engine surfaces an unregistered target on its own). The
+/// O(N) scan over the handful-sized aux set is negligible, and the message names the offending event
+/// so a failing source is debuggable without a rebuild.
+pub(crate) fn assert_aux_contract_expiry_times<MarketKind, AssetKey>(
+    events: &[Timed<EngineEvent<MarketKind, ExchangeIndex, AssetKey, InstrumentIndex>>],
+    instruments: &IndexedInstruments,
+) {
+    for (i, event) in events.iter().enumerate() {
+        let EngineEvent::ContractExpiry(key) = &event.value else {
+            continue;
+        };
+        // Skip unregistered targets — the engine handler surfaces those separately; this check owns
+        // only the time-vs-expiry equality.
+        let Ok(instrument) = instruments.find_instrument(*key) else {
+            continue;
+        };
+        if let Some(expiry) = instrument.kind.expiry()
+            && expiry != event.time
+        {
+            panic!(
+                "AuxEventSource ContractExpiry ({key}) at events[{i}] must carry Timed::time == \
+                 the instrument's expiry; expiry={expiry:?} != Timed::time={:?}",
+                event.time,
+            );
+        }
+    }
+}
+
 /// In-memory [`AuxEventSource`] backed by an [`Arc`]'d, pre-sorted `Vec`.
 ///
 /// Mirrors [`MarketDataInMemory`](super::market_data::MarketDataInMemory): cloning is O(1) (an
@@ -195,7 +250,7 @@ mod tests {
     use super::*;
     use crate::SplitRoundingPolicy;
     use crate::shutdown::Shutdown;
-    use chrono::DateTime;
+    use chrono::{DateTime, Utc};
     use rust_decimal::Decimal;
     use rustrade_instrument::corporate_action::{CorporateActionKind, SplitRatio};
 
@@ -275,5 +330,86 @@ mod tests {
             AssetIndex,
             InstrumentIndex,
         >(&[corp_action(1_000, 2_000)]);
+    }
+
+    fn time_at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).expect("valid timestamp")
+    }
+
+    /// A `ContractExpiry` event ordered at `time_secs`, targeting `InstrumentIndex(0)`.
+    fn contract_expiry(time_secs: i64) -> Timed<EngineEvent> {
+        Timed::new(
+            EngineEvent::ContractExpiry(InstrumentIndex::new(0)),
+            time_at(time_secs),
+        )
+    }
+
+    /// `IndexedInstruments` holding one instrument at `InstrumentIndex(0)`, either a `Future`
+    /// expiring at `expiry_secs` (`Some`) or a non-expiring `Spot` (`None`), so the expiry-vs-time
+    /// check and its non-expiring skip branch can both be exercised.
+    fn instruments_with(expiry_secs: Option<i64>) -> IndexedInstruments {
+        use rustrade_instrument::{
+            Underlying,
+            exchange::ExchangeId,
+            index::builder::IndexedInstrumentsBuilder,
+            instrument::{
+                Instrument, kind::InstrumentKind, kind::future::FutureContract,
+                quote::InstrumentQuoteAsset,
+            },
+            test_utils::asset,
+        };
+
+        let kind = match expiry_secs {
+            Some(secs) => InstrumentKind::Future(FutureContract {
+                contract_size: Decimal::from(1),
+                settlement_asset: asset("usdt"),
+                expiry: time_at(secs),
+            }),
+            None => InstrumentKind::Spot,
+        };
+        IndexedInstrumentsBuilder::default()
+            .add_instrument(Instrument::new(
+                ExchangeId::BinanceSpot,
+                "btc_usdt_future",
+                "btc_usdt_future",
+                Underlying::new(asset("btc"), asset("usdt")),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                kind,
+                None,
+            ))
+            .build()
+    }
+
+    #[test]
+    fn assert_aux_contract_expiry_times_accepts_matching_time() {
+        // Timed::time == the Future's own expiry satisfies the contract; the trailing non-expiry
+        // event (Shutdown) is ignored. No panic.
+        assert_aux_contract_expiry_times(
+            &[contract_expiry(2_000), at(3_000)],
+            &instruments_with(Some(2_000)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Timed::time == the instrument's expiry")]
+    fn assert_aux_contract_expiry_times_panics_on_mismatch() {
+        // Ordered at Timed::time=1000 but the instrument expires at 2000 — a silent look-ahead the
+        // hard assert (all builds) must catch, naming the offending event.
+        assert_aux_contract_expiry_times(&[contract_expiry(1_000)], &instruments_with(Some(2_000)));
+    }
+
+    #[test]
+    fn assert_aux_contract_expiry_times_skips_non_expiring_and_unregistered() {
+        use rustrade_instrument::index::builder::IndexedInstrumentsBuilder;
+
+        // A ContractExpiry targeting a non-expiring (Spot ⇒ expiry() == None) instrument is not
+        // this check's concern — no expiry to compare against — so the time mismatch is ignored.
+        assert_aux_contract_expiry_times(&[contract_expiry(1_000)], &instruments_with(None));
+        // An empty registry ⇒ find_instrument errors ⇒ the target is skipped (the engine surfaces
+        // an unregistered target on its own). No panic despite an arbitrary Timed::time.
+        assert_aux_contract_expiry_times(
+            &[contract_expiry(1_000)],
+            &IndexedInstrumentsBuilder::default().build(),
+        );
     }
 }

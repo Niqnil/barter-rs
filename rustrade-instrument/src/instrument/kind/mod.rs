@@ -4,6 +4,7 @@ use crate::instrument::{
         MarketDataFutureContract, MarketDataInstrumentKind, MarketDataOptionContract,
     },
 };
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,16 @@ impl<AssetKey> InstrumentKind<AssetKey> {
             InstrumentKind::Perpetual(kind) => kind.contract_size,
             InstrumentKind::Future(kind) => kind.contract_size,
             InstrumentKind::Option(kind) => kind.contract_size,
+        }
+    }
+
+    /// Returns the contract expiry instant for expiring kinds (`Future` & `Option`), and `None`
+    /// for the non-expiring `Spot` & `Perpetual` kinds.
+    pub fn expiry(&self) -> Option<DateTime<Utc>> {
+        match self {
+            InstrumentKind::Spot | InstrumentKind::Perpetual(_) => None,
+            InstrumentKind::Future(kind) => Some(kind.expiry),
+            InstrumentKind::Option(kind) => Some(kind.expiry),
         }
     }
 

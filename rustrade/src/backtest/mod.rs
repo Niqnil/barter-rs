@@ -6,11 +6,11 @@ use crate::{EngineEvent, Timed};
 use crate::{
     backtest::{
         aux_events::{
-            AuxEventSource, NoAuxEvents, assert_aux_corporate_action_effective_times,
-            assert_aux_events_sorted,
+            AuxEventSource, NoAuxEvents, assert_aux_contract_expiry_times,
+            assert_aux_corporate_action_effective_times, assert_aux_events_sorted,
         },
         market_data::BacktestMarketData,
-        summary::{BacktestSummary, MultiBacktestSummary},
+        summary::{BacktestResult, BacktestSummary, MultiBacktestSummary},
     },
     engine::{
         Processor,
@@ -168,9 +168,18 @@ where
 {
     let time_start = std::time::Instant::now();
 
-    let backtest_futures = args_dynamic_iter
-        .into_iter()
-        .map(|args_dynamic| backtest(Arc::clone(&args_constant), args_dynamic));
+    // Project each run down to its `summary` inside its own future, so the terminal `EngineState`
+    // is dropped as that run completes rather than pinned in the joined output until the whole
+    // batch finishes. The batch path intentionally does not retain per-run terminal `EngineState`
+    // (callers needing it drive `backtest` directly).
+    let backtest_futures = args_dynamic_iter.into_iter().map(|args_dynamic| {
+        let args_constant = Arc::clone(&args_constant);
+        async move {
+            backtest(args_constant, args_dynamic)
+                .await
+                .map(|result| result.summary)
+        }
+    });
 
     // Run all backtests concurrently
     let summaries = try_join_all(backtest_futures).await?;
@@ -194,16 +203,19 @@ where
 /// before the first market tick still orders and stamps correctly. The merge/tie-break/seed logic is
 /// unit-tested in `backtest::tests`.
 ///
-/// # What the returned summary does and does not contain
-/// This function returns only a [`BacktestSummary`] whose `trading_summary` aggregates statistics
-/// derived from **closed** positions (PnL, returns, drawdown per `TearSheet`). It does **not** expose
-/// final engine/position state: a position left **open** at the end of the run — e.g. one that took a
-/// stock split but no subsequent closing fill — contributes nothing to `trading_summary`, and a
-/// notional-preserving split moves no aggregate metric on its own. Callers needing to inspect
-/// post-run positions (or assert that a corporate action mutated a position) must drive their own
-/// engine harness; the split *economics* are asserted at the `Engine::process_with_audit` seam (see
-/// the `test_corporate_action_*` tests), which this path cannot reach because it hardcodes
-/// [`AuditMode::Disabled`] — the per-event `EngineOutput` stream is therefore not observable here.
+/// # What the returned result contains
+/// Returns a [`BacktestResult`] with two parts:
+/// - `summary`: a [`BacktestSummary`] whose `trading_summary` aggregates statistics derived from
+///   **closed** positions (PnL, returns, drawdown per `TearSheet`). A position left **open** at the
+///   end of the run — e.g. one that took a stock split but no subsequent closing fill — contributes
+///   nothing to it, and a notional-preserving split moves no aggregate metric on its own.
+/// - `engine_state`: the terminal [`EngineState`], so callers can inspect post-run positions directly
+///   (e.g. assert a corporate action rescaled an open position's `quantity_abs` /
+///   `price_entry_average`) without driving their own engine harness.
+///
+/// This path hardcodes [`AuditMode::Disabled`], so the per-event `EngineOutput` audit stream is not
+/// observable here; the split *economics per event* are asserted at the `Engine::process_with_audit`
+/// seam (see the `test_corporate_action_*` tests). The terminal `engine_state` exposes the net effect.
 pub async fn backtest<
     MarketData,
     SummaryInterval,
@@ -222,7 +234,7 @@ pub async fn backtest<
         >,
     >,
     args_dynamic: BacktestArgsDynamic<Strategy, Risk>,
-) -> Result<BacktestSummary<SummaryInterval>, BarterError>
+) -> Result<BacktestResult<SummaryInterval, EngineState<GlobalData, InstrumentData>>, BarterError>
 where
     MarketData: BacktestMarketData<Kind = InstrumentData::MarketEventKind>,
     SummaryInterval: TimeInterval,
@@ -289,6 +301,13 @@ where
     // cannot see the wrapping `Timed`, so this pre-merge site is the only place to catch it. Hard
     // panic, handful-sized scan. See [`assert_aux_corporate_action_effective_times`].
     assert_aux_corporate_action_effective_times(&aux);
+    // Enforce the third `AuxEventSource` obligation: every injected `ContractExpiry`'s wrapping
+    // `Timed::time` must equal its target instrument's own `expiry` (engine-side ground truth on the
+    // `InstrumentKind`). The instant is not on the payload, so — like the corporate-action check —
+    // the handler cannot see the wrapping `Timed`; a mismatch would order the expiry at one instant
+    // but settle it at another (silent look-ahead). Hard panic, handful-sized scan. See
+    // [`assert_aux_contract_expiry_times`].
+    assert_aux_contract_expiry_times(&aux, &args_constant.instruments);
 
     // Seed the clock from the earliest of the first market event and the first aux event, so an aux
     // event scheduled before the first market tick still orders and stamps correctly.
@@ -345,10 +364,15 @@ where
         .trading_summary_generator(args_dynamic.risk_free_return)
         .generate(args_constant.summary_interval);
 
-    Ok(BacktestSummary {
-        id: args_dynamic.id,
-        risk_free_return: args_dynamic.risk_free_return,
-        trading_summary,
+    // `trading_summary_generator` only borrows the engine, so the terminal state can be moved out
+    // here and returned for direct post-run inspection (open positions, balances, instrument state).
+    Ok(BacktestResult {
+        summary: BacktestSummary {
+            id: args_dynamic.id,
+            risk_free_return: args_dynamic.risk_free_return,
+            trading_summary,
+        },
+        engine_state: engine.state,
     })
 }
 

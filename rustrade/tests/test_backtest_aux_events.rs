@@ -39,6 +39,7 @@ use rustrade::{
             trading::TradingState,
         },
     },
+    execution::AccountStreamEvent,
     risk::DefaultRiskManager,
     statistic::time::Daily,
     strategy::DefaultStrategy,
@@ -49,9 +50,16 @@ use rustrade_data::{
     streams::consumer::MarketStreamEvent,
     subscription::trade::PublicTrade,
 };
+use rustrade_execution::{
+    AccountEvent, AccountEventKind,
+    order::id::{OrderId, StrategyId},
+    trade::{AssetFees, Trade, TradeId},
+};
 use rustrade_instrument::{
+    Side,
+    asset::AssetIndex,
     corporate_action::{CorporateActionKind, SplitRatio},
-    exchange::ExchangeId,
+    exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::InstrumentIndex,
 };
@@ -201,7 +209,8 @@ async fn backtest_runs_with_corporate_action_injected_mid_stream() {
 
     let summary = backtest(args_constant(aux), args_dynamic("with-split"))
         .await
-        .expect("backtest with an injected split must complete");
+        .expect("backtest with an injected split must complete")
+        .summary;
 
     assert_eq!(summary.id, "with-split");
 }
@@ -218,7 +227,8 @@ async fn backtest_runs_with_contract_expiry_injected_mid_stream() {
 
     let summary = backtest(args_constant(aux), args_dynamic("with-expiry"))
         .await
-        .expect("backtest with an injected contract expiry must complete");
+        .expect("backtest with an injected contract expiry must complete")
+        .summary;
 
     assert_eq!(summary.id, "with-expiry");
 }
@@ -231,7 +241,8 @@ async fn backtest_runs_with_aux_event_before_first_market_event() {
 
     let summary = backtest(args_constant(aux), args_dynamic("early-split"))
         .await
-        .expect("backtest with an aux event before the first market tick must complete");
+        .expect("backtest with an aux event before the first market tick must complete")
+        .summary;
 
     assert_eq!(summary.id, "early-split");
 
@@ -318,7 +329,108 @@ async fn backtest_non_standard_split_seam_carries_corporate_action_and_close_com
         args_dynamic("non-standard-identity-change"),
     )
     .await
-    .expect("backtest carrying a CorporateAction + a flatten Command must complete");
+    .expect("backtest carrying a CorporateAction + a flatten Command must complete")
+    .summary;
 
     assert_eq!(summary.id, "non-standard-identity-change");
+}
+
+/// A synthetic fill for `instrument` opening a long position of `quantity` @ `price`, wrapped for
+/// injection through the aux seam. Injecting the fill directly (rather than routing an order through
+/// the `MockExchange`) keeps the open deterministic and in simulated-time order with the split: the
+/// mock's fill is async and latency-delayed, so it would race the split's application.
+fn seed_long_position_event(
+    time: &str,
+    instrument: usize,
+    price: Decimal,
+    quantity: Decimal,
+) -> Timed<EngineEvent> {
+    Timed::new(
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::Trade(Trade {
+                id: TradeId::new("seed-fill"),
+                order_id: OrderId::new("seed-fill"),
+                instrument: InstrumentIndex::new(instrument),
+                strategy: StrategyId::new("seed"),
+                time_exchange: ts(time),
+                side: Side::Buy,
+                price,
+                // Zero fees keep `price_entry_average` clean; the asset only needs to be a valid
+                // index (fees don't affect the split-scaled fields asserted below).
+                quantity,
+                fees: AssetFees::new(AssetIndex(0), dec!(0), Some(dec!(0))),
+            }),
+        })),
+        ts(time),
+    )
+}
+
+/// **Value-bearing economics through the public async `backtest()` path — unlocked by returning the
+/// terminal `engine_state`.**
+///
+/// A 2:1 forward stock split is notional-preserving, so it moves no aggregate `trading_summary`
+/// metric and the position stays **open** — meaning before `backtest()` exposed `engine_state`, this
+/// effect was assertable only at the lower-level `process_with_audit` seam (see
+/// `test_engine_process_engine_event_with_audit.rs`). Now the split's rescaling of an open position
+/// is observable directly on the result: `quantity_abs` doubles and `price_entry_average` halves.
+///
+/// Sequencing (merged into simulated-time order by the aux seam): first market tick 22:00 → seed
+/// fill 22:05 (opens 5 @ 100) → split 22:30 (2:1) → later ticks. `DefaultStrategy` issues no orders,
+/// so the seeded position is never closed and survives to the terminal state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backtest_split_rescales_open_position_observable_in_engine_state() {
+    let aux = AuxEventsInMemory::new(Arc::new(vec![
+        seed_long_position_event("2025-03-24T22:05:00Z", 0, dec!(100), dec!(5)),
+        // 2:1 forward split, Fractional policy (no flooring): quantity_abs ×2, price_entry_average ÷2.
+        split_event("2025-03-24T22:30:00Z", dec!(2)),
+    ]));
+
+    let engine_state = backtest(args_constant(aux), args_dynamic("split-open-position"))
+        .await
+        .expect("backtest applying a split to an open position must complete")
+        .engine_state;
+
+    let instrument_state = engine_state
+        .instruments
+        .instrument_index(&InstrumentIndex::new(0));
+
+    // The notional-preserving split leaves the position open (nothing closes it).
+    assert_eq!(
+        instrument_state.position.positions.len(),
+        1,
+        "the seeded long position must survive the split, still open at shutdown"
+    );
+    let position = instrument_state
+        .position
+        .positions
+        .values()
+        .next()
+        .expect("exactly one open position");
+
+    // The economic assertions the summary-only API could not reach:
+    assert_eq!(
+        position.quantity_abs,
+        dec!(10),
+        "2:1 forward split doubles quantity_abs (5 → 10)"
+    );
+    assert_eq!(
+        position.price_entry_average,
+        dec!(50),
+        "2:1 forward split halves price_entry_average (100 → 50), preserving notional"
+    );
+    assert_eq!(
+        position.quantity_abs_max,
+        dec!(10),
+        "quantity_abs_max scales with the split, unfloored (5 → 10)"
+    );
+
+    // The split's idempotency id is recorded on the instrument, proving the action was applied (not
+    // suppressed) on this path.
+    assert!(
+        instrument_state
+            .corporate_actions_processed
+            .contains("btcusdt-2025-03-24-split"),
+        "the applied split's id must be recorded on the instrument state"
+    );
 }

@@ -221,7 +221,9 @@ fn bench_backtest(
         b.iter_batched(
             || (Arc::clone(&args_constant), args_dynamic.clone()),
             |(constant, dynamic)| {
-                rt.block_on(async move { backtest::backtest(constant, dynamic).await.unwrap() })
+                rt.block_on(
+                    async move { backtest::backtest(constant, dynamic).await.unwrap().summary },
+                )
             },
             criterion::BatchSize::SmallInput,
         );

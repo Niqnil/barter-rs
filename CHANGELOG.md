@@ -139,6 +139,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameters cannot carry a default, so callers that spell the generics explicitly (turbofish, or a
   fully type-annotated function pointer) must account for the extra argument. Callers that rely on
   inference are unaffected.
+- **`backtest` now returns `BacktestResult { summary, engine_state }`, not a bare `BacktestSummary`**
+  (`rustrade`). The terminal `EngineState` is returned alongside the summary so callers can inspect
+  post-run state directly — open positions, balances, instrument state — which the aggregate
+  `TradingSummary` (closed-position statistics only) cannot express. This makes the net effect of a
+  notional-preserving corporate action assertable through the public async `backtest` path (e.g. a
+  stock split's rescaling of a position left open at shutdown). **Breaking**: replace `summary` with
+  `result.summary` at the call site (e.g. `backtest(..).await?.summary`); the new terminal state is
+  `result.engine_state`. `run_backtests` is **unchanged** — it still returns `MultiBacktestSummary`
+  and does not retain per-run `EngineState` (drive `backtest` directly when the terminal state is
+  needed).
+- **`ContractExpiry` now advances the backtest clock to the contract's expiry instant** (`rustrade`).
+  When the engine processes an `EngineEvent::ContractExpiry`, the `HistoricalClock` now advances to
+  the expiring instrument's `expiry` (read from its `InstrumentKind`) before synthesising the
+  settlement fill, so the fill — and the resulting `PositionExit` — is stamped at the expiry instant
+  rather than the prior market tick. Previously the event carried no timestamp on its payload and
+  left the clock unmoved (unlike `CorporateAction`, which advances to its `effective_time`).
+  Non-breaking: adds an `EngineClock::advance_to` **default** method (a no-op, so `LiveClock` and any
+  downstream `EngineClock` impl are unaffected) and a new `InstrumentKind::expiry()` accessor
+  (`rustrade-instrument`, `Some` for `Future`/`Option`, `None` otherwise). A backtest that injects a
+  `ContractExpiry` via an `AuxEventSource` must now position it in the merged stream by the target
+  instrument's own `expiry` (the harness enforces `Timed::time == expiry` with a hard pre-merge
+  panic, mirroring the existing `CorporateAction` `effective_time` check), so a mismatch fails loudly
+  instead of silently ordering the expiry at one instant while settling it at another.
 - **Alpaca client error variants** (`rustrade-data`, feature-gated `alpaca`). `AlpacaOptionsError` is
   now a type alias of the shared `AlpacaRestError`, which adds an `InvalidCredential` variant. The
   `AlpacaOptionsClient` constructor now reports a credential that cannot be encoded as an HTTP header

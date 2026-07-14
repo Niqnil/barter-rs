@@ -173,7 +173,8 @@ async fn main() {
 
     let summary = backtest(args_constant, args_dynamic)
         .await
-        .expect("backtest with an injected corporate action must complete");
+        .expect("backtest with an injected corporate action must complete")
+        .summary;
 
     println!(
         "Backtest '{}' completed with an injected 2:1 split.",
