@@ -99,6 +99,21 @@ fn engine_output_stays_boxed_and_small() {
     );
 }
 
+/// Regression guard for #194: the never-constructed `ActionOutput::GenerateAlgoOrders` variant
+/// (a ~928 B `GenerateAlgoOrdersOutput`) was removed, dropping `ActionOutput`'s size floor to its
+/// largest live variant `ClosePositions(SendCancelsAndOpensOutput)` (~608 B). This bound catches a
+/// reintroduction of an algo-order-sized variant (which would jump back to ~928 B) while leaving
+/// headroom for unrelated field growth.
+#[test]
+fn action_output_stays_small_after_dropping_algo_variant() {
+    let size = std::mem::size_of::<ActionOutput<ExchangeIndex, InstrumentIndex>>();
+    assert!(
+        size <= 640,
+        "ActionOutput grew to {size} B (expected <= 640): was a GenerateAlgoOrders-sized variant \
+         reintroduced? The dead algo variant was removed to drop the size floor (#194)."
+    );
+}
+
 const STARTING_TIMESTAMP: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
 const RISK_FREE_RETURN: Decimal = dec!(0.05);
 const STARTING_BALANCE_USDT: Balance = Balance::new(dec!(40_000.0), dec!(40_000.0));

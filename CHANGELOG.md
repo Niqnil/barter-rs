@@ -210,6 +210,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unstable box patterns and must be rewritten this way. Value **construction** only needs `Box::new(..)`
   around the payload. **No wire change**: `Box<T>` serializes identically to `T`, so persisted audit
   streams are unaffected.
+- **`ActionOutput::GenerateAlgoOrders` variant removed** (`rustrade`). The variant was never
+  constructed by the engine — `Command` has no algo-order variant, `Engine::action()` only emits
+  `CancelOrders`/`OpenOrders`/`ClosePositions`, and the per-tick algo path builds
+  `EngineOutput::AlgoOrders` directly — so it was reachable only through the derived `From` impl. Its
+  ~928 B `GenerateAlgoOrdersOutput` payload set `ActionOutput`'s size floor; removing it drops the
+  enum ~928 → ~608 B (largest remaining variant `ClosePositions`). **Breaking** only for downstream
+  code that matched or constructed `ActionOutput::GenerateAlgoOrders` (no in-tree or known downstream
+  use). Migration: delete any such match arm; algo-order work is surfaced via `EngineOutput::AlgoOrders`.
 
 ### Removed
 
