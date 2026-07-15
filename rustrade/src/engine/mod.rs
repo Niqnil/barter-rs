@@ -1338,12 +1338,30 @@ pub enum EngineOutput<
     ExchangeKey = ExchangeIndex,
     InstrumentKey = InstrumentIndex,
 > {
-    Commanded(ActionOutput<ExchangeKey, InstrumentKey>),
+    /// Output of an actioned [`Command`](super::command::Command).
+    ///
+    /// **Boxed:** [`ActionOutput`] embeds a `GenerateAlgoOrdersOutput` (~928 B), which would
+    /// otherwise pin `EngineOutput`'s stack size — and thus the per-tick
+    /// [`ProcessAudit`](super::audit::ProcessAudit) copy — to that size on **every** event, even
+    /// though this command-only variant is rarely the one produced. Boxing moves the payload to the
+    /// heap so the common per-tick outputs stay small (`EngineOutput` 936 → 232 B). `Box<T>` is
+    /// serde-transparent, so the audit wire format is unchanged.
+    Commanded(Box<ActionOutput<ExchangeKey, InstrumentKey>>),
     OnTradingDisabled(OnTradingDisabled),
     AccountDisconnect(OnDisconnect),
     PositionExit(PositionExited<AssetIndex, InstrumentKey>),
     MarketDisconnect(OnDisconnect),
-    AlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
+
+    /// Summary of algorithmic orders generated for a processed event (the per-tick auto-generation
+    /// path).
+    ///
+    /// **Boxed:** `GenerateAlgoOrdersOutput` is ~928 B and this variant is only produced when the
+    /// strategy actually emits orders (the empty case short-circuits before construction), so
+    /// keeping it inline would tax every no-order tick's [`ProcessAudit`](super::audit::ProcessAudit)
+    /// copy for a rarely-populated payload. Boxing allocates only when orders exist and keeps
+    /// `EngineOutput` small (936 → 232 B); `Box<T>` is serde-transparent, so the audit wire format
+    /// is unchanged.
+    AlgoOrders(Box<GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>>),
 
     /// Cash-in-lieu observable: a corporate-action split disposed a fractional share quantity
     /// (under [`SplitRoundingPolicy::Floor`]) from one open position. Emitted **per position**
@@ -1585,7 +1603,7 @@ impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
     for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
 {
     fn from(value: ActionOutput<ExchangeKey, InstrumentKey>) -> Self {
-        Self::Commanded(value)
+        Self::Commanded(Box::new(value))
     }
 }
 
@@ -1603,6 +1621,6 @@ impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
     for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
 {
     fn from(value: GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>) -> Self {
-        Self::AlgoOrders(value)
+        Self::AlgoOrders(Box::new(value))
     }
 }

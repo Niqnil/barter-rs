@@ -71,6 +71,13 @@ where
 ///
 /// Contains the complete result of an algorithmic order generation action,
 /// including successful and risk-refused orders, as well as any errors that occurred.
+///
+/// # Size note
+/// This type is ~928 B (mostly `OrderEvent`s inlined via `NoneOneOrMany`). [`EngineOutput`] boxes the
+/// variants that carry it (#172) to keep the per-tick audit copy small; shrinking it at the root is
+/// tracked in #195.
+///
+/// [`EngineOutput`]: crate::engine::EngineOutput
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct GenerateAlgoOrdersOutput<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
     /// Generates orders that were approved by the [`RiskManager`] and sent for execution.

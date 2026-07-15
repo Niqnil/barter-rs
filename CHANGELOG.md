@@ -198,6 +198,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-of-data batch (and see *why*) programmatically instead of by parsing logs. `HistoricalTicks<T>`
   also implements `IntoIterator` (yielding the ticks) for callers that only need the data. Migration:
   read `.ticks` for the previous `Vec<T>`, or iterate the value directly.
+- **`EngineOutput::AlgoOrders` and `EngineOutput::Commanded` now carry a `Box`** (`rustrade`). Both
+  variants embedded a ~928 B `GenerateAlgoOrdersOutput` — `AlgoOrders` directly, `Commanded` via
+  `ActionOutput` — which pinned `EngineOutput`'s size, and therefore the `ProcessAudit` value moved
+  on **every** processed event, to ~936 B even on the common no-order market tick. Boxing both moves
+  the payload off the stack (`EngineOutput` ~936 → ~232 B, with a proportional cut to the per-tick
+  `ProcessAudit` copy) and allocates only when the variant is actually produced. **Breaking** for
+  downstream code that destructures these two variants' payloads: bind the box and deref — e.g.
+  `EngineOutput::AlgoOrders(output)` then `&**output`, or match one level then `match *boxed { … }`.
+  Nested patterns such as `EngineOutput::Commanded(ActionOutput::ClosePositions(..))` rely on Rust's
+  unstable box patterns and must be rewritten this way. Value **construction** only needs `Box::new(..)`
+  around the payload. **No wire change**: `Box<T>` serializes identically to `T`, so persisted audit
+  streams are unaffected.
 
 ### Removed
 

@@ -28,6 +28,10 @@ pub mod send_requests;
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]
 #[allow(clippy::large_enum_variant)]
 pub enum ActionOutput<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    // NOTE (#194): never constructed by the engine — `Command` has no `GenerateAlgoOrders` variant,
+    // and `Engine::action()` only emits `CancelOrders`/`OpenOrders`/`ClosePositions`; the per-tick
+    // algo path builds `EngineOutput::AlgoOrders` directly. Reachable only via the `From` derive.
+    // Its ~928 B payload sets this enum's size floor; tracked for removal (breaking) in #194.
     GenerateAlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
     CancelOrders(SendRequestsOutput<RequestCancel, ExchangeKey, InstrumentKey>),
     OpenOrders(SendRequestsOutput<RequestOpen, ExchangeKey, InstrumentKey>),
