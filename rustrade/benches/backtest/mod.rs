@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use criterion::{Criterion, Throughput};
+use futures::StreamExt;
 use rust_decimal::Decimal;
 use rustrade::{
     backtest,
@@ -200,6 +201,7 @@ fn benchmark_backtest() {
     bench_backtest(&mut c, Arc::clone(&args_constant), &args_dynamic);
     bench_backtests_concurrent(&mut c, args_constant, args_dynamic);
     bench_aux_seam(&mut c);
+    bench_audit_seam(&mut c);
 }
 
 fn bench_backtest(
@@ -371,7 +373,89 @@ fn bench_aux_seam(c: &mut Criterion) {
         b.iter_batched(
             || (Arc::clone(&args_constant), args_dynamic.clone()),
             |(constant, dynamic)| {
-                rt.block_on(async move { backtest_market_only(constant, dynamic).await.unwrap() })
+                rt.block_on(async move {
+                    backtest_market_only(constant, dynamic, AuditMode::Disabled)
+                        .await
+                        .unwrap()
+                })
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audit-stream A/B benchmark
+//
+// The engine builds a full `AuditTick` on **every** processed event regardless of audit mode — both
+// `async_run` and `async_run_with_audit` call `process_with_audit`. The only per-event work the audit
+// stream adds is the `audit_tx.send(audit)` that moves that tick into the audit channel. This group
+// isolates that send cost by running the same fixture + no-op strategy twice, differing ONLY in
+// `AuditMode`:
+//   - `AuditDisabled` — `async_run`: builds each tick, drops it (no channel).
+//   - `AuditEnabled`  — `async_run_with_audit`: builds each tick AND sends it to a drained consumer.
+// The delta between the two events/sec figures IS the per-event audit-send cost. That cost scales with
+// the `AuditTick` size, so it is the wall-clock counterpart to the `size_of` guards in the engine
+// tests (root-boxing the order payloads shrank the tick this path moves). Compare across revisions
+// with `--save-baseline` / `--baseline`.
+// ---------------------------------------------------------------------------------------------
+fn bench_audit_seam(c: &mut Criterion) {
+    let Config {
+        risk_free_return,
+        system: SystemConfig {
+            instruments,
+            executions,
+        },
+    } = serde_json::from_str(CONFIG).unwrap();
+
+    let (args_constant, num_events) = args_constant_seam(instruments, executions);
+    let args_dynamic = args_dynamic_seam(risk_free_return);
+
+    let mut group = c.benchmark_group("Backtest AuditSeam");
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(10));
+    group.sample_size(50);
+    // Each iteration drives the whole fixture once, so events/sec makes the per-event audit-send cost
+    // directly visible as the throughput delta between the two cases.
+    group.throughput(Throughput::Elements(num_events as u64));
+
+    // A — audit stream off: the engine builds each tick and drops it.
+    group.bench_function("AuditDisabled", |b| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        b.iter_batched(
+            || (Arc::clone(&args_constant), args_dynamic.clone()),
+            |(constant, dynamic)| {
+                rt.block_on(async move {
+                    backtest_market_only(constant, dynamic, AuditMode::Disabled)
+                        .await
+                        .unwrap()
+                })
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // B — audit stream on: each tick is additionally sent to (and drained by) a live receiver.
+    group.bench_function("AuditEnabled", |b| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        b.iter_batched(
+            || (Arc::clone(&args_constant), args_dynamic.clone()),
+            |(constant, dynamic)| {
+                rt.block_on(async move {
+                    backtest_market_only(constant, dynamic, AuditMode::Enabled)
+                        .await
+                        .unwrap()
+                })
             },
             criterion::BatchSize::SmallInput,
         );
@@ -387,9 +471,15 @@ fn bench_aux_seam(c: &mut Criterion) {
 /// from the public API so the A/B needs no library changes. `EngineEvent: From<MarketStreamEvent>` is
 /// derived, so `SystemBuild` accepts the raw `MarketStreamEvent` stream via its
 /// `Event: From<MarketStream::Item>` bound.
+///
+/// `audit_mode` parameterises this baseline for two A/Bs: the aux-seam group always passes
+/// [`AuditMode::Disabled`], while [`bench_audit_seam`] runs it at both modes so the throughput delta
+/// isolates the per-event `audit_tx.send(audit)` cost. When enabled, the audit stream is drained
+/// concurrently (see below), so the send actually enqueues to and is consumed by a live receiver.
 async fn backtest_market_only(
     args_constant: Arc<SeamConstant>,
     args_dynamic: SeamDynamic,
+    audit_mode: AuditMode,
 ) -> Result<BacktestSummary<Daily>, BarterError> {
     let market_first = args_constant.market_data.time_first_event().await?;
     let raw_market = args_constant.market_data.stream().await?;
@@ -420,10 +510,10 @@ async fn backtest_market_only(
     );
 
     // No merge — the raw market stream is fed directly (the pre-seam path this baseline measures).
-    let system = SystemBuild::new(
+    let mut system = SystemBuild::new(
         engine,
         EngineFeedMode::Stream,
-        AuditMode::Disabled,
+        audit_mode,
         raw_market,
         account_channel,
         futures,
@@ -431,7 +521,30 @@ async fn backtest_market_only(
     .init()
     .await?;
 
+    // With the audit stream enabled, drain it concurrently on the runtime so each per-event
+    // `audit_tx.send(audit)` actually enqueues to (and is consumed by) a live receiver. Without a
+    // drain, `shutdown_after_backtest` drops the audit receiver up front and every send early-returns
+    // a no-op — hiding the very send cost the audit A/B measures. `take_audit()` returns `None` under
+    // `AuditMode::Disabled`, so the disabled path is byte-for-byte the pre-seam baseline.
+    let audit_drain = system.take_audit().map(|audit| {
+        tokio::spawn(async move {
+            let mut updates = audit.updates.into_stream();
+            let mut count: u64 = 0;
+            while updates.next().await.is_some() {
+                count += 1;
+            }
+            count
+        })
+    });
+
     let (engine, _shutdown_audit) = system.shutdown_after_backtest().await?;
+
+    if let Some(handle) = audit_drain {
+        // Join the drain so its consume-side cost is folded into the measured wall-clock. Surface a
+        // drain-task panic instead of swallowing it — a dead drain would silently undercount the
+        // per-event audit-send cost this A/B exists to measure.
+        handle.await.expect("audit drain task panicked");
+    }
 
     // Mirror the seam case's downstream work so the A/B isolates the merge, not summary generation.
     let trading_summary = engine

@@ -194,16 +194,21 @@ impl<Kind, ExchangeKey, InstrumentKey> SendRequestsOutput<Kind, ExchangeKey, Ins
     pub fn unrecoverable_errors(&self) -> NoneOneOrMany<UnrecoverableEngineError> {
         self.errors
             .iter()
-            .filter_map(|entry| match &entry.1 {
-                EngineError::Unrecoverable(error) => Some(error.clone()),
-                _ => None,
+            .filter_map(|entry| {
+                // `entry` is `&Box<(OrderEvent, EngineError)>` (payload boxed, see `# Size`);
+                // deref through the box to destructure the tuple.
+                let (_, error) = &**entry;
+                match error {
+                    EngineError::Unrecoverable(error) => Some(error.clone()),
+                    _ => None,
+                }
             })
             .collect()
     }
 }
 
-impl<ExchangeKey, InstrumentKey, Kind> Default
-    for SendRequestsOutput<ExchangeKey, InstrumentKey, Kind>
+impl<Kind, ExchangeKey, InstrumentKey> Default
+    for SendRequestsOutput<Kind, ExchangeKey, InstrumentKey>
 {
     fn default() -> Self {
         Self {

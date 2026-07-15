@@ -83,18 +83,20 @@ use rustrade_integration::{
 
 /// Regression guard: `EngineOutput` stays small so the per-tick
 /// [`ProcessAudit`](rustrade::engine::audit::ProcessAudit) copy is cheap. Its floor is the largest
-/// unboxed variant `PositionExit(PositionExited)` (~232 B). The `AlgoOrders`/`Commanded` variants are
-/// boxed (#172) and their order payloads are additionally boxed at the root (#195), so neither
-/// dominates. This bound (<= 256 B) catches a large regression — a new big inline variant, or a
-/// re-inlined algo-order payload — while leaving headroom for unrelated field growth.
+/// variant `PositionExit(PositionExited)` (~232 B). The `AlgoOrders`/`Commanded` variants are carried
+/// inline, but their order payloads are boxed at the root (#195) — `GenerateAlgoOrdersOutput` ~144 B,
+/// `ActionOutput` ~96 B — so both sit under the `PositionExit` floor and neither dominates. This bound
+/// (<= 256 B) catches a large regression — a new big inline variant, or a re-inlined order payload
+/// that lifts `AlgoOrders`/`Commanded` above the floor — while leaving headroom for unrelated growth.
 #[test]
-fn engine_output_stays_boxed_and_small() {
-    // Measured 232 B, floored by the unboxed PositionExit variant.
+fn engine_output_stays_small() {
+    // Measured 232 B, floored by the PositionExit variant.
     let size = std::mem::size_of::<EngineOutput<(), (), ExchangeIndex, InstrumentIndex>>();
     assert!(
         size <= 256,
         "EngineOutput grew to {size} B (expected <= 256): a variant gained a large inline payload. \
-         AlgoOrders/Commanded should stay boxed (#172) with root-boxed payloads (#195)."
+         AlgoOrders/Commanded order payloads must stay root-boxed (#195) so those variants sit under \
+         the ~232 B PositionExit floor."
     );
 }
 
@@ -244,7 +246,7 @@ fn test_engine_process_engine_event_with_audit() {
         audit.event,
         EngineAudit::process_with_output(
             EngineEvent::TradingStateUpdate(TradingState::Enabled),
-            EngineOutput::AlgoOrders(Box::new(GenerateAlgoOrdersOutput {
+            EngineOutput::AlgoOrders(GenerateAlgoOrdersOutput {
                 cancels_and_opens: SendCancelsAndOpensOutput {
                     cancels: SendRequestsOutput::default(),
                     opens: SendRequestsOutput {
@@ -256,7 +258,7 @@ fn test_engine_process_engine_event_with_audit() {
                     },
                 },
                 ..Default::default()
-            }))
+            })
         )
     );
 
@@ -434,15 +436,13 @@ fn test_engine_process_engine_event_with_audit() {
         audit.event,
         EngineAudit::process_with_output(
             event,
-            EngineOutput::Commanded(Box::new(ActionOutput::ClosePositions(
-                SendCancelsAndOpensOutput {
-                    cancels: SendRequestsOutput::default(),
-                    opens: SendRequestsOutput {
-                        sent: NoneOneOrMany::One(Box::new(btc_usdt_sell_order.clone())),
-                        errors: NoneOneOrMany::None,
-                    },
-                }
-            )))
+            EngineOutput::Commanded(ActionOutput::ClosePositions(SendCancelsAndOpensOutput {
+                cancels: SendRequestsOutput::default(),
+                opens: SendRequestsOutput {
+                    sent: NoneOneOrMany::One(Box::new(btc_usdt_sell_order.clone())),
+                    errors: NoneOneOrMany::None,
+                },
+            }))
         )
     );
 
@@ -601,10 +601,10 @@ fn test_engine_process_engine_event_with_audit() {
         audit.event,
         EngineAudit::process_with_output(
             event,
-            EngineOutput::Commanded(Box::new(ActionOutput::OpenOrders(SendRequestsOutput {
+            EngineOutput::Commanded(ActionOutput::OpenOrders(SendRequestsOutput {
                 sent: NoneOneOrMany::One(Box::new(eth_btc_sell_order.clone())),
                 errors: NoneOneOrMany::None,
-            })))
+            }))
         )
     );
 
@@ -3437,13 +3437,13 @@ fn test_corporate_action_option_non_standard_wrapper_close_and_new_identity() {
     };
     // A Commanded(ClosePositions) output fires, carrying a reduce-only Sell order for the old option.
     let commanded_sell = outputs.iter().any(|o| match o {
-        // `Commanded` carries a `Box<ActionOutput>`; box patterns are unstable, so deref one level.
-        EngineOutput::Commanded(action) => match &**action {
-            ActionOutput::ClosePositions(out) => out.opens.sent.iter().any(|order| {
+        // `Commanded` now carries `ActionOutput` inline, so the nested variant is matched directly
+        // (no `Box` deref / unstable box pattern needed).
+        EngineOutput::Commanded(ActionOutput::ClosePositions(out)) => {
+            out.opens.sent_iter().any(|order| {
                 order.key.instrument == InstrumentIndex(0) && order.state.side == Side::Sell
-            }),
-            _ => false,
-        },
+            })
+        }
         _ => false,
     });
     assert!(

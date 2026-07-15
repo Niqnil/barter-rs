@@ -198,18 +198,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-of-data batch (and see *why*) programmatically instead of by parsing logs. `HistoricalTicks<T>`
   also implements `IntoIterator` (yielding the ticks) for callers that only need the data. Migration:
   read `.ticks` for the previous `Vec<T>`, or iterate the value directly.
-- **`EngineOutput::AlgoOrders` and `EngineOutput::Commanded` now carry a `Box`** (`rustrade`). Both
-  variants embedded a ~928 B `GenerateAlgoOrdersOutput` — `AlgoOrders` directly, `Commanded` via
-  `ActionOutput` — which pinned `EngineOutput`'s size, and therefore the `ProcessAudit` value moved
-  on **every** processed event, to ~936 B even on the common no-order market tick. Boxing both moves
-  the payload off the stack (`EngineOutput` ~936 → ~232 B, with a proportional cut to the per-tick
-  `ProcessAudit` copy) and allocates only when the variant is actually produced. **Breaking** for
-  downstream code that destructures these two variants' payloads: bind the box and deref — e.g.
-  `EngineOutput::AlgoOrders(output)` then `&**output`, or match one level then `match *boxed { … }`.
-  Nested patterns such as `EngineOutput::Commanded(ActionOutput::ClosePositions(..))` rely on Rust's
-  unstable box patterns and must be rewritten this way. Value **construction** only needs `Box::new(..)`
-  around the payload. **No wire change**: `Box<T>` serializes identically to `T`, so persisted audit
-  streams are unaffected.
+- **`EngineOutput` shrunk ~936 → ~232 B** (`rustrade`). Its `AlgoOrders` and `Commanded` variants
+  embedded large order aggregates (`GenerateAlgoOrdersOutput` directly, `ActionOutput` via
+  `Commanded`) that pinned the enum's size, so the `ProcessAudit`/`AuditTick` value copied on
+  **every** processed event was ~936 B — even on the common no-order market tick. Root-boxing those
+  aggregates' order payloads (see the `SendRequestsOutput`/`GenerateAlgoOrdersOutput` entry below)
+  shrinks them to ~144 B / ~96 B, both well under the ~232 B `PositionExit` variant that now floors
+  the enum, so both variants are carried **inline** — no per-variant heap allocation and no pointer
+  indirection on the audit path — and `EngineOutput`'s stack size (and the per-tick copy) drops
+  proportionally. The variant shapes are unchanged (`AlgoOrders(GenerateAlgoOrdersOutput)`,
+  `Commanded(ActionOutput)`), so matching/constructing them needs no box wrapper or deref. **No wire
+  change**: the audit format is byte-identical.
 - **`ActionOutput::GenerateAlgoOrders` variant removed** (`rustrade`). The variant was never
   constructed by the engine — `Command` has no algo-order variant, `Engine::action()` only emits
   `CancelOrders`/`OpenOrders`/`ClosePositions`, and the per-tick algo path builds
@@ -222,9 +221,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each `OrderEvent`/error/refusal is stored boxed inside its `NoneOneOrMany` field
   (`SendRequestsOutput::sent`/`errors`, `GenerateAlgoOrdersOutput::cancels_refused`/`opens_refused`),
   shrinking `GenerateAlgoOrdersOutput` ~928 → ~144 B and `ActionOutput` ~608 → ~96 B (small enough
-  that its `#[allow(clippy::large_enum_variant)]` is removed). This fixes at the root the size the
-  `EngineOutput`/`ActionOutput` boxing (above) worked around one level up. **Breaking** for downstream
-  code that destructures these public fields: the collection item type is now `Box<…>`, so bind and
+  that its `#[allow(clippy::large_enum_variant)]` is removed). Shrinking the payloads at the root is
+  what lets `EngineOutput` carry those aggregates inline (above) instead of behind an outer `Box`.
+  **Breaking** for downstream code that destructures these public fields: the collection item type is
+  now `Box<…>`, so bind and
   deref — e.g. `output.sent.iter().map(|order| &**order)` (or the provided `output.sent_iter()`
   helper, which yields `&OrderEvent`), or `NoneOneOrMany::One(Box::new(order))` when constructing.
   Field/read access is unchanged (auto-derefs through the box: `order.key`, `order.state`).

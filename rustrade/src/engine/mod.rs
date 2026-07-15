@@ -1340,14 +1340,14 @@ pub enum EngineOutput<
 > {
     /// Output of an actioned [`Command`](super::command::Command).
     ///
-    /// **Boxed:** [`ActionOutput`] is this command-only variant's payload and is rarely the output a
-    /// tick produces, so it is boxed to keep `EngineOutput`'s stack size — and thus the per-tick
-    /// [`ProcessAudit`](super::audit::ProcessAudit) copy — off the common path (`EngineOutput`
-    /// 936 → 232 B). Its inner order payloads are themselves boxed at the root (#195), so
-    /// `ActionOutput` is now small; the outer box is retained pending a separate re-evaluation of
-    /// whether a second indirection still earns its keep. `Box<T>` is serde-transparent, so the
-    /// audit wire format is unchanged.
-    Commanded(Box<ActionOutput<ExchangeKey, InstrumentKey>>),
+    /// **Inline.** [`ActionOutput`]'s inner order payloads are boxed at the root (#195), so
+    /// `ActionOutput` is only ~96 B — well under the ~232 B [`PositionExit`](Self::PositionExit)
+    /// variant that floors this enum's size. Carrying it inline therefore costs `EngineOutput`
+    /// nothing in stack size (and thus in the per-tick [`ProcessAudit`](super::audit::ProcessAudit)
+    /// copy), while avoiding a heap allocation and pointer indirection on the command path that an
+    /// outer `Box` would add. The audit wire format is unchanged (a newtype variant serializes its
+    /// payload identically whether boxed or not).
+    Commanded(ActionOutput<ExchangeKey, InstrumentKey>),
     OnTradingDisabled(OnTradingDisabled),
     AccountDisconnect(OnDisconnect),
     PositionExit(PositionExited<AssetIndex, InstrumentKey>),
@@ -1356,14 +1356,15 @@ pub enum EngineOutput<
     /// Summary of algorithmic orders generated for a processed event (the per-tick auto-generation
     /// path).
     ///
-    /// **Boxed:** this variant is only produced when the strategy actually emits orders (the empty
-    /// case short-circuits before construction), so keeping it inline would tax every no-order
-    /// tick's [`ProcessAudit`](super::audit::ProcessAudit) copy for a rarely-populated payload.
-    /// Boxing allocates only when orders exist and keeps `EngineOutput` small (936 → 232 B).
-    /// `GenerateAlgoOrdersOutput`'s inner order payloads are additionally boxed at the root (#195),
-    /// so the boxed payload is now ~144 B; the outer box is retained pending a separate
-    /// re-evaluation. `Box<T>` is serde-transparent, so the audit wire format is unchanged.
-    AlgoOrders(Box<GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>>),
+    /// **Inline.** `GenerateAlgoOrdersOutput`'s inner order payloads are boxed at the root (#195),
+    /// so it is only ~144 B — under the ~232 B [`PositionExit`](Self::PositionExit) variant that
+    /// floors this enum's size. Carrying it inline therefore costs `EngineOutput` nothing in stack
+    /// size (and thus in the per-tick [`ProcessAudit`](super::audit::ProcessAudit) copy). The
+    /// only allocation is the root boxing of the orders themselves, paid solely when the strategy
+    /// actually emits some — the empty no-order case short-circuits before this variant is even
+    /// constructed. The audit wire format is unchanged (a newtype variant serializes its payload
+    /// identically whether boxed or not).
+    AlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
 
     /// Cash-in-lieu observable: a corporate-action split disposed a fractional share quantity
     /// (under [`SplitRoundingPolicy::Floor`]) from one open position. Emitted **per position**
@@ -1605,7 +1606,7 @@ impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
     for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
 {
     fn from(value: ActionOutput<ExchangeKey, InstrumentKey>) -> Self {
-        Self::Commanded(Box::new(value))
+        Self::Commanded(value)
     }
 }
 
@@ -1623,6 +1624,6 @@ impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
     for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
 {
     fn from(value: GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>) -> Self {
-        Self::AlgoOrders(Box::new(value))
+        Self::AlgoOrders(value)
     }
 }
