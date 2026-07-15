@@ -22,13 +22,11 @@ pub mod generate_algo_orders;
 pub mod send_requests;
 
 /// Output of the `Engine` after actioning a [`Command`](super::command::Command).
+///
+/// `ClosePositions` (a cancels+opens pair) previously dwarfed `CancelOrders` (~608 B vs ~208 B) — a
+/// spread past 200 B that tripped `clippy::large_enum_variant`. With [`SendRequestsOutput`]'s order
+/// payloads boxed at the root (#195) that spread is gone, so no `#[allow]` is needed here.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]
-// `ClosePositions` (a cancels+opens pair, ~608 B) dwarfs `CancelOrders` (~208 B); the >200 B spread
-// trips `clippy::large_enum_variant`. This is a command-response type, not the per-tick hot path,
-// and its largest member is already boxed one level up (`EngineOutput::Commanded(Box<ActionOutput>)`),
-// so boxing a variant here would only add an allocation for no measured benefit. The root-cause
-// shrink of `SendCancelsAndOpensOutput` itself is tracked separately in #195.
-#[allow(clippy::large_enum_variant)]
 pub enum ActionOutput<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
     CancelOrders(SendRequestsOutput<RequestCancel, ExchangeKey, InstrumentKey>),
     OpenOrders(SendRequestsOutput<RequestOpen, ExchangeKey, InstrumentKey>),

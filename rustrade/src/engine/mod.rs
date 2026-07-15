@@ -266,13 +266,13 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     "Engine actioning user Command::SendCancelRequests"
                 );
                 let output = self.send_requests(requests.clone());
-                self.state.record_in_flight_cancels(&output.sent);
+                self.state.record_in_flight_cancels(output.sent_iter());
                 ActionOutput::CancelOrders(output)
             }
             Command::SendOpenRequests(requests) => {
                 info!(?requests, "Engine actioning user Command::SendOpenRequests");
                 let output = self.send_requests(requests.clone());
-                self.state.record_in_flight_opens(&output.sent);
+                self.state.record_in_flight_opens(output.sent_iter());
                 ActionOutput::OpenOrders(output)
             }
             Command::ClosePositions(filter) => {
@@ -438,7 +438,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             .filter_map(Order::to_request_cancel)
             .collect();
         let cancels = self.send_requests(cancel_requests);
-        self.state.record_in_flight_cancels(&cancels.sent);
+        self.state.record_in_flight_cancels(cancels.sent_iter());
 
         // Re-borrow after send_requests (which takes &self for execution_txs).
         let instrument_state = self.state.instruments.instrument_index_mut(key);
@@ -1340,12 +1340,13 @@ pub enum EngineOutput<
 > {
     /// Output of an actioned [`Command`](super::command::Command).
     ///
-    /// **Boxed:** [`ActionOutput`] embeds a `GenerateAlgoOrdersOutput` (~928 B), which would
-    /// otherwise pin `EngineOutput`'s stack size — and thus the per-tick
-    /// [`ProcessAudit`](super::audit::ProcessAudit) copy — to that size on **every** event, even
-    /// though this command-only variant is rarely the one produced. Boxing moves the payload to the
-    /// heap so the common per-tick outputs stay small (`EngineOutput` 936 → 232 B). `Box<T>` is
-    /// serde-transparent, so the audit wire format is unchanged.
+    /// **Boxed:** [`ActionOutput`] is this command-only variant's payload and is rarely the output a
+    /// tick produces, so it is boxed to keep `EngineOutput`'s stack size — and thus the per-tick
+    /// [`ProcessAudit`](super::audit::ProcessAudit) copy — off the common path (`EngineOutput`
+    /// 936 → 232 B). Its inner order payloads are themselves boxed at the root (#195), so
+    /// `ActionOutput` is now small; the outer box is retained pending a separate re-evaluation of
+    /// whether a second indirection still earns its keep. `Box<T>` is serde-transparent, so the
+    /// audit wire format is unchanged.
     Commanded(Box<ActionOutput<ExchangeKey, InstrumentKey>>),
     OnTradingDisabled(OnTradingDisabled),
     AccountDisconnect(OnDisconnect),
@@ -1355,12 +1356,13 @@ pub enum EngineOutput<
     /// Summary of algorithmic orders generated for a processed event (the per-tick auto-generation
     /// path).
     ///
-    /// **Boxed:** `GenerateAlgoOrdersOutput` is ~928 B and this variant is only produced when the
-    /// strategy actually emits orders (the empty case short-circuits before construction), so
-    /// keeping it inline would tax every no-order tick's [`ProcessAudit`](super::audit::ProcessAudit)
-    /// copy for a rarely-populated payload. Boxing allocates only when orders exist and keeps
-    /// `EngineOutput` small (936 → 232 B); `Box<T>` is serde-transparent, so the audit wire format
-    /// is unchanged.
+    /// **Boxed:** this variant is only produced when the strategy actually emits orders (the empty
+    /// case short-circuits before construction), so keeping it inline would tax every no-order
+    /// tick's [`ProcessAudit`](super::audit::ProcessAudit) copy for a rarely-populated payload.
+    /// Boxing allocates only when orders exist and keeps `EngineOutput` small (936 → 232 B).
+    /// `GenerateAlgoOrdersOutput`'s inner order payloads are additionally boxed at the root (#195),
+    /// so the boxed payload is now ~144 B; the outer box is retained pending a separate
+    /// re-evaluation. `Box<T>` is serde-transparent, so the audit wire format is unchanged.
     AlgoOrders(Box<GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>>),
 
     /// Cash-in-lieu observable: a corporate-action split disposed a fractional share quantity

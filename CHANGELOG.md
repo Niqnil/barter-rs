@@ -218,6 +218,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum ~928 → ~608 B (largest remaining variant `ClosePositions`). **Breaking** only for downstream
   code that matched or constructed `ActionOutput::GenerateAlgoOrders` (no in-tree or known downstream
   use). Migration: delete any such match arm; algo-order work is surfaced via `EngineOutput::AlgoOrders`.
+- **`SendRequestsOutput` and `GenerateAlgoOrdersOutput` order payloads are now boxed** (`rustrade`).
+  Each `OrderEvent`/error/refusal is stored boxed inside its `NoneOneOrMany` field
+  (`SendRequestsOutput::sent`/`errors`, `GenerateAlgoOrdersOutput::cancels_refused`/`opens_refused`),
+  shrinking `GenerateAlgoOrdersOutput` ~928 → ~144 B and `ActionOutput` ~608 → ~96 B (small enough
+  that its `#[allow(clippy::large_enum_variant)]` is removed). This fixes at the root the size the
+  `EngineOutput`/`ActionOutput` boxing (above) worked around one level up. **Breaking** for downstream
+  code that destructures these public fields: the collection item type is now `Box<…>`, so bind and
+  deref — e.g. `output.sent.iter().map(|order| &**order)` (or the provided `output.sent_iter()`
+  helper, which yields `&OrderEvent`), or `NoneOneOrMany::One(Box::new(order))` when constructing.
+  Field/read access is unchanged (auto-derefs through the box: `order.key`, `order.state`).
+  **No wire change**: `Box<T>` serializes identically to `T`.
 
 ### Removed
 

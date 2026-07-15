@@ -71,7 +71,10 @@ where
             })
             .partition_result();
 
-        SendRequestsOutput::new(NoneOneOrMany::from(sent), NoneOneOrMany::from(errors))
+        SendRequestsOutput::new(
+            sent.into_iter().map(Box::new).collect(),
+            errors.into_iter().map(Box::new).collect(),
+        )
     }
 
     fn send_request<Kind>(
@@ -156,12 +159,23 @@ impl<ExchangeKey, InstrumentKey> Default for SendCancelsAndOpensOutput<ExchangeK
 }
 
 /// Summary of order requests (cancel _or_ open) sent by the [`Engine`] to the `ExecutionManager`.
+///
+/// # Size
+/// Each [`OrderEvent`] payload is boxed inside its [`NoneOneOrMany`] field. An unboxed
+/// `OrderEvent` (~184 B for an open) inlined into [`NoneOneOrMany::One`] is the root of the size of
+/// the aggregates that embed this type
+/// ([`GenerateAlgoOrdersOutput`](super::generate_algo_orders::GenerateAlgoOrdersOutput),
+/// [`SendCancelsAndOpensOutput`], [`ActionOutput`](super::ActionOutput)); boxing keeps each field to
+/// a pointer (#195). `Box<T>` is serde-transparent, so the wire format is unchanged.
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
 pub struct SendRequestsOutput<Kind, ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
-    pub sent: NoneOneOrMany<OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
-    pub errors: NoneOneOrMany<(OrderEvent<Kind, ExchangeKey, InstrumentKey>, EngineError)>,
+    /// Order requests successfully sent for execution (payload boxed — see the type's `# Size` note).
+    pub sent: NoneOneOrMany<Box<OrderEvent<Kind, ExchangeKey, InstrumentKey>>>,
+    /// Order requests that failed to send, each paired with the [`EngineError`] that occurred
+    /// (payload boxed — see the type's `# Size` note).
+    pub errors: NoneOneOrMany<Box<(OrderEvent<Kind, ExchangeKey, InstrumentKey>, EngineError)>>,
 }
 
 impl<Kind, ExchangeKey, InstrumentKey> SendRequestsOutput<Kind, ExchangeKey, InstrumentKey> {
@@ -170,11 +184,17 @@ impl<Kind, ExchangeKey, InstrumentKey> SendRequestsOutput<Kind, ExchangeKey, Ins
         self.sent.is_none() && self.errors.is_none()
     }
 
+    /// Iterates the successfully-sent order requests, dereferencing through the boxed payload (see
+    /// the type's `# Size` note) so callers receive `&OrderEvent` rather than `&Box<OrderEvent>`.
+    pub fn sent_iter(&self) -> impl Iterator<Item = &OrderEvent<Kind, ExchangeKey, InstrumentKey>> {
+        self.sent.iter().map(|order| &**order)
+    }
+
     /// Returns any unrecoverable errors that occurred during order request sending.
     pub fn unrecoverable_errors(&self) -> NoneOneOrMany<UnrecoverableEngineError> {
         self.errors
             .iter()
-            .filter_map(|(_order, error)| match error {
+            .filter_map(|entry| match &entry.1 {
                 EngineError::Unrecoverable(error) => Some(error.clone()),
                 _ => None,
             })

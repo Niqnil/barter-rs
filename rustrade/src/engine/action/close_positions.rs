@@ -61,8 +61,8 @@ where
         let opens = self.send_requests(opens);
 
         // Record in flight order requests
-        self.state.record_in_flight_cancels(&cancels.sent);
-        self.state.record_in_flight_opens(&opens.sent);
+        self.state.record_in_flight_cancels(cancels.sent_iter());
+        self.state.record_in_flight_opens(opens.sent_iter());
 
         SendCancelsAndOpensOutput::new(cancels, opens)
     }
