@@ -198,6 +198,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-of-data batch (and see *why*) programmatically instead of by parsing logs. `HistoricalTicks<T>`
   also implements `IntoIterator` (yielding the ticks) for callers that only need the data. Migration:
   read `.ticks` for the previous `Vec<T>`, or iterate the value directly.
+- **`EngineOutput` shrunk ~936 → ~232 B** (`rustrade`). Its `AlgoOrders` and `Commanded` variants
+  embedded large order aggregates (`GenerateAlgoOrdersOutput` directly, `ActionOutput` via
+  `Commanded`) that pinned the enum's size, so the `ProcessAudit`/`AuditTick` value copied on
+  **every** processed event was ~936 B — even on the common no-order market tick. Root-boxing those
+  aggregates' order payloads (see the `SendRequestsOutput`/`GenerateAlgoOrdersOutput` entry below)
+  shrinks them to ~144 B / ~96 B, both well under the ~232 B `PositionExit` variant that now floors
+  the enum, so both variants are carried **inline** — no per-variant heap allocation and no pointer
+  indirection on the audit path — and `EngineOutput`'s stack size (and the per-tick copy) drops
+  proportionally. The variant shapes are unchanged (`AlgoOrders(GenerateAlgoOrdersOutput)`,
+  `Commanded(ActionOutput)`), so matching/constructing them needs no box wrapper or deref. **No wire
+  change**: the audit format is byte-identical.
+- **`ActionOutput::GenerateAlgoOrders` variant removed** (`rustrade`). The variant was never
+  constructed by the engine — `Command` has no algo-order variant, `Engine::action()` only emits
+  `CancelOrders`/`OpenOrders`/`ClosePositions`, and the per-tick algo path builds
+  `EngineOutput::AlgoOrders` directly — so it was reachable only through the derived `From` impl. Its
+  ~928 B `GenerateAlgoOrdersOutput` payload set `ActionOutput`'s size floor; removing it drops the
+  enum ~928 → ~608 B (largest remaining variant `ClosePositions`). **Breaking** only for downstream
+  code that matched or constructed `ActionOutput::GenerateAlgoOrders` (no in-tree or known downstream
+  use). Migration: delete any such match arm; algo-order work is surfaced via `EngineOutput::AlgoOrders`.
+- **`SendRequestsOutput` and `GenerateAlgoOrdersOutput` order payloads are now boxed** (`rustrade`).
+  Each `OrderEvent`/error/refusal is stored boxed inside its `NoneOneOrMany` field
+  (`SendRequestsOutput::sent`/`errors`, `GenerateAlgoOrdersOutput::cancels_refused`/`opens_refused`),
+  shrinking `GenerateAlgoOrdersOutput` ~928 → ~144 B and `ActionOutput` ~608 → ~96 B (small enough
+  that its `#[allow(clippy::large_enum_variant)]` is removed). Shrinking the payloads at the root is
+  what lets `EngineOutput` carry those aggregates inline (above) instead of behind an outer `Box`.
+  **Breaking** for downstream code that destructures these public fields: the collection item type is
+  now `Box<…>`, so bind and
+  deref — e.g. `output.sent.iter().map(|order| &**order)` (or the provided `output.sent_iter()`
+  helper, which yields `&OrderEvent`), or `NoneOneOrMany::One(Box::new(order))` when constructing.
+  Field/read access is unchanged (auto-derefs through the box: `order.key`, `order.state`).
+  **No wire change**: `Box<T>` serializes identically to `T`.
 
 ### Removed
 
@@ -246,6 +277,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `calculate_pnl_return` now return `Option<Decimal>` (was `Decimal`); `Position::update_pnl_realised`
   now returns `#[must_use] PnlRealisedUpdate { Updated, Overflowed }` (was `()`); direct callers must
   handle the new return values.
+- **Backtest benches no longer panic at setup** (`rustrade`, benches only). The shared
+  `market_data_from_file` helper now sorts the recorded fixture ascending by `time_exchange` before
+  constructing `MarketDataInMemory`, which hard-asserts sorted input. The committed fixture is
+  interleaved across three instruments (not globally sorted), so the `bench_backtest` and
+  `bench_backtests_concurrent` groups previously panicked during setup and could not run — meaning any
+  prior `--save-baseline` numbers for those two groups are not comparable across this change (they
+  never completed). Benchmark-only; no library behaviour changes.
 
 ### Security
 

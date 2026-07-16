@@ -201,8 +201,8 @@ fn test_engine_process_engine_event_with_audit() {
                     cancels: SendRequestsOutput::default(),
                     opens: SendRequestsOutput {
                         sent: NoneOneOrMany::Many(vec![
-                            btc_usdt_buy_order.clone(),
-                            eth_btc_buy_order.clone(),
+                            Box::new(btc_usdt_buy_order.clone()),
+                            Box::new(eth_btc_buy_order.clone()),
                         ]),
                         errors: NoneOneOrMany::None,
                     },
@@ -389,7 +389,7 @@ fn test_engine_process_engine_event_with_audit() {
             EngineOutput::Commanded(ActionOutput::ClosePositions(SendCancelsAndOpensOutput {
                 cancels: SendRequestsOutput::default(),
                 opens: SendRequestsOutput {
-                    sent: NoneOneOrMany::One(btc_usdt_sell_order.clone()),
+                    sent: NoneOneOrMany::One(Box::new(btc_usdt_sell_order.clone())),
                     errors: NoneOneOrMany::None,
                 },
             }))
@@ -552,7 +552,7 @@ fn test_engine_process_engine_event_with_audit() {
         EngineAudit::process_with_output(
             event,
             EngineOutput::Commanded(ActionOutput::OpenOrders(SendRequestsOutput {
-                sent: NoneOneOrMany::One(eth_btc_sell_order.clone()),
+                sent: NoneOneOrMany::One(Box::new(eth_btc_sell_order.clone())),
                 errors: NoneOneOrMany::None,
             }))
         )
@@ -3387,8 +3387,10 @@ fn test_corporate_action_option_non_standard_wrapper_close_and_new_identity() {
     };
     // A Commanded(ClosePositions) output fires, carrying a reduce-only Sell order for the old option.
     let commanded_sell = outputs.iter().any(|o| match o {
+        // `Commanded` now carries `ActionOutput` inline, so the nested variant is matched directly
+        // (no `Box` deref / unstable box pattern needed).
         EngineOutput::Commanded(ActionOutput::ClosePositions(out)) => {
-            out.opens.sent.iter().any(|order| {
+            out.opens.sent_iter().any(|order| {
                 order.key.instrument == InstrumentIndex(0) && order.state.side == Side::Sell
             })
         }
