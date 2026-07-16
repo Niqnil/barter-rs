@@ -3,6 +3,7 @@
 //! Provides access to aggregates (OHLCV), trades, and quotes across all asset classes.
 
 use super::error::MassiveError;
+use super::pagination::PaginationGuard;
 use super::transformer::{
     AggregatesResponse, QuotesResponse, TradesResponse, parse_aggregates_response,
     parse_quotes_response, parse_trades_response, timespan_to_step,
@@ -248,8 +249,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching aggregates page");
 
                 let parsed = self.fetch_aggregates_page(&url).await?;
@@ -309,8 +312,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching trades page");
 
                 let parsed = self.fetch_trades_page(&url).await?;
@@ -373,8 +378,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching quotes page");
 
                 let parsed = self.fetch_quotes_page(&url).await?;

@@ -109,6 +109,10 @@ use tracing_subscriber as _;
 // (tests/massive_integration.rs), which compile as separate units.
 #[cfg(test)]
 use serial_test as _;
+// wiremock is only referenced by the pagination integration tests under the
+// `massive` feature (tests/massive_pagination.rs), which compile as separate units.
+#[cfg(test)]
+use wiremock as _;
 
 use crate::{
     error::DataError,

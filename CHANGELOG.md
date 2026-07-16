@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bounded, cycle-safe pagination for Massive REST fetches** (`rustrade-data`). Every Massive
+  `next_url`-paginated fetch (`fetch_aggregates`, `fetch_trades`, `fetch_quotes`, `fetch_tickers`,
+  `fetch_dividends`, `fetch_splits_raw`, `fetch_option_contracts`, `fetch_option_chain_snapshot`)
+  now caps the number of pages it will follow and detects a `next_url` that revisits an
+  already-fetched page, yielding a terminal error instead of paginating without bound. Because a
+  silently truncated result is indistinguishable from a genuinely small one for a market-data
+  client, incomplete pagination fails loudly rather than returning a partial result. Two new
+  `MassiveError` variants carry the diagnosis: `PaginationLimitExceeded { pages, limit }` and
+  `CyclicPagination { url }`.
+
 - **Corporate-action stock-split processing** (`rustrade`). The engine now handles
   `EngineEvent::CorporateAction` for stock/reverse splits, adjusting every open position on the
   target Spot instrument (the same per-position rescale as `Position::apply_split`) and emitting
@@ -115,6 +125,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`MassiveError` is now `#[non_exhaustive]`** (`rustrade-data`). Lets new variants (such as the
+  pagination-robustness errors above) be added without further breaking changes. **Breaking** for
+  downstream code matching `MassiveError` exhaustively — add a wildcard (`_`) arm.
 - **`EngineEvent` is now `#[non_exhaustive]` and gains a `CorporateAction` variant** (`rustrade`).
   Marking it non-exhaustive lets future engine-driven event variants be added without further
   breaking changes. **Breaking** for downstream code matching `EngineEvent` exhaustively — add a

@@ -4524,6 +4524,7 @@ dependencies = [
  "url",
  "urlencoding",
  "vecmap-rs",
+ "wiremock",
 ]
 
 [[package]]

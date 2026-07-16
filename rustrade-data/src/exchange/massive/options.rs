@@ -28,6 +28,7 @@
 //! ```
 
 use super::error::MassiveError;
+use super::pagination::PaginationGuard;
 use super::reference::SortOrder;
 use super::rest::MassiveRestClient;
 use crate::subscription::greeks::OptionGreeks;
@@ -954,8 +955,10 @@ impl MassiveRestClient {
         let mut contracts: Vec<MassiveOptionContract> =
             Vec::with_capacity(query.limit.unwrap_or(100) as usize);
         let mut next_url: Option<String> = Some(initial_url);
+        let mut guard = PaginationGuard::default();
 
         while let Some(url) = next_url.take() {
+            guard.observe(&url)?;
             debug!(url = %url, "Fetching option contracts page");
 
             let body = self.fetch_page_body(&url).await?;
@@ -1032,8 +1035,10 @@ impl MassiveRestClient {
         let mut snapshots: Vec<MassiveOptionSnapshot> =
             Vec::with_capacity(query.limit.unwrap_or(50) as usize);
         let mut next_url: Option<String> = Some(initial_url);
+        let mut guard = PaginationGuard::default();
 
         while let Some(url) = next_url.take() {
+            guard.observe(&url)?;
             debug!(url = %url, "Fetching option chain snapshot page");
 
             let body = self.fetch_page_body(&url).await?;

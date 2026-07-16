@@ -3,6 +3,7 @@
 //! Provides access to ticker information, exchanges, market status, and holidays.
 
 use super::error::MassiveError;
+use super::pagination::PaginationGuard;
 use super::rest::MassiveRestClient;
 use async_stream::try_stream;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -1145,8 +1146,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching tickers page");
 
                 let body = self.fetch_page_body(&url).await?;
@@ -1337,8 +1340,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching dividends page");
 
                 let body = self.fetch_page_body(&url).await?;
@@ -1391,8 +1396,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching splits page");
 
                 let body = self.fetch_page_body(&url).await?;

@@ -7,7 +7,11 @@ use std::time::Duration;
 ///
 /// The library returns these errors without automatic retry or reconnection.
 /// Consumers decide how to handle rate limits, disconnections, and auth failures.
+///
+/// `#[non_exhaustive]`: new variants may be added without a major-version bump, so
+/// downstream `match`es must include a wildcard arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum MassiveError {
     /// Rate limited by the API. Contains optional retry-after duration.
     ///
@@ -49,6 +53,25 @@ pub enum MassiveError {
     /// Returned when input parameters are invalid before making an API request
     /// (e.g., timestamp out of representable range).
     InvalidInput { message: String },
+
+    /// A paginated fetch exceeded the maximum number of pages before the API
+    /// reported the end of the result set.
+    ///
+    /// Yielded as a terminal error on the affected stream. For a market-data
+    /// client a silent truncation is indistinguishable from a genuinely small
+    /// result set, so pagination fails loudly rather than returning a partial
+    /// `Vec`. Hitting this limit indicates either an unexpectedly large query or
+    /// a server that never signals the final page — inspect the query before
+    /// retrying.
+    PaginationLimitExceeded { pages: usize, limit: usize },
+
+    /// A paginated fetch revisited a URL it had already fetched.
+    ///
+    /// Yielded as a terminal error on the affected stream. A `next_url` that
+    /// points back to an already-visited page would otherwise loop forever;
+    /// detecting the cycle turns silent non-termination into an observable
+    /// failure.
+    CyclicPagination { url: String },
 }
 
 impl std::fmt::Display for MassiveError {
@@ -88,6 +111,18 @@ impl std::fmt::Display for MassiveError {
             }
             MassiveError::InvalidInput { message } => {
                 write!(f, "Massive invalid input: {}", message)
+            }
+            MassiveError::PaginationLimitExceeded { pages, limit } => {
+                write!(
+                    f,
+                    "Massive pagination exceeded {limit}-page limit (fetched {pages} pages) — result may be incomplete"
+                )
+            }
+            MassiveError::CyclicPagination { url } => {
+                write!(
+                    f,
+                    "Massive pagination cycle detected: next_url revisits {url}"
+                )
             }
         }
     }

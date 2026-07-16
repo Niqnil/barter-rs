@@ -31,6 +31,7 @@ rust_decimal_macros = { workspace = true }
 time = { version = "0.3", features = ["macros"] }  # For ibkr tests and databento examples
 temp-env = { workspace = true }
 serial_test = { workspace = true }  # For Massive WebSocket tests (1 connection limit)
+wiremock = { workspace = true }  # For Massive REST pagination tests (mock next_url chains)
 
 [dependencies]
 # Rustrade Ecosystem
