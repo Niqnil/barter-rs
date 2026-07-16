@@ -81,56 +81,6 @@ use rustrade_integration::{
     collection::{none_one_or_many::NoneOneOrMany, one_or_many::OneOrMany, snapshot::Snapshot},
 };
 
-/// Regression guard: `EngineOutput` stays small so the per-tick
-/// [`ProcessAudit`](rustrade::engine::audit::ProcessAudit) copy is cheap. Its floor is the largest
-/// variant `PositionExit(PositionExited)` (~232 B). The `AlgoOrders`/`Commanded` variants are carried
-/// inline, but their order payloads are boxed at the root (#195) — `GenerateAlgoOrdersOutput` ~144 B,
-/// `ActionOutput` ~96 B — so both sit under the `PositionExit` floor and neither dominates. This bound
-/// (<= 256 B) catches a large regression — a new big inline variant, or a re-inlined order payload
-/// that lifts `AlgoOrders`/`Commanded` above the floor — while leaving headroom for unrelated growth.
-#[test]
-fn engine_output_stays_small() {
-    // Measured 232 B, floored by the PositionExit variant.
-    let size = std::mem::size_of::<EngineOutput<(), (), ExchangeIndex, InstrumentIndex>>();
-    assert!(
-        size <= 256,
-        "EngineOutput grew to {size} B (expected <= 256): a variant gained a large inline payload. \
-         AlgoOrders/Commanded order payloads must stay root-boxed (#195) so those variants sit under \
-         the ~232 B PositionExit floor."
-    );
-}
-
-/// Regression guard for #194 + #195. #194 removed the never-constructed
-/// `ActionOutput::GenerateAlgoOrders` variant (a ~928 B `GenerateAlgoOrdersOutput`); #195 then boxed
-/// [`SendRequestsOutput`](rustrade::engine::action::send_requests::SendRequestsOutput)'s order
-/// payloads at the root, collapsing the largest live variant
-/// `ClosePositions(SendCancelsAndOpensOutput)` from ~608 B to ~96 B and removing the
-/// `#[allow(clippy::large_enum_variant)]` `ActionOutput` used to carry. This bound (<= 128 B) catches
-/// a re-inlining of an order payload (which jumps back to hundreds of bytes) while leaving headroom.
-#[test]
-fn action_output_stays_small() {
-    let size = std::mem::size_of::<ActionOutput<ExchangeIndex, InstrumentIndex>>();
-    assert!(
-        size <= 128,
-        "ActionOutput grew to {size} B (expected <= 128): did a SendRequestsOutput order payload \
-         lose its root Box? Boxing keeps ActionOutput small enough to drop the large_enum_variant \
-         allow (#195)."
-    );
-}
-
-/// Regression guard for #195: `GenerateAlgoOrdersOutput` boxes each order/refusal payload inside its
-/// six `NoneOneOrMany` fields, so the aggregate stays ~144 B instead of inlining six full
-/// `OrderEvent`s (~928 B). This bound (<= 160 B) catches a re-inlining of any of those payloads.
-#[test]
-fn generate_algo_orders_output_stays_small() {
-    let size = std::mem::size_of::<GenerateAlgoOrdersOutput<ExchangeIndex, InstrumentIndex>>();
-    assert!(
-        size <= 160,
-        "GenerateAlgoOrdersOutput grew to {size} B (expected <= 160): did a SendRequestsOutput or \
-         *_refused payload lose its Box? Payloads must stay boxed to keep the aggregate small (#195)."
-    );
-}
-
 const STARTING_TIMESTAMP: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
 const RISK_FREE_RETURN: Decimal = dec!(0.05);
 const STARTING_BALANCE_USDT: Balance = Balance::new(dec!(40_000.0), dec!(40_000.0));

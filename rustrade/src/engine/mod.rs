@@ -1627,3 +1627,27 @@ impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
         Self::AlgoOrders(value)
     }
 }
+
+#[cfg(test)]
+mod size_guard {
+    use super::*;
+
+    /// Regression guard: `EngineOutput` stays small so the per-tick `ProcessAudit` copy is cheap. Its
+    /// floor is the largest variant `PositionExit(PositionExited)` (~232 B). The `AlgoOrders`/
+    /// `Commanded` variants are carried inline, but their order payloads are boxed at the root (#195)
+    /// — `GenerateAlgoOrdersOutput` ~144 B, `ActionOutput` ~96 B — so both sit under the
+    /// `PositionExit` floor and neither dominates. This bound (<= 256 B) catches a large regression —
+    /// a new big inline variant, or a re-inlined order payload that lifts `AlgoOrders`/`Commanded`
+    /// above the floor — while leaving headroom for unrelated growth.
+    #[test]
+    fn engine_output_stays_small() {
+        // Measured 232 B, floored by the PositionExit variant.
+        let size = std::mem::size_of::<EngineOutput<(), (), ExchangeIndex, InstrumentIndex>>();
+        assert!(
+            size <= 256,
+            "EngineOutput grew to {size} B (expected <= 256): a variant gained a large inline \
+             payload. AlgoOrders/Commanded order payloads must stay root-boxed (#195) so those \
+             variants sit under the ~232 B PositionExit floor."
+        );
+    }
+}

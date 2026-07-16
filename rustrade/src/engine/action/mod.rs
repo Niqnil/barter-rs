@@ -44,3 +44,26 @@ impl<ExchangeKey, InstrumentKey> ActionOutput<ExchangeKey, InstrumentKey> {
         .into_option()
     }
 }
+
+#[cfg(test)]
+mod size_guard {
+    use super::*;
+
+    /// Regression guard for #194 + #195. #194 removed the never-constructed
+    /// `ActionOutput::GenerateAlgoOrders` variant (a ~928 B `GenerateAlgoOrdersOutput`); #195 then
+    /// boxed `SendRequestsOutput`'s order payloads at the root, collapsing the largest live variant
+    /// `ClosePositions(SendCancelsAndOpensOutput)` from ~608 B to ~96 B and removing the
+    /// `#[allow(clippy::large_enum_variant)]` `ActionOutput` used to carry. This bound (<= 128 B)
+    /// catches a re-inlining of an order payload (which jumps back to hundreds of bytes) while
+    /// leaving headroom.
+    #[test]
+    fn action_output_stays_small() {
+        let size = std::mem::size_of::<ActionOutput<ExchangeIndex, InstrumentIndex>>();
+        assert!(
+            size <= 128,
+            "ActionOutput grew to {size} B (expected <= 128): did a SendRequestsOutput order \
+             payload lose its root Box? Boxing keeps ActionOutput small enough to drop the \
+             large_enum_variant allow (#195)."
+        );
+    }
+}

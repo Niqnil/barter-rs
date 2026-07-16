@@ -137,3 +137,22 @@ impl<ExchangeKey, InstrumentKey> Default for GenerateAlgoOrdersOutput<ExchangeKe
         }
     }
 }
+
+#[cfg(test)]
+mod size_guard {
+    use super::*;
+
+    /// Regression guard for #195: `GenerateAlgoOrdersOutput` boxes each order/refusal payload inside
+    /// its six `NoneOneOrMany` fields, so the aggregate stays ~144 B instead of inlining six full
+    /// `OrderEvent`s (~928 B). This bound (<= 160 B) catches a re-inlining of any of those payloads.
+    #[test]
+    fn generate_algo_orders_output_stays_small() {
+        let size = std::mem::size_of::<GenerateAlgoOrdersOutput<ExchangeIndex, InstrumentIndex>>();
+        assert!(
+            size <= 160,
+            "GenerateAlgoOrdersOutput grew to {size} B (expected <= 160): did a SendRequestsOutput \
+             or *_refused payload lose its Box? Payloads must stay boxed to keep the aggregate small \
+             (#195)."
+        );
+    }
+}

@@ -167,6 +167,15 @@ impl<ExchangeKey, InstrumentKey> Default for SendCancelsAndOpensOutput<ExchangeK
 /// ([`GenerateAlgoOrdersOutput`](super::generate_algo_orders::GenerateAlgoOrdersOutput),
 /// [`SendCancelsAndOpensOutput`], [`ActionOutput`](super::ActionOutput)); boxing keeps each field to
 /// a pointer (#195). `Box<T>` is serde-transparent, so the wire format is unchanged.
+///
+/// The box is deliberately at the *item* level (`NoneOneOrMany<Box<T>>`), not the *field* level
+/// (`Box<NoneOneOrMany<T>>`). Item-level boxing keeps the empty/no-order case allocation-free —
+/// [`NoneOneOrMany::None`] holds no box, so the common per-tick path that constructs an empty output
+/// (see [`is_empty`](Self::is_empty)) never touches the heap. A field-level box would instead
+/// allocate one heap block on *every* output, empty or not, regressing that hot path; its only edge
+/// is one fewer allocation on the rare multi-order (`Many`) tick, which is dominated by the
+/// per-order `request.clone()` + channel send already on that path. Item-level boxing is the right
+/// trade for a type whose empty case is the overwhelmingly common one.
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]

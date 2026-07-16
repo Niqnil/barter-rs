@@ -277,6 +277,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `calculate_pnl_return` now return `Option<Decimal>` (was `Decimal`); `Position::update_pnl_realised`
   now returns `#[must_use] PnlRealisedUpdate { Updated, Overflowed }` (was `()`); direct callers must
   handle the new return values.
+- **Backtest benches no longer panic at setup** (`rustrade`, benches only). The shared
+  `market_data_from_file` helper now sorts the recorded fixture ascending by `time_exchange` before
+  constructing `MarketDataInMemory`, which hard-asserts sorted input. The committed fixture is
+  interleaved across three instruments (not globally sorted), so the `bench_backtest` and
+  `bench_backtests_concurrent` groups previously panicked during setup and could not run — meaning any
+  prior `--save-baseline` numbers for those two groups are not comparable across this change (they
+  never completed). Benchmark-only; no library behaviour changes.
 
 ### Security
 

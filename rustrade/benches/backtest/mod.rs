@@ -400,6 +400,13 @@ fn bench_aux_seam(c: &mut Criterion) {
 // the `AuditTick` size, so it is the wall-clock counterpart to the `size_of` guards in the engine
 // tests (root-boxing the order payloads shrank the tick this path moves). Compare across revisions
 // with `--save-baseline` / `--baseline`.
+//
+// Caveat: both cases run on a `new_current_thread()` runtime, so in `AuditEnabled` the per-event
+// `audit_tx.send(audit)` producer and the spawned drain contend for the *same* thread. That folds
+// single-thread producer/drain scheduling overhead into the measured delta — overhead not present in
+// a multi-threaded production deployment — so this A/B likely *over*-states the send cost. That makes
+// it a conservative regression guard (a real regression can only be larger than measured), not an
+// absolute production figure; profile on a multi-thread runtime if the absolute cost matters.
 // ---------------------------------------------------------------------------------------------
 fn bench_audit_seam(c: &mut Criterion) {
     let Config {
@@ -894,8 +901,26 @@ where
 
     // `MarketDataInMemory::new` hard-asserts events are globally sorted ascending by `time_exchange`
     // (the backtest time-merge relies on it). The recorded fixture interleaves three instruments and
-    // is NOT globally sorted, so sort here (stable) before construction. Applied identically to every
-    // bench case, so it does not bias the aux-seam A/B.
+    // is NOT globally sorted (10k+ inversions), so before this helper sorted, `new` panicked at bench
+    // *setup* — `bench_backtest`/`bench_backtests_concurrent` could not run at all, and any prior
+    // `--baseline` numbers for those two groups are not comparable (they never completed). Sorting
+    // here (stable) fixes that. Applied identically to every bench case, so it does not bias the
+    // aux-seam / audit A/Bs.
+    //
+    // These synthetic corpora are Item-only. The sort key below maps `Reconnecting` to `None`, which
+    // `Option`'s `Ord` sorts before every `Some` — so a `Reconnecting` event would be hoisted to the
+    // front of the corpus regardless of when it occurred (this matches `new`'s own sortedness check,
+    // which uses the same key, but is not a meaningful replay order). Assert the Item-only invariant
+    // so a future fixture that contains reconnects fails loudly here instead of being quietly
+    // reordered.
+    assert!(
+        events
+            .iter()
+            .all(|event| matches!(event, MarketStreamEvent::Item(_))),
+        "market_data_from_file expects an Item-only corpus: the time sort cannot order Reconnecting \
+         events (they collapse to `None`, sorting to the front). Filter or stable-partition them \
+         first."
+    );
     events.sort_by_key(|event| match event {
         MarketStreamEvent::Item(event) => Some(event.time_exchange),
         MarketStreamEvent::Reconnecting(_) => None,
