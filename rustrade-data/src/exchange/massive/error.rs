@@ -72,6 +72,33 @@ pub enum MassiveError {
     /// detecting the cycle turns silent non-termination into an observable
     /// failure.
     CyclicPagination { url: String },
+
+    /// A paginated fetch received a `next_url` outside the client's configured
+    /// origin (scheme + host + port), or one that failed to parse as a URL.
+    ///
+    /// Yielded as a terminal error *before* the request is issued. The client
+    /// attaches its API key as an `Authorization: Bearer` default header sent
+    /// with **every** request regardless of destination host, so following a
+    /// `next_url` that names an unexpected origin would leak the token to
+    /// whatever host it points at. A prefix check is insufficient — a look-alike
+    /// host such as `https://api.massive.com.evil.example` (or the
+    /// separator-less `https://api.massive.comevil.example`) shares the prefix
+    /// yet is a different origin — so origins are parsed and compared, and a
+    /// mismatched or unparseable `next_url` is rejected (fail-closed).
+    ///
+    /// A well-behaved Massive API only ever returns a `next_url` under its own
+    /// origin (the path and `cursor` query differ; the origin is fixed). Hitting
+    /// this indicates a server-side bug, response tampering, or a misconfigured
+    /// base URL. Consumers may match on it to alert distinctly from ordinary
+    /// input-validation failures.
+    UntrustedNextUrl {
+        /// The rejected `next_url`, exactly as received (unparsed if it failed
+        /// to parse as a URL at all).
+        next_url: String,
+        /// ASCII-serialized origin (`scheme://host[:port]`) the client trusts,
+        /// derived from its configured base URL.
+        expected_origin: String,
+    },
 }
 
 impl std::fmt::Display for MassiveError {
@@ -122,6 +149,15 @@ impl std::fmt::Display for MassiveError {
                 write!(
                     f,
                     "Massive pagination cycle detected: next_url revisits {url}"
+                )
+            }
+            MassiveError::UntrustedNextUrl {
+                next_url,
+                expected_origin,
+            } => {
+                write!(
+                    f,
+                    "Massive rejected next_url outside trusted origin {expected_origin}: {next_url}"
                 )
             }
         }

@@ -19,6 +19,7 @@ use reqwest::{Client, StatusCode, header};
 use std::env;
 use std::time::Duration;
 use tracing::debug;
+use url::Url;
 
 const BASE_URL: &str = "https://api.massive.com";
 const ENV_API_KEY: &str = "MASSIVE_API_KEY";
@@ -69,6 +70,16 @@ impl MassiveRestClient {
     /// # Arguments
     ///
     /// * `api_key` - Massive API key from <https://massive.com/dashboard/api-keys>
+    ///
+    /// # Redirects
+    ///
+    /// The client does **not** follow HTTP redirects. The API key is sent as an
+    /// `Authorization: Bearer` header on every request, so auto-following a
+    /// server-issued 3xx could carry it off the trusted origin. Massive uses
+    /// explicit `next_url` cursor pagination and is not expected to redirect, so
+    /// an unexpected 3xx surfaces as [`MassiveError::Api`] rather than being
+    /// followed. A base URL set via [`Self::with_base_url`] must therefore serve
+    /// responses directly, without redirect indirection.
     pub fn new(api_key: impl Into<String>) -> Result<Self, MassiveError> {
         let api_key = api_key.into();
         let mut headers = header::HeaderMap::new();
@@ -83,6 +94,17 @@ impl MassiveRestClient {
         let client = Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
+            // Transport-layer companion to the `validate_next_url` origin guard. The API key rides in
+            // an `Authorization: Bearer` default header on every request, so a server-issued 3xx must
+            // not be allowed to bounce an origin-validated request to another host: `Policy::none()`
+            // stops reqwest auto-following any redirect, so an unexpected 3xx is returned unfollowed
+            // and surfaces as a `MassiveError::Api` instead of silently carrying the token off-origin.
+            // This makes the "token never leaves the trusted origin" guarantee structural rather than
+            // relying on reqwest's internal cross-origin header stripping. (`https_only` is deliberately
+            // NOT set: it would reject the `http://` base URL that `with_base_url` accepts for local
+            // testing, while adding nothing against the leak — the origin check already rejects any
+            // `http://` `next_url` under an `https` base, since scheme is part of the compared origin.)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         Ok(Self {
@@ -100,6 +122,10 @@ impl MassiveRestClient {
     }
 
     /// Override the base URL (useful for testing or legacy polygon.io endpoint).
+    ///
+    /// The base URL defines the trusted origin: a paginated `next_url` is followed
+    /// only when it shares this scheme, host, and port, and redirects are never
+    /// followed (see the "Redirects" note on [`Self::new`]).
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
@@ -126,22 +152,56 @@ impl MassiveRestClient {
         Ok(())
     }
 
-    /// Validate next_url is from the expected origin to prevent token leakage.
-    pub(super) fn validate_next_url(next_url: &str, base_url: &str) -> Result<(), MassiveError> {
-        if !next_url.starts_with(base_url) {
-            return Err(MassiveError::InvalidInput {
-                message: format!(
-                    "next_url origin mismatch: expected {}, got {}",
-                    base_url, next_url
-                ),
-            });
+    /// Validate that `url` shares the client's configured origin before a request
+    /// is issued, so the API token is never sent to an untrusted host.
+    ///
+    /// The client attaches `Authorization: Bearer <key>` as a reqwest default
+    /// header, sent with **every** request this client issues regardless of
+    /// destination host, so a URL naming a different origin would leak the token.
+    /// A `starts_with(base_url)` prefix check is insufficient — a look-alike host
+    /// such as `https://api.massive.com.evil.example` (or the separator-less
+    /// `https://api.massive.comevil.example`) shares the prefix yet is a
+    /// different origin. Both URLs are parsed and their
+    /// [origins](url::Url::origin) (scheme + host + port) compared; a `url` that
+    /// fails to parse or whose origin differs is rejected (fail-closed) with
+    /// [`MassiveError::UntrustedNextUrl`].
+    ///
+    /// A `base_url` that fails to parse is a client-side misconfiguration
+    /// (reachable only via [`Self::with_base_url`], since [`BASE_URL`] is a valid
+    /// constant) and surfaces as [`MassiveError::InvalidInput`], not as a
+    /// security event.
+    ///
+    /// On success returns the parsed [`Url`] so the caller can issue the request
+    /// without re-parsing the string.
+    fn validate_next_url(next_url: &str, base_url: &str) -> Result<Url, MassiveError> {
+        let base_origin = Url::parse(base_url)
+            .map_err(|e| MassiveError::InvalidInput {
+                message: format!("base_url is not a valid URL ({e}): {base_url}"),
+            })?
+            .origin();
+
+        let untrusted = || MassiveError::UntrustedNextUrl {
+            next_url: next_url.to_owned(),
+            expected_origin: base_origin.ascii_serialization(),
+        };
+
+        let parsed = Url::parse(next_url).map_err(|_| untrusted())?;
+        if parsed.origin() != base_origin {
+            return Err(untrusted());
         }
-        Ok(())
+        Ok(parsed)
     }
 
     /// Fetch a page body from the given URL with standard error handling.
+    ///
+    /// Every URL is [origin-validated](Self::validate_next_url) against the
+    /// client's base URL before the request is sent — this is the single
+    /// chokepoint that issues an authenticated request, so validating here (not
+    /// at each pagination call site) makes the token-leak guard structural: a new
+    /// paginated fetch cannot bypass it by forgetting to call the validator.
     pub(super) async fn fetch_page_body(&self, url: &str) -> Result<String, MassiveError> {
-        let response = self.client.get(url).send().await?;
+        let validated_url = Self::validate_next_url(url, &self.base_url)?;
+        let response = self.client.get(validated_url).send().await?;
         let status = response.status();
 
         // Extract retry-after before consuming response
@@ -272,10 +332,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                // Validate next_url origin before following
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, &self.base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }
@@ -332,10 +388,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                // Validate next_url origin before following
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, &self.base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }
@@ -398,10 +450,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                // Validate next_url origin before following
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, &self.base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }
@@ -430,5 +478,96 @@ mod tests {
             let result = MassiveRestClient::from_env();
             assert!(matches!(result, Err(MassiveError::EnvVar { .. })));
         });
+    }
+
+    // --- validate_next_url (#182: token-leak guard) ---------------------------
+
+    const BASE: &str = "https://api.massive.com";
+
+    fn assert_untrusted(next_url: &str) {
+        match MassiveRestClient::validate_next_url(next_url, BASE) {
+            Err(MassiveError::UntrustedNextUrl {
+                next_url: got,
+                expected_origin,
+            }) => {
+                assert_eq!(got, next_url);
+                assert_eq!(expected_origin, "https://api.massive.com");
+            }
+            other => panic!("expected UntrustedNextUrl for {next_url:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_next_url_accepts_same_origin_different_path() {
+        // The documented shape: same origin, path + `cursor` query differ.
+        assert!(
+            MassiveRestClient::validate_next_url(
+                "https://api.massive.com/v3/reference/tickers?cursor=YWN0aXZlPXRydWU",
+                BASE,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_next_url_accepts_explicit_default_port() {
+        // `:443` is the default for https, so origins are equal.
+        assert!(
+            MassiveRestClient::validate_next_url("https://api.massive.com:443/v2/aggs", BASE)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_next_url_rejects_lookalike_subdomain() {
+        // The reported #182 vector: shares the base URL as a string prefix
+        // (so `starts_with` passed) but is a different host.
+        assert_untrusted("https://api.massive.com.attacker.example/v2/aggs?cursor=abc");
+    }
+
+    #[test]
+    fn validate_next_url_rejects_no_dot_suffix_host() {
+        // Proves the fix closes the separator-less bypass, not just subdomains:
+        // `api.massive.comevil.example` also `starts_with("https://api.massive.com")`.
+        assert_untrusted("https://api.massive.comevil.example/v2/aggs");
+    }
+
+    #[test]
+    fn validate_next_url_rejects_scheme_downgrade() {
+        // https -> http would send the bearer token in cleartext.
+        assert_untrusted("http://api.massive.com/v2/aggs");
+    }
+
+    #[test]
+    fn validate_next_url_rejects_port_mismatch() {
+        assert_untrusted("https://api.massive.com:8443/v2/aggs");
+    }
+
+    #[test]
+    fn validate_next_url_rejects_userinfo_confusion() {
+        // Host is `attacker.example`; `api.massive.com` is only userinfo.
+        assert_untrusted("https://api.massive.com@attacker.example/v2/aggs");
+    }
+
+    #[test]
+    fn validate_next_url_rejects_unparseable_next_url() {
+        // Fail-closed: an unverifiable URL must never receive the token.
+        assert_untrusted("not a url");
+    }
+
+    #[test]
+    fn validate_next_url_rejects_non_http_scheme() {
+        // Non-http(s) schemes yield opaque origins that never compare equal.
+        assert_untrusted("file:///etc/passwd");
+    }
+
+    #[test]
+    fn validate_next_url_unparseable_base_is_invalid_input_not_security() {
+        // A broken client-configured base URL is a misconfiguration, not a
+        // token-leak attempt — surfaces as InvalidInput.
+        assert!(matches!(
+            MassiveRestClient::validate_next_url("https://api.massive.com/v2/aggs", "not a url"),
+            Err(MassiveError::InvalidInput { .. })
+        ));
     }
 }

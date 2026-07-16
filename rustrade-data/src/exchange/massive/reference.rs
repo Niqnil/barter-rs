@@ -1166,9 +1166,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }
@@ -1360,9 +1357,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }
@@ -1416,9 +1410,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }

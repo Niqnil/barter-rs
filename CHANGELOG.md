@@ -300,6 +300,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Fixed a bearer-token leak in Massive REST pagination** (`rustrade-data`). The client attaches its
+  API key as an `Authorization: Bearer` default header sent with every request, and validated each
+  server-supplied `next_url` with a `starts_with(base_url)` prefix check before following it. A
+  look-alike host that merely shares the prefix — `https://api.massive.com.attacker.example` or even
+  the separator-less `https://api.massive.comevil.example` — passed that check and would have received
+  the token. Pagination now parses both URLs and compares their [origins][url-origin]
+  (scheme + host + port), rejecting any `next_url` whose origin differs or that fails to parse
+  (fail-closed) so the token is never sent to an untrusted host. The check moved into the single
+  request chokepoint (`fetch_page_body`) so it cannot be bypassed by a future paginated fetch, and the
+  client now disables HTTP redirect following (`redirect::Policy::none()`) so a server-issued 3xx
+  cannot bounce an origin-validated request to another host behind the guard — the guarantee no longer
+  depends on reqwest's internal cross-origin header stripping. A new
+  `MassiveError::UntrustedNextUrl { next_url, expected_origin }` variant carries the diagnosis
+  (`MassiveError` is `#[non_exhaustive]`, so the addition is not a breaking change).
+
+  [url-origin]: https://docs.rs/url/latest/url/struct.Url.html#method.origin
+
 - Upgraded `anyhow` to 1.0.103 and `quick-xml` to 0.41.0 to clear three RUSTSEC advisories:
   RUSTSEC-2026-0190 (unsoundness in `anyhow::Error::downcast_mut`), RUSTSEC-2026-0194 (quadratic
   run time when checking a start tag for duplicate attribute names) and RUSTSEC-2026-0195

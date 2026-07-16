@@ -176,3 +176,120 @@ async fn tickers_stream_paginates_finite_chain_without_false_positive() {
         "exactly two pages should have been fetched"
     );
 }
+
+/// A `next_url` pointing at a *different origin* must terminate the stream with
+/// `UntrustedNextUrl` and — the load-bearing guarantee (#182) — the client must
+/// never issue a request to that origin, so the `Authorization: Bearer` token is
+/// never leaked.
+///
+/// The two mock servers share host `127.0.0.1` but bind different ports, so they
+/// are distinct origins (origin = scheme + host + port); the malicious page under
+/// the trusted origin hands back a `next_url` on the attacker's origin.
+#[tokio::test]
+async fn aggregates_stream_rejects_cross_origin_next_url_without_leaking_token() {
+    // The attacker-controlled origin. Its catch-all mock would happily answer
+    // (and thus would have received the bearer token) *if* the client ever
+    // fetched it — the test asserts it never does.
+    let attacker = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resultsCount": 0,
+            "results": [],
+            "next_url": serde_json::Value::Null,
+        })))
+        .mount(&attacker)
+        .await;
+
+    // The trusted origin returns one empty page whose `next_url` points off-origin
+    // at the attacker.
+    let primary = MockServer::start().await;
+    let evil_next = format!("{}/v2/aggs/steal?cursor=abc", attacker.uri());
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resultsCount": 0,
+            "results": [],
+            "next_url": evil_next,
+        })))
+        .mount(&primary)
+        .await;
+
+    let client = client_for(&primary);
+    let to = Utc::now();
+    let from = to - Duration::minutes(5);
+    let mut stream = pin!(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to));
+
+    let mut terminal_err = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(_) => continue,
+            Err(e) => {
+                terminal_err = Some(e);
+                break;
+            }
+        }
+    }
+
+    assert!(
+        matches!(terminal_err, Some(MassiveError::UntrustedNextUrl { .. })),
+        "expected UntrustedNextUrl, got {terminal_err:?}"
+    );
+    assert!(
+        attacker.received_requests().await.unwrap().is_empty(),
+        "client must not issue any request to the untrusted origin (token would leak)"
+    );
+}
+
+/// The origin guard vets the URL the client *requests*, but a trusted server could
+/// still answer with a 3xx redirect to another origin. The client disables redirect
+/// following (`redirect::Policy::none()`), so the token can never ride a
+/// server-issued redirect off-origin: the 3xx is returned unfollowed and surfaces
+/// as a terminal `MassiveError::Api`, and — the load-bearing guarantee — the
+/// attacker origin receives no request. This keeps the "token never leaves the
+/// trusted origin" property from depending on reqwest's internal header stripping.
+#[tokio::test]
+async fn aggregates_stream_does_not_follow_redirect_off_origin() {
+    // Same catch-all attacker origin as the cross-origin test — it would answer
+    // (and receive the bearer token) if the client ever followed the redirect.
+    let attacker = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resultsCount": 0,
+            "results": [],
+            "next_url": serde_json::Value::Null,
+        })))
+        .mount(&attacker)
+        .await;
+
+    // The trusted origin redirects the very first request off-origin at the attacker.
+    let primary = MockServer::start().await;
+    let evil_location = format!("{}/v2/aggs/steal", attacker.uri());
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", evil_location.as_str()))
+        .mount(&primary)
+        .await;
+
+    let client = client_for(&primary);
+    let to = Utc::now();
+    let from = to - Duration::minutes(5);
+    let mut stream = pin!(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to));
+
+    let mut terminal_err = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(_) => continue,
+            Err(e) => {
+                terminal_err = Some(e);
+                break;
+            }
+        }
+    }
+
+    assert!(
+        matches!(terminal_err, Some(MassiveError::Api { status, .. }) if (300..400).contains(&status)),
+        "expected an unfollowed 3xx as MassiveError::Api, got {terminal_err:?}"
+    );
+    assert!(
+        attacker.received_requests().await.unwrap().is_empty(),
+        "client must not follow the redirect to the untrusted origin (token would leak)"
+    );
+}
