@@ -17,7 +17,9 @@
 //!    until it returns the `<FlexQueryResponse>` statement (or a terminal error).
 //!
 //! Non-success statuses (e.g. `1003` invalid token, `1018` throttled, token-expired) surface as
-//! [`IbkrFlexError::Flex`]; exhausting the poll budget surfaces as [`IbkrFlexError::PollTimeout`].
+//! [`IbkrFlexError::Flex`]; a non-success HTTP status whose body is *not* a recognizable Flex
+//! envelope (e.g. a proxy/CDN error page) surfaces as [`IbkrFlexError::HttpStatus`]; exhausting the
+//! poll budget surfaces as [`IbkrFlexError::PollTimeout`].
 //!
 //! This service uses an HTTPS token + saved-query id — it does **not** use IB Gateway / TWS, so it
 //! is entirely independent of the socket [`IbkrStreamConfig`](crate::exchange::ibkr::IbkrStreamConfig).
@@ -68,9 +70,19 @@ const POLL_MAX_ATTEMPTS: u32 = 12;
 /// Delay between GetStatement poll attempts while the statement is still generating.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Delay before the *first* GetStatement poll. The statement is generated asynchronously, so the
+/// first poll almost always reports [`GENERATION_IN_PROGRESS_CODE`]; waiting once up front keeps
+/// that near-certain miss from consuming one of the bounded poll attempts. Overridable via
+/// [`FlexPollPolicy`].
+const POLL_INITIAL_DELAY: Duration = Duration::from_secs(5);
+
 /// Flex `ErrorCode` meaning "statement generation in progress, try again shortly" — the only
 /// non-success status that should be retried rather than surfaced as an error.
 const GENERATION_IN_PROGRESS_CODE: &str = "1019";
+
+/// Maximum number of bytes of a non-Flex error body retained in [`IbkrFlexError::HttpStatus`]. Flex
+/// and IBKR error envelopes are tiny; this only bounds an unexpectedly large proxy/CDN error page.
+const MAX_ERROR_BODY_BYTES: usize = 1024;
 
 /// Errors from IBKR Flex Web Service operations.
 ///
@@ -90,20 +102,42 @@ pub enum IbkrFlexError {
     #[error("invalid credential: {0}")]
     InvalidCredential(String),
 
-    /// Transport-level HTTP error (connection, timeout, or non-2xx status).
+    /// Transport-level HTTP error (connection, timeout, or body-decode failure).
+    ///
+    /// A non-2xx HTTP *status* no longer surfaces here: the client reads the response body **before**
+    /// branching on status and reports a non-success status as [`IbkrFlexError::HttpStatus`] (or the
+    /// richer [`IbkrFlexError::Flex`] when the body is a Flex error envelope). This variant is now
+    /// purely a connection/timeout/decode failure.
     ///
     /// The inner [`reqwest::Error`] **never carries the request URL.** The Flex token is
     /// transmitted as `t=<TOKEN>` in every request URL, and `reqwest::Error`'s `Display` and
     /// `Debug` both embed that URL verbatim when present. The `From<reqwest::Error>` conversion
     /// for this type always strips it via [`reqwest::Error::without_url`] before the error is
-    /// stored, covering every reqwest site that attaches a URL (`send`, `error_for_status`, body
-    /// decode); `Client::build()` errors carry no URL, so the strip is a no-op for them. The
-    /// `source()` chain (hyper/IO transport errors) is preserved and does not independently carry
-    /// the URL.
+    /// stored, covering every reqwest site that attaches a URL (`send`, body decode);
+    /// `Client::build()` errors carry no URL, so the strip is a no-op for them. The `source()`
+    /// chain (hyper/IO transport errors) is preserved and does not independently carry the URL.
     ///
     /// Safe to log or display without credential scrubbing.
     #[error("HTTP error: {0}")]
     Http(reqwest::Error),
+
+    /// The service returned a non-success HTTP status whose body was **not** a recognizable Flex
+    /// envelope — e.g. a proxy/CDN/WAF error page or a gateway timeout served in front of the Flex
+    /// Web Service.
+    ///
+    /// The body is read before the status is inspected (so the diagnostic is preserved rather than
+    /// discarded by `error_for_status`), then bounded to [`MAX_ERROR_BODY_BYTES`] and
+    /// **token-scrubbed** before storage: the Flex token rides in the request URL's `t=` parameter,
+    /// so a proxy that echoes the request line into its error page could otherwise reflect the
+    /// credential into this body. An IBKR *application* error that arrives under a non-2xx status is
+    /// still surfaced as the richer [`IbkrFlexError::Flex`], not here.
+    #[error("HTTP status {status}: {body}")]
+    HttpStatus {
+        /// The non-success HTTP status code.
+        status: u16,
+        /// A bounded, token-scrubbed slice of the response body.
+        body: String,
+    },
 
     /// The Flex service returned a non-success status (e.g. invalid token, throttled, expired).
     #[error("Flex service error ({code}): {message}")]
@@ -114,11 +148,12 @@ pub enum IbkrFlexError {
         message: String,
     },
 
-    /// The statement was still generating after [`POLL_MAX_ATTEMPTS`] poll attempts.
+    /// The statement was still generating after the configured poll budget was exhausted.
     #[error("Flex statement not ready after {attempts} poll attempts")]
     PollTimeout {
-        /// Number of poll attempts made before giving up. Currently always [`POLL_MAX_ATTEMPTS`],
-        /// since this error fires only after every attempt reported the statement still generating.
+        /// Number of poll attempts made before giving up — the configured
+        /// [`FlexPollPolicy::max_attempts`] ([`POLL_MAX_ATTEMPTS`] by default), since this error
+        /// fires only after every attempt reported the statement still generating.
         attempts: u32,
     },
 
@@ -137,12 +172,49 @@ pub enum IbkrFlexError {
 ///
 /// Stripping lives in this single conversion rather than per-call-site discipline so the
 /// "[`IbkrFlexError::Http`] never carries the URL" invariant is enforced by the type system: every
-/// `?` on a `reqwest::Error` — at the request sites *and* any path added later — routes through here.
+/// `?` on a `reqwest::Error` — at the request sites (`send`, body decode) *and* any path added later
+/// — routes through here.
 /// [`reqwest::Error::without_url`] sets the stored URL to `None` (a no-op for `Client::build()`
 /// errors, which carry none) while preserving the diagnostic kind/status and `source()` chain.
 impl From<reqwest::Error> for IbkrFlexError {
     fn from(error: reqwest::Error) -> Self {
         IbkrFlexError::Http(error.without_url())
+    }
+}
+
+/// Poll timing for the GetStatement stage of [`IbkrFlexClient::fetch_statement_xml`].
+///
+/// The Flex Web Service generates statements asynchronously, so a fetch polls GetStatement until the
+/// statement is ready. This policy controls that polling:
+///
+/// - `initial_delay` — waited **once** before the first poll. The statement is created
+///   asynchronously, so the first GetStatement almost always reports `1019` ("still generating"); an
+///   initial delay keeps that near-certain miss from consuming one of the bounded attempts.
+/// - `interval` — waited between subsequent polls.
+/// - `max_attempts` — the number of GetStatement polls before giving up with
+///   [`IbkrFlexError::PollTimeout`].
+///
+/// The [`Default`] budget (`initial_delay` 5 s, `interval` 5 s, `max_attempts` 12) suits a typical
+/// small activity statement. A caller fetching a large statement — which takes longer to generate —
+/// can widen the budget via [`IbkrFlexClient::with_poll_policy`]. A `max_attempts` of `0` yields an
+/// immediate [`IbkrFlexError::PollTimeout`] (an observable "no polling requested" outcome).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlexPollPolicy {
+    /// Delay before the first GetStatement poll.
+    pub initial_delay: Duration,
+    /// Delay between subsequent GetStatement polls.
+    pub interval: Duration,
+    /// Maximum number of GetStatement poll attempts before [`IbkrFlexError::PollTimeout`].
+    pub max_attempts: u32,
+}
+
+impl Default for FlexPollPolicy {
+    fn default() -> Self {
+        Self {
+            initial_delay: POLL_INITIAL_DELAY,
+            interval: POLL_INTERVAL,
+            max_attempts: POLL_MAX_ATTEMPTS,
+        }
     }
 }
 
@@ -252,6 +324,7 @@ pub struct IbkrFlexClient {
     token: String,
     query_id: String,
     base_url: String,
+    poll_policy: FlexPollPolicy,
 }
 
 impl fmt::Debug for IbkrFlexClient {
@@ -260,6 +333,7 @@ impl fmt::Debug for IbkrFlexClient {
         f.debug_struct("IbkrFlexClient")
             .field("query_id", &self.query_id)
             .field("base_url", &self.base_url)
+            .field("poll_policy", &self.poll_policy)
             .finish_non_exhaustive()
     }
 }
@@ -280,8 +354,9 @@ impl IbkrFlexClient {
             // `https_only(true)` rejects any request whose own URL is not `https`, catching a
             // misconfigured `http://` base URL before the token reaches the wire. This client issues
             // two GETs to known HTTPS endpoints and expects no redirects, so an unexpected 3xx is
-            // returned unfollowed and surfaces downstream as a body-parse error — never as a silent
-            // scheme downgrade. (The content-layer scheme check on the SendRequest poll URL cannot
+            // returned unfollowed and surfaces downstream as an `IbkrFlexError::HttpStatus` (a
+            // non-success status with a non-Flex body) — never as a silent scheme downgrade. (The
+            // content-layer scheme check on the SendRequest poll URL cannot
             // intercept redirects reqwest would otherwise follow, which is why these guards exist.)
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
@@ -291,7 +366,31 @@ impl IbkrFlexClient {
             token: config.token,
             query_id: config.query_id,
             base_url: FLEX_BASE_URL.to_owned(),
+            poll_policy: FlexPollPolicy::default(),
         })
+    }
+
+    /// Override the GetStatement [`FlexPollPolicy`] (poll timing / budget).
+    ///
+    /// Builder-style; defaults to [`FlexPollPolicy::default`]. Widen the budget for a large
+    /// statement (which takes longer to generate):
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use rustrade_data::exchange::ibkr::{IbkrFlexClient, FlexPollPolicy};
+    /// # fn f() -> Result<(), Box<dyn std::error::Error>> {
+    /// let _client = IbkrFlexClient::from_env()?.with_poll_policy(FlexPollPolicy {
+    ///     initial_delay: Duration::from_secs(10),
+    ///     interval: Duration::from_secs(10),
+    ///     max_attempts: 30,
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_poll_policy(mut self, policy: FlexPollPolicy) -> Self {
+        self.poll_policy = policy;
+        self
     }
 
     /// Create a client from environment variables (see [`IbkrFlexConfig::from_env`]).
@@ -306,8 +405,10 @@ impl IbkrFlexClient {
 
     /// Run the full 2-call Flex flow and return the raw `<FlexQueryResponse>` statement XML.
     ///
-    /// Issues SendRequest, then polls GetStatement (up to [`POLL_MAX_ATTEMPTS`] times, sleeping
-    /// [`POLL_INTERVAL`] between attempts) until the statement is ready.
+    /// Issues SendRequest, then polls GetStatement until the statement is ready, governed by this
+    /// client's [`FlexPollPolicy`] (an `initial_delay` before the first poll, `interval` between
+    /// subsequent polls, and a `max_attempts` budget). Defaults to [`FlexPollPolicy::default`];
+    /// override with [`with_poll_policy`](Self::with_poll_policy).
     ///
     /// # Security
     ///
@@ -334,67 +435,80 @@ impl IbkrFlexClient {
     ///
     /// - [`IbkrFlexError::Http`] on a transport failure.
     /// - [`IbkrFlexError::Flex`] if the service reports a terminal non-success status.
+    /// - [`IbkrFlexError::HttpStatus`] if a non-success HTTP status carries a body that is not a
+    ///   recognizable Flex envelope (e.g. a proxy/CDN error page).
     /// - [`IbkrFlexError::PollTimeout`] if the statement is still generating after the poll budget.
     /// - [`IbkrFlexError::Parse`] if a response cannot be parsed.
     pub async fn fetch_statement_xml(&self) -> Result<String, IbkrFlexError> {
         let send_url = format!("{}/SendRequest", self.base_url);
         debug!("Requesting IBKR Flex statement generation");
 
-        // Plain `?` is safe: `IbkrFlexError`'s `From<reqwest::Error>` strips the token-bearing
-        // request URL from every error (see the impl above).
-        let body = self
-            .http
-            .get(&send_url)
-            .query(&[
-                ("t", self.token.as_str()),
-                ("q", self.query_id.as_str()),
-                ("v", FLEX_VERSION),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
+        let (status, body) = self
+            .get_with_query(&send_url, self.query_id.as_str())
             .await?;
-
         let SendRequestOk {
             reference_code,
             url,
-        } = parse_send_request_response(&body)?;
+        } = interpret_send_response(status, &body, &self.token)?;
 
-        for attempt in 1..=POLL_MAX_ATTEMPTS {
-            // Plain `?` as above: the `From` impl strips the token-bearing URL from any reqwest error.
-            let body = self
-                .http
-                .get(&url)
-                .query(&[
-                    ("t", self.token.as_str()),
-                    ("q", reference_code.as_str()),
-                    ("v", FLEX_VERSION),
-                ])
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
+        // A short initial delay before the first poll: the statement is generated asynchronously, so
+        // an immediate GetStatement almost always reports 1019 ("still generating") and would burn
+        // one of the bounded attempts on a near-certain miss. Skipped when no polls are budgeted
+        // (`max_attempts == 0`), so that documented "no polling requested" case fails over immediately
+        // rather than sleeping before an empty loop.
+        if self.poll_policy.max_attempts > 0 {
+            tokio::time::sleep(self.poll_policy.initial_delay).await;
+        }
 
-            match classify_get_statement(&body)? {
+        for attempt in 1..=self.poll_policy.max_attempts {
+            let (status, body) = self.get_with_query(&url, reference_code.as_str()).await?;
+
+            match interpret_poll_response(status, &body, &self.token)? {
                 GetStatementOutcome::Ready => return Ok(body),
                 GetStatementOutcome::InProgress => {
                     debug!(
                         attempt,
-                        max = POLL_MAX_ATTEMPTS,
+                        max = self.poll_policy.max_attempts,
                         "Flex statement still generating"
                     );
-                    if attempt < POLL_MAX_ATTEMPTS {
-                        tokio::time::sleep(POLL_INTERVAL).await;
+                    if attempt < self.poll_policy.max_attempts {
+                        tokio::time::sleep(self.poll_policy.interval).await;
                     }
                 }
             }
         }
 
         Err(IbkrFlexError::PollTimeout {
-            attempts: POLL_MAX_ATTEMPTS,
+            attempts: self.poll_policy.max_attempts,
         })
+    }
+
+    /// Issue a GET to `url` with the standard Flex query parameters (`t`/`q`/`v`) and read the full
+    /// response body **regardless of HTTP status**, returning the status alongside the body.
+    ///
+    /// Reading the body before branching on status is deliberate: `error_for_status` discards the
+    /// body, but IBKR/proxy diagnostic bodies — and Flex application errors that arrive under a
+    /// non-2xx status — are exactly what a caller needs to diagnose a failure. The status is
+    /// returned so the caller ([`interpret_send_response`] / [`interpret_poll_response`]) can decide
+    /// whether an unrecognized body under a non-success status is a transport error
+    /// ([`IbkrFlexError::HttpStatus`]) versus a genuine Flex-envelope error.
+    ///
+    /// The `?` on `send`/`text` still routes any `reqwest::Error` through the URL-stripping
+    /// `From<reqwest::Error>` impl, so the token never leaks into an error.
+    async fn get_with_query(
+        &self,
+        url: &str,
+        q: &str,
+    ) -> Result<(reqwest::StatusCode, String), IbkrFlexError> {
+        let response = self
+            .http
+            .get(url)
+            .query(&[("t", self.token.as_str()), ("q", q), ("v", FLEX_VERSION)])
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        Ok((status, body))
     }
 
     /// Fetch the statement and parse its Corporate Actions section into faithful records.
@@ -454,6 +568,26 @@ struct FlexStatementResponse {
 /// Parse a SendRequest response: success yields the reference code + poll URL; any other status
 /// becomes an [`IbkrFlexError::Flex`].
 fn parse_send_request_response(xml: &str) -> Result<SendRequestOk, IbkrFlexError> {
+    // A SendRequest response is always a `<FlexStatementResponse>` envelope. Reject any other root
+    // element as a parse error up front — otherwise quick_xml's lenient, all-`#[serde(default)]`
+    // deserialization coerces a non-Flex body (e.g. a proxy/CDN HTML error page) into an
+    // empty-status envelope, which would surface as a confusing `Flex { code: "" }`. Mirrors the
+    // root-element check `classify_get_statement` already does, and lets `interpret_send_response`
+    // distinguish a non-Flex body (→ `HttpStatus` under a non-2xx status) from a genuine Flex error.
+    match root_element_name(xml).as_deref() {
+        Some("FlexStatementResponse") => {}
+        Some(other) => {
+            return Err(IbkrFlexError::Parse(format!(
+                "unexpected Flex SendRequest root element <{other}>"
+            )));
+        }
+        None => {
+            return Err(IbkrFlexError::Parse(
+                "empty or unreadable Flex SendRequest response".to_owned(),
+            ));
+        }
+    }
+
     let resp: FlexStatementResponse = quick_xml::de::from_str(xml).map_err(|e| {
         IbkrFlexError::Parse(format!("failed to parse Flex SendRequest response: {e}"))
     })?;
@@ -525,6 +659,87 @@ fn flex_error(resp: FlexStatementResponse, stage: &str) -> IbkrFlexError {
             .error_message
             .unwrap_or_else(|| format!("Flex {stage} returned non-success status {}", resp.status)),
     }
+}
+
+/// Interpret a SendRequest response given its HTTP `status` and `body`.
+///
+/// The body is parsed as a Flex envelope **first**, so an IBKR application error that arrives under
+/// a non-2xx status still surfaces as the richer [`IbkrFlexError::Flex`] (e.g. `1003` invalid
+/// token). A body that is *not* a recognizable Flex envelope under a non-success status becomes
+/// [`IbkrFlexError::HttpStatus`] (a proxy/CDN error page) rather than a misleading XML parse error;
+/// the same malformed body under a 2xx status stays a genuine [`IbkrFlexError::Parse`].
+fn interpret_send_response(
+    status: reqwest::StatusCode,
+    body: &str,
+    token: &str,
+) -> Result<SendRequestOk, IbkrFlexError> {
+    match parse_send_request_response(body) {
+        Err(IbkrFlexError::Parse(_)) if !status.is_success() => {
+            Err(http_status_error(status, body, token))
+        }
+        other => other,
+    }
+}
+
+/// Interpret a GetStatement poll response given its HTTP `status` and `body`.
+///
+/// The body is classified **first**, so a `1019` "still generating" that IBKR returns under a
+/// non-2xx status is still recognized as retryable — previously `error_for_status` aborted the poll
+/// before the body was classified. A body that is not a recognizable Flex envelope under a
+/// non-success status becomes [`IbkrFlexError::HttpStatus`]; a terminal Flex error envelope under a
+/// non-2xx status stays the richer [`IbkrFlexError::Flex`].
+fn interpret_poll_response(
+    status: reqwest::StatusCode,
+    body: &str,
+    token: &str,
+) -> Result<GetStatementOutcome, IbkrFlexError> {
+    match classify_get_statement(body) {
+        Err(IbkrFlexError::Parse(_)) if !status.is_success() => {
+            Err(http_status_error(status, body, token))
+        }
+        other => other,
+    }
+}
+
+/// Build an [`IbkrFlexError::HttpStatus`] from a non-success response, bounding and token-scrubbing
+/// the body.
+fn http_status_error(status: reqwest::StatusCode, body: &str, token: &str) -> IbkrFlexError {
+    IbkrFlexError::HttpStatus {
+        status: status.as_u16(),
+        body: sanitize_error_body(body, token),
+    }
+}
+
+/// Redact the Flex `token` from `body`, then bound the result to [`MAX_ERROR_BODY_BYTES`] (on a
+/// UTF-8 char boundary).
+///
+/// The token rides in the request URL's `t=` query parameter, so a misconfigured proxy or WAF that
+/// echoes the request line into its error page could reflect the credential into the body. Redacting
+/// it upholds the "token never appears in an error" invariant this module enforces for
+/// `reqwest::Error` URLs. Redaction runs over the full body **before** bounding so a token that
+/// straddles the byte cap can't survive as an unredacted fragment.
+fn sanitize_error_body(body: &str, token: &str) -> String {
+    // Redact the token over the FULL body first (order matters for correctness, not just cost):
+    // bounding first could leave a credential that straddles the byte cap present only as a prefix,
+    // which the full-token `contains`/`replace` would then miss, and redacting after bounding could
+    // also push the result back over the cap (`[REDACTED]` is longer than a short token). Scanning
+    // the whole body only runs on the error path, so the extra pass is acceptable.
+    let mut scrubbed = if !token.is_empty() && body.contains(token) {
+        body.replace(token, "[REDACTED]")
+    } else {
+        body.to_owned()
+    };
+    // Then bound to MAX_ERROR_BODY_BYTES so a large proxy/CDN error page can't bloat the error.
+    // `is_char_boundary` keeps the truncated string valid UTF-8 (there is always a boundary at or
+    // below the cap), which `String::truncate` requires.
+    if scrubbed.len() > MAX_ERROR_BODY_BYTES {
+        let mut end = MAX_ERROR_BODY_BYTES;
+        while !scrubbed.is_char_boundary(end) {
+            end -= 1;
+        }
+        scrubbed.truncate(end);
+    }
+    scrubbed
 }
 
 /// Read the name of the first (root) element of an XML document, ignoring the prolog/comments.
@@ -639,6 +854,27 @@ mod tests {
             parse_send_request_response(xml),
             Err(IbkrFlexError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn send_request_non_envelope_root_is_a_parse_error() {
+        // A non-<FlexStatementResponse> body (e.g. a proxy/CDN HTML error page) must be a parse
+        // error, not coerced by lenient all-`#[serde(default)]` deserialization into a confusing
+        // empty-status `Flex` error. This is what lets `interpret_send_response` treat it as an
+        // HttpStatus under a non-2xx status.
+        for body in [
+            "<html><body>502 Bad Gateway</body></html>",
+            "<not-flex/>",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    parse_send_request_response(body),
+                    Err(IbkrFlexError::Parse(_))
+                ),
+                "expected Parse for body {body:?}"
+            );
+        }
     }
 
     #[test]
@@ -811,6 +1047,177 @@ mod tests {
         assert!(
             !debug.contains("  987654"),
             "surrounding whitespace should not survive into the stored query_id, got: {debug}"
+        );
+    }
+
+    // ----- status/body interpretation (part (a): read body before branching on status) -----
+
+    #[test]
+    fn interpret_send_response_success_parses() {
+        let ok = interpret_send_response(reqwest::StatusCode::OK, SEND_SUCCESS, "tok").unwrap();
+        assert_eq!(ok.reference_code, "1234567890");
+    }
+
+    #[test]
+    fn interpret_send_response_flex_error_preserved_under_non_2xx() {
+        // An IBKR application error (Fail/1003) that arrives under a non-success HTTP status must
+        // still surface as the richer Flex error, not be masked as a raw transport status.
+        match interpret_send_response(reqwest::StatusCode::UNAUTHORIZED, SEND_FAIL, "tok") {
+            Err(IbkrFlexError::Flex { code, .. }) => assert_eq!(code, "1003"),
+            other => panic!("expected Flex error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_send_response_non_flex_body_under_non_2xx_is_http_status() {
+        // A proxy/CDN error page (not a Flex envelope) under a non-2xx status becomes HttpStatus,
+        // carrying the status + body rather than being discarded (as `error_for_status` did) or
+        // surfacing as a misleading XML parse error.
+        let body = "<html><body>502 Bad Gateway</body></html>";
+        match interpret_send_response(reqwest::StatusCode::BAD_GATEWAY, body, "tok") {
+            Err(IbkrFlexError::HttpStatus { status, body }) => {
+                assert_eq!(status, 502);
+                assert!(body.contains("Bad Gateway"), "diagnostic body preserved");
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_send_response_garbage_under_2xx_is_parse_error() {
+        // A malformed body under a *success* status is a genuine parse failure, not a transport
+        // status — the HttpStatus fallback must fire only on non-success statuses.
+        assert!(matches!(
+            interpret_send_response(reqwest::StatusCode::OK, "<not-flex/>", "tok"),
+            Err(IbkrFlexError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn interpret_poll_response_ready_and_in_progress() {
+        assert_eq!(
+            interpret_poll_response(reqwest::StatusCode::OK, GET_READY, "tok").unwrap(),
+            GetStatementOutcome::Ready
+        );
+        assert_eq!(
+            interpret_poll_response(reqwest::StatusCode::OK, GET_IN_PROGRESS, "tok").unwrap(),
+            GetStatementOutcome::InProgress
+        );
+    }
+
+    #[test]
+    fn interpret_poll_response_1019_under_non_2xx_is_still_retryable() {
+        // R9 retry-path fix: a 1019 "still generating" that IBKR returns under a non-success HTTP
+        // status must remain retryable. Previously `error_for_status` aborted the poll before the
+        // body was ever classified, turning a transient generation delay into a hard failure.
+        assert_eq!(
+            interpret_poll_response(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                GET_IN_PROGRESS,
+                "tok"
+            )
+            .unwrap(),
+            GetStatementOutcome::InProgress
+        );
+    }
+
+    #[test]
+    fn interpret_poll_response_terminal_flex_error_preserved_under_non_2xx() {
+        match interpret_poll_response(reqwest::StatusCode::BAD_REQUEST, GET_FAIL, "tok") {
+            Err(IbkrFlexError::Flex { code, .. }) => assert_eq!(code, "1020"),
+            other => panic!("expected Flex error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_poll_response_non_flex_body_under_non_2xx_is_http_status() {
+        match interpret_poll_response(
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+            "upstream request timed out",
+            "tok",
+        ) {
+            Err(IbkrFlexError::HttpStatus { status, body }) => {
+                assert_eq!(status, 504);
+                assert!(body.contains("timed out"));
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_status_body_is_token_scrubbed() {
+        // A misconfigured proxy could reflect the request URL (with the `t=` token) into its error
+        // page; the stored HttpStatus body must never carry the credential.
+        let token = "super-secret-token";
+        let body = format!("400 Bad Request: GET /SendRequest?t={token}&q=1&v=3");
+        match interpret_send_response(reqwest::StatusCode::BAD_REQUEST, &body, token) {
+            Err(IbkrFlexError::HttpStatus { body, .. }) => {
+                assert!(!body.contains(token), "token must be redacted, got: {body}");
+                assert!(body.contains("[REDACTED]"));
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_status_body_is_bounded_on_char_boundary() {
+        // A large body is truncated to the cap without splitting a multi-byte char (`€` is 3 bytes,
+        // 1024 is not a multiple of 3, so a naive byte-slice would panic on an invalid boundary).
+        let body = "€".repeat(1000); // 3000 bytes, exceeds the 1024-byte cap
+        match interpret_send_response(reqwest::StatusCode::BAD_GATEWAY, &body, "tok") {
+            Err(IbkrFlexError::HttpStatus { body, .. }) => {
+                assert!(
+                    body.len() <= MAX_ERROR_BODY_BYTES,
+                    "body bounded to the cap"
+                );
+                assert!(
+                    body.chars().all(|c| c == '€'),
+                    "truncation must land on a char boundary (valid UTF-8)"
+                );
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_status_body_scrubs_token_straddling_the_cap() {
+        // Regression: the token must be redacted even when it straddles the MAX_ERROR_BODY_BYTES cap
+        // in the *original* body. Redacting after bounding (the previous order) would leave only a
+        // prefix of the token in the bounded slice, which the full-token match then misses — leaking
+        // the fragment. Redacting first also keeps the result within the cap (`[REDACTED]` is longer
+        // than a short token, so replacing after bounding could overrun it).
+        let token = "SECRETTOKEN1234567890"; // 21 bytes
+        let prefix = "x".repeat(MAX_ERROR_BODY_BYTES - 9); // token starts 9 bytes before the cap
+        let body = format!("{prefix}{token}{}", "y".repeat(100)); // > cap; token spans the boundary
+        match interpret_send_response(reqwest::StatusCode::BAD_REQUEST, &body, token) {
+            Err(IbkrFlexError::HttpStatus { body, .. }) => {
+                assert!(
+                    !body.contains(token),
+                    "full token must be redacted, got: {body}"
+                );
+                assert!(
+                    !body.contains("SECRET"),
+                    "no token fragment may survive the boundary, got: {body}"
+                );
+                assert!(
+                    body.len() <= MAX_ERROR_BODY_BYTES,
+                    "redaction must not push the body back over the cap, len = {}",
+                    body.len()
+                );
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flex_poll_policy_default_matches_constants() {
+        assert_eq!(
+            FlexPollPolicy::default(),
+            FlexPollPolicy {
+                initial_delay: POLL_INITIAL_DELAY,
+                interval: POLL_INTERVAL,
+                max_attempts: POLL_MAX_ATTEMPTS,
+            }
         );
     }
 }

@@ -72,8 +72,8 @@ pub mod subscription;
 pub mod trades;
 
 pub use flex::{
-    IbkrFlexClient, IbkrFlexConfig, IbkrFlexCorporateAction, IbkrFlexError, IbkrReorgType,
-    parse_corporate_actions,
+    FlexPollPolicy, IbkrFlexClient, IbkrFlexConfig, IbkrFlexCorporateAction, IbkrFlexError,
+    IbkrReorgType, parse_corporate_actions,
 };
 
 use crate::{

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Richer IBKR Flex transport diagnostics + configurable poll budget** (`rustrade-data`, `ibkr`
+  feature). `IbkrFlexClient` now reads the HTTP response body **before** branching on status, so a
+  non-2xx response's diagnostic body (IBKR/proxy/CDN error pages) is preserved instead of being
+  discarded by `error_for_status`. A non-success status whose body is not a recognizable Flex
+  envelope surfaces as the new `IbkrFlexError::HttpStatus { status, body }` — the body bounded and
+  **token-scrubbed** (a proxy that echoes the request URL cannot leak the `t=` Flex token); an IBKR
+  application error that arrives under a non-2xx status still surfaces as the richer
+  `IbkrFlexError::Flex`. As a side effect this also fixes a retry-path bypass: a `1019` ("statement
+  still generating") returned under a non-2xx status is now honored as retryable rather than aborting
+  the poll. Poll timing is now configurable via the new `FlexPollPolicy { initial_delay, interval,
+  max_attempts }` (set with `IbkrFlexClient::with_poll_policy`); a short `initial_delay` before the
+  first poll (5 s by default) keeps the near-certain first `1019` from consuming one of the bounded
+  attempts. `IbkrFlexError` is `#[non_exhaustive]`, so the new variant is additive.
+
 - **Bounded, cycle-safe pagination for Massive REST fetches** (`rustrade-data`). Every Massive
   `next_url`-paginated fetch (`fetch_aggregates`, `fetch_trades`, `fetch_quotes`, `fetch_tickers`,
   `fetch_dividends`, `fetch_splits_raw`, `fetch_option_contracts`, `fetch_option_chain_snapshot`)
