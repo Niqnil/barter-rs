@@ -142,6 +142,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MassiveError` is now `#[non_exhaustive]`** (`rustrade-data`). Lets new variants (such as the
   pagination-robustness errors above) be added without further breaking changes. **Breaking** for
   downstream code matching `MassiveError` exhaustively — add a wildcard (`_`) arm.
+- **BREAKING: `MassiveRestClient::with_base_url` now returns `Result<Self, MassiveError>`**
+  (`rustrade-data`). The base URL is parsed into its trusted origin once, at construction, and cached
+  on the client — so a base URL that is not a valid URL now fails fast with
+  `MassiveError::InvalidInput` here instead of surfacing as a deferred error on the first request, and
+  every `next_url` origin check compares against the cached origin rather than re-parsing the base URL
+  per page. Migration: append `?` or `.expect(..)` to existing `with_base_url(..)` calls. (#198)
 - **`EngineEvent` is now `#[non_exhaustive]` and gains a `CorporateAction` variant** (`rustrade`).
   Marking it non-exhaustive lets future engine-driven event variants be added without further
   breaking changes. **Breaking** for downstream code matching `EngineEvent` exhaustively — add a
@@ -331,6 +337,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [url-origin]: https://docs.rs/url/latest/url/struct.Url.html#method.origin
 
+- **Hardened Massive REST authentication against future token leaks** (`rustrade-data`;
+  defense-in-depth follow-up to the origin-validation fix above). The API key is no longer installed
+  as a client-wide `Authorization: Bearer` default header on the underlying `reqwest::Client`, where
+  it rode every request regardless of destination host. It is now attached per-request inside the
+  single origin-validated request chokepoint (`fetch_page_body`), only *after* the destination origin
+  passes `validate_next_url`. The credential is thus coupled to the origin check by construction — no
+  request path can carry it to a host that has not been validated, even if a future paginated fetch
+  omitted the guard. `reqwest`'s `bearer_auth` additionally marks the header sensitive (redacted in
+  its logs). No public API change and no behaviour change for well-behaved responses. (#198)
 - Upgraded `anyhow` to 1.0.103 and `quick-xml` to 0.41.0 to clear three RUSTSEC advisories:
   RUSTSEC-2026-0190 (unsoundness in `anyhow::Error::downcast_mut`), RUSTSEC-2026-0194 (quadratic
   run time when checking a start tag for duplicate attribute names) and RUSTSEC-2026-0195

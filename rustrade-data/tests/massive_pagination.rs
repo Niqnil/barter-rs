@@ -25,7 +25,7 @@ use rustrade_data::exchange::massive::{
 };
 use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use wiremock::matchers::method;
+use wiremock::matchers::{header, method};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// Serves pre-configured JSON pages in registration order.
@@ -64,6 +64,7 @@ fn client_for(server: &MockServer) -> MassiveRestClient {
     MassiveRestClient::new("test_api_key")
         .expect("client builds")
         .with_base_url(server.uri())
+        .expect("mock server uri is a valid base url")
 }
 
 /// A `next_url` that always points back to the same page must terminate the stream
@@ -236,6 +237,41 @@ async fn aggregates_stream_rejects_cross_origin_next_url_without_leaking_token()
     assert!(
         attacker.received_requests().await.unwrap().is_empty(),
         "client must not issue any request to the untrusted origin (token would leak)"
+    );
+}
+
+/// The positive counterpart to the cross-origin test: on the trusted origin the
+/// client *must* attach the `Authorization: Bearer <key>` header (#198 moved it off
+/// the reqwest default headers to a per-request attachment). The mock only matches
+/// when that header is present, so a clean stream completion proves the token rode
+/// the request; had it not been attached, the request would miss the mock and come
+/// back as a `MassiveError::Api { status: 404 }`.
+#[tokio::test]
+async fn aggregates_request_attaches_bearer_token_to_trusted_origin() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(header("authorization", "Bearer test_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resultsCount": 0,
+            "results": [],
+            "next_url": serde_json::Value::Null,
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let to = Utc::now();
+    let from = to - Duration::minutes(5);
+    let mut stream = pin!(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to));
+
+    while let Some(item) = stream.next().await {
+        item.expect("request with bearer token should be accepted by the trusted origin");
+    }
+
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "expected exactly one authenticated request to the trusted origin"
     );
 }
 

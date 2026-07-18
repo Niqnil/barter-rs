@@ -77,11 +77,10 @@ pub enum MassiveError {
     /// origin (scheme + host + port), or one that failed to parse as a URL.
     ///
     /// Yielded as a terminal error *before* the request is issued. The client
-    /// attaches its API key as an `Authorization: Bearer` default header sent
-    /// with **every** request regardless of destination host, so following a
-    /// `next_url` that names an unexpected origin would leak the token to
-    /// whatever host it points at. A prefix check is insufficient — a look-alike
-    /// host such as `https://api.massive.com.evil.example` (or the
+    /// attaches its API key as an `Authorization: Bearer` header only after this
+    /// origin check passes, so a `next_url` that names an unexpected origin is
+    /// rejected before the token is ever attached. A prefix check is insufficient
+    /// — a look-alike host such as `https://api.massive.com.evil.example` (or the
     /// separator-less `https://api.massive.comevil.example`) shares the prefix
     /// yet is a different origin — so origins are parsed and compared, and a
     /// mismatched or unparseable `next_url` is rejected (fail-closed).
