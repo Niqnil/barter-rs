@@ -129,8 +129,10 @@ pub enum IbkrFlexError {
     /// discarded by `error_for_status`), then bounded to [`MAX_ERROR_BODY_BYTES`] and
     /// **token-scrubbed** before storage: the Flex token rides in the request URL's `t=` parameter,
     /// so a proxy that echoes the request line into its error page could otherwise reflect the
-    /// credential into this body. An IBKR *application* error that arrives under a non-2xx status is
-    /// still surfaced as the richer [`IbkrFlexError::Flex`], not here.
+    /// credential into this body. The scrub is best-effort defense-in-depth — it redacts both the
+    /// raw token and the encoded form it takes on the wire (see [`sanitize_error_body`]). An IBKR
+    /// *application* error that arrives under a non-2xx status is still surfaced as the richer
+    /// [`IbkrFlexError::Flex`], not here.
     #[error("HTTP status {status}: {body}")]
     HttpStatus {
         /// The non-success HTTP status code.
@@ -451,36 +453,10 @@ impl IbkrFlexClient {
             url,
         } = interpret_send_response(status, &body, &self.token)?;
 
-        // A short initial delay before the first poll: the statement is generated asynchronously, so
-        // an immediate GetStatement almost always reports 1019 ("still generating") and would burn
-        // one of the bounded attempts on a near-certain miss. Skipped when no polls are budgeted
-        // (`max_attempts == 0`), so that documented "no polling requested" case fails over immediately
-        // rather than sleeping before an empty loop.
-        if self.poll_policy.max_attempts > 0 {
-            tokio::time::sleep(self.poll_policy.initial_delay).await;
-        }
-
-        for attempt in 1..=self.poll_policy.max_attempts {
-            let (status, body) = self.get_with_query(&url, reference_code.as_str()).await?;
-
-            match interpret_poll_response(status, &body, &self.token)? {
-                GetStatementOutcome::Ready => return Ok(body),
-                GetStatementOutcome::InProgress => {
-                    debug!(
-                        attempt,
-                        max = self.poll_policy.max_attempts,
-                        "Flex statement still generating"
-                    );
-                    if attempt < self.poll_policy.max_attempts {
-                        tokio::time::sleep(self.poll_policy.interval).await;
-                    }
-                }
-            }
-        }
-
-        Err(IbkrFlexError::PollTimeout {
-            attempts: self.poll_policy.max_attempts,
+        poll_until_ready(&self.poll_policy, &self.token, async || {
+            self.get_with_query(&url, reference_code.as_str()).await
         })
+        .await
     }
 
     /// Issue a GET to `url` with the standard Flex query parameters (`t`/`q`/`v`) and read the full
@@ -526,6 +502,55 @@ impl IbkrFlexClient {
         let xml = self.fetch_statement_xml().await?;
         parse_corporate_actions(&xml)
     }
+}
+
+/// Poll GetStatement until the statement is ready or `policy`'s attempt budget is exhausted,
+/// delegating each raw fetch to `poll_once`.
+///
+/// Isolating the loop from the transport keeps its orchestration deterministically testable without
+/// a network round trip: `poll_once` is any async producer of a `(status, body)` pair, so a scripted
+/// responder can drive the exact wiring — the `max_attempts == 0` immediate-timeout case, the
+/// `1..=max_attempts` bound, and the `attempt < max_attempts` inter-poll sleep guard — under
+/// zero-duration policies. (The live two-call round trip stays covered by the `#[ignore]`d network
+/// test.)
+///
+/// The `initial_delay` is waited once before the first poll: the statement is generated
+/// asynchronously, so an immediate GetStatement almost always reports `1019` ("still generating") and
+/// would burn one of the bounded attempts on a near-certain miss. It is skipped when no polls are
+/// budgeted (`max_attempts == 0`), so that documented "no polling requested" case fails over
+/// immediately with [`IbkrFlexError::PollTimeout`] rather than sleeping before an empty loop.
+async fn poll_until_ready<F>(
+    policy: &FlexPollPolicy,
+    token: &str,
+    mut poll_once: F,
+) -> Result<String, IbkrFlexError>
+where
+    F: AsyncFnMut() -> Result<(reqwest::StatusCode, String), IbkrFlexError>,
+{
+    if policy.max_attempts > 0 {
+        tokio::time::sleep(policy.initial_delay).await;
+    }
+
+    for attempt in 1..=policy.max_attempts {
+        let (status, body) = poll_once().await?;
+        match interpret_poll_response(status, &body, token)? {
+            GetStatementOutcome::Ready => return Ok(body),
+            GetStatementOutcome::InProgress => {
+                debug!(
+                    attempt,
+                    max = policy.max_attempts,
+                    "Flex statement still generating"
+                );
+                if attempt < policy.max_attempts {
+                    tokio::time::sleep(policy.interval).await;
+                }
+            }
+        }
+    }
+
+    Err(IbkrFlexError::PollTimeout {
+        attempts: policy.max_attempts,
+    })
 }
 
 // ============================================================================
@@ -710,25 +735,38 @@ fn http_status_error(status: reqwest::StatusCode, body: &str, token: &str) -> Ib
     }
 }
 
-/// Redact the Flex `token` from `body`, then bound the result to [`MAX_ERROR_BODY_BYTES`] (on a
-/// UTF-8 char boundary).
+/// Redact the Flex `token` — both its raw form and its `application/x-www-form-urlencoded` wire
+/// form — from `body`, then bound the result to [`MAX_ERROR_BODY_BYTES`] (on a UTF-8 char boundary).
 ///
-/// The token rides in the request URL's `t=` query parameter, so a misconfigured proxy or WAF that
-/// echoes the request line into its error page could reflect the credential into the body. Redacting
-/// it upholds the "token never appears in an error" invariant this module enforces for
-/// `reqwest::Error` URLs. Redaction runs over the full body **before** bounding so a token that
-/// straddles the byte cap can't survive as an unredacted fragment.
+/// The token rides in the request URL's `t=` query parameter, attached via reqwest's `.query(&[…])`,
+/// which serialises through [`url::Url::query_pairs_mut`] — WHATWG form-urlencoding, which escapes
+/// space as `+` and leaves a *narrower* byte set unescaped than RFC-3986 percent-encoding (e.g. `~`
+/// is escaped here). A misconfigured proxy or WAF that echoes the request line into its error page
+/// would reflect *that* wire form, not the raw token, so both are scrubbed. The wire form is computed
+/// with [`url::form_urlencoded::byte_serialize`] — the same primitive `url`'s serializer (and thus
+/// reqwest's `.query()`) uses internally, not a hand-rolled percent-encoding table — so it cannot
+/// drift from what is actually sent (`sanitize_error_body_scrubs_reqwests_wire_encoded_token` pins
+/// this against reqwest's real request encoding).
+///
+/// This is **best-effort defense-in-depth, not an absolute guarantee**: an intermediary could still
+/// transform the reflected value in a way this scrub does not anticipate (further re-encoding,
+/// HTML-entity escaping, or truncation that splits the token). For a real IBKR token — a numeric
+/// string that encodes to itself — the raw scrub already covers it and the wire-form pass is a no-op.
 fn sanitize_error_body(body: &str, token: &str) -> String {
     // Redact the token over the FULL body first (order matters for correctness, not just cost):
     // bounding first could leave a credential that straddles the byte cap present only as a prefix,
     // which the full-token `contains`/`replace` would then miss, and redacting after bounding could
     // also push the result back over the cap (`[REDACTED]` is longer than a short token). Scanning
     // the whole body only runs on the error path, so the extra pass is acceptable.
-    let mut scrubbed = if !token.is_empty() && body.contains(token) {
-        body.replace(token, "[REDACTED]")
-    } else {
-        body.to_owned()
-    };
+    let mut scrubbed = redact(body, token);
+    // Also scrub the encoded form the token actually takes on the wire, so a reflected request line
+    // is covered too — but only when it differs from the raw token (a no-op for numeric tokens).
+    if !token.is_empty() {
+        let wire_form: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
+        if wire_form.as_str() != token {
+            scrubbed = redact(&scrubbed, &wire_form);
+        }
+    }
     // Then bound to MAX_ERROR_BODY_BYTES so a large proxy/CDN error page can't bloat the error.
     // `is_char_boundary` keeps the truncated string valid UTF-8 (there is always a boundary at or
     // below the cap), which `String::truncate` requires.
@@ -740,6 +778,19 @@ fn sanitize_error_body(body: &str, token: &str) -> String {
         scrubbed.truncate(end);
     }
     scrubbed
+}
+
+/// Replace every occurrence of `needle` in `body` with `[REDACTED]`, always returning an owned
+/// `String` (the caller chains two redaction passes over the result, so a borrowing return would not
+/// help). The `contains` guard skips only the `replace` scan when `needle` is absent — it does not
+/// avoid the allocation. An empty `needle` is never treated as a match: `str::replace` with an empty
+/// pattern would splice the replacement between every character.
+fn redact(body: &str, needle: &str) -> String {
+    if !needle.is_empty() && body.contains(needle) {
+        body.replace(needle, "[REDACTED]")
+    } else {
+        body.to_owned()
+    }
 }
 
 /// Read the name of the first (root) element of an XML document, ignoring the prolog/comments.
@@ -1219,5 +1270,113 @@ mod tests {
                 max_attempts: POLL_MAX_ATTEMPTS,
             }
         );
+    }
+
+    #[test]
+    fn sanitize_error_body_scrubs_reqwests_wire_encoded_token() {
+        // A token with characters that encode differently on the wire (space -> `+`; `+ / ~` -> `%..`).
+        // If a proxy reflects the *encoded* request line into its error page, the raw-token scrub
+        // alone would miss it. This pins two properties: (1) `byte_serialize` produces exactly what
+        // reqwest's `.query()` puts on the wire — so the scrub can't silently drift from the real
+        // encoding if reqwest/url change — and (2) that encoded form is redacted from the body.
+        let token = "abc def+g/h~i";
+
+        // What reqwest actually serialises onto the query string (`build()` only — nothing is sent).
+        let request = reqwest::Client::new()
+            .get("https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement")
+            .query(&[("t", token), ("q", "1234567890"), ("v", FLEX_VERSION)])
+            .build()
+            .expect("request builds without sending");
+        let wire_query = request.url().query().expect("query present");
+
+        let wire_form: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
+        assert_ne!(
+            wire_form, token,
+            "test token must actually encode to something different, else it proves nothing"
+        );
+        assert!(
+            wire_query.contains(&format!("t={wire_form}")),
+            "byte_serialize must match reqwest's actual query encoding, else the wire-form scrub \
+             silently stops matching; query = {wire_query}, wire_form = {wire_form}"
+        );
+
+        // A proxy that echoes the received request line into its error page reflects the encoded form.
+        let reflected = format!("502 Bad Gateway while proxying GET /GetStatement?{wire_query}");
+        let scrubbed = sanitize_error_body(&reflected, token);
+        assert!(
+            !scrubbed.contains(&wire_form),
+            "wire-encoded token must be redacted, got: {scrubbed}"
+        );
+        assert!(scrubbed.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn poll_until_ready_zero_max_attempts_times_out_without_polling() {
+        // `max_attempts == 0` is the documented "no polling requested" case: it must return
+        // immediately with `PollTimeout { attempts: 0 }` and issue zero GetStatement calls (and skip
+        // the initial delay). Zero-duration policy keeps the test instant.
+        let policy = FlexPollPolicy {
+            initial_delay: Duration::ZERO,
+            interval: Duration::ZERO,
+            max_attempts: 0,
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let result = poll_until_ready(&policy, "tok", async || {
+            calls.set(calls.get() + 1);
+            Ok((reqwest::StatusCode::OK, GET_READY.to_owned()))
+        })
+        .await;
+        assert_eq!(calls.get(), 0, "max_attempts == 0 must not issue any poll");
+        assert!(matches!(
+            result,
+            Err(IbkrFlexError::PollTimeout { attempts: 0 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn poll_until_ready_returns_as_soon_as_statement_is_ready() {
+        // The loop must stop at the first Ready response, not run the full budget.
+        let policy = FlexPollPolicy {
+            initial_delay: Duration::ZERO,
+            interval: Duration::ZERO,
+            max_attempts: 5,
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let result = poll_until_ready(&policy, "tok", async || {
+            calls.set(calls.get() + 1);
+            // In progress on the first poll, ready on the second.
+            let body = if calls.get() < 2 {
+                GET_IN_PROGRESS
+            } else {
+                GET_READY
+            };
+            Ok((reqwest::StatusCode::OK, body.to_owned()))
+        })
+        .await;
+        assert_eq!(calls.get(), 2, "must stop polling once Ready is seen");
+        assert_eq!(result.expect("ready"), GET_READY);
+    }
+
+    #[tokio::test]
+    async fn poll_until_ready_exhausts_budget_and_reports_attempt_count() {
+        // Every poll reports in-progress: the loop must run exactly `max_attempts` times — proving
+        // the `1..=max_attempts` bound and the `attempt < max_attempts` sleep guard don't over- or
+        // under-run — and surface that count in `PollTimeout`.
+        let policy = FlexPollPolicy {
+            initial_delay: Duration::ZERO,
+            interval: Duration::ZERO,
+            max_attempts: 3,
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let result = poll_until_ready(&policy, "tok", async || {
+            calls.set(calls.get() + 1);
+            Ok((reqwest::StatusCode::OK, GET_IN_PROGRESS.to_owned()))
+        })
+        .await;
+        assert_eq!(calls.get(), 3, "must poll exactly max_attempts times");
+        assert!(matches!(
+            result,
+            Err(IbkrFlexError::PollTimeout { attempts: 3 })
+        ));
     }
 }

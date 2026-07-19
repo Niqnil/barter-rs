@@ -144,10 +144,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downstream code matching `MassiveError` exhaustively — add a wildcard (`_`) arm.
 - **BREAKING: `MassiveRestClient::with_base_url` now returns `Result<Self, MassiveError>`**
   (`rustrade-data`). The base URL is parsed into its trusted origin once, at construction, and cached
-  on the client — so a base URL that is not a valid URL now fails fast with
-  `MassiveError::InvalidInput` here instead of surfacing as a deferred error on the first request, and
-  every `next_url` origin check compares against the cached origin rather than re-parsing the base URL
-  per page. Migration: append `?` or `.expect(..)` to existing `with_base_url(..)` calls. (#198)
+  on the client — so a base URL that is not a valid URL, or one whose scheme is not `http`/`https`,
+  now fails fast with `MassiveError::InvalidInput` here instead of surfacing as a deferred error on
+  the first request, and every `next_url` origin check compares against the cached origin rather than
+  re-parsing the base URL per page. (Rejecting non-`http(s)` schemes at construction avoids a
+  confusing failure mode: a scheme such as `file:` parses but yields an opaque origin that never
+  compares equal, which would otherwise brick every request with a misleading `UntrustedNextUrl`.)
+  Migration: append `?` or `.expect(..)` to existing `with_base_url(..)` calls. (#198)
 - **`EngineEvent` is now `#[non_exhaustive]` and gains a `CorporateAction` variant** (`rustrade`).
   Marking it non-exhaustive lets future engine-driven event variants be added without further
   breaking changes. **Breaking** for downstream code matching `EngineEvent` exhaustively — add a

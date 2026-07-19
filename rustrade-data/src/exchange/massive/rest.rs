@@ -51,9 +51,9 @@ fn truncate_body(body: &str) -> String {
 pub struct MassiveRestClient {
     client: Client,
     // Attached per-request as an `Authorization: Bearer` header from the
-    // origin-validated `fetch_page_body` chokepoint (and used for WebSocket auth),
-    // never as a client-wide default header — so the token can only ever ride a
-    // request whose destination origin has already been validated. See #198.
+    // origin-validated `fetch_page_body` chokepoint, never as a client-wide
+    // default header — so the token can only ever ride a request whose
+    // destination origin has already been validated. See #198.
     api_key: String,
     base_url: String,
     // Trusted origin (scheme + host + port) derived from `base_url`, parsed once at
@@ -155,14 +155,31 @@ impl MassiveRestClient {
     }
 
     /// Parse `base_url` into the trusted [origin](url::Origin) used to vet every
-    /// `next_url`. A base URL that fails to parse is a client-side misconfiguration
-    /// (surfaced as [`MassiveError::InvalidInput`]), not a security event.
+    /// `next_url`. A base URL that fails to parse — or that uses a non-`http(s)`
+    /// scheme — is a client-side misconfiguration (surfaced as
+    /// [`MassiveError::InvalidInput`]), not a security event.
+    ///
+    /// The scheme is restricted to `http`/`https` deliberately: a non-special
+    /// scheme (e.g. `file:`) parses fine but its [origin](url::Url::origin) is a
+    /// fresh [`url::Origin::Opaque`] that never compares equal to any other —
+    /// even one parsed from the identical string — so every subsequent
+    /// [`validate_next_url`](Self::validate_next_url) check (including the very
+    /// first request, built from `base_url` itself) would fail with a misleading
+    /// [`MassiveError::UntrustedNextUrl`]. Rejecting it here fails the build fast
+    /// with a clear message instead of self-bricking every request.
     fn parse_base_origin(base_url: &str) -> Result<url::Origin, MassiveError> {
-        Ok(Url::parse(base_url)
-            .map_err(|e| MassiveError::InvalidInput {
-                message: format!("base_url is not a valid URL ({e}): {base_url}"),
-            })?
-            .origin())
+        let url = Url::parse(base_url).map_err(|e| MassiveError::InvalidInput {
+            message: format!("base_url is not a valid URL ({e}): {base_url}"),
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(MassiveError::InvalidInput {
+                message: format!(
+                    "base_url must use the http or https scheme, got `{}`: {base_url}",
+                    url.scheme()
+                ),
+            });
+        }
+        Ok(url.origin())
     }
 
     /// Get the base URL.
@@ -615,6 +632,20 @@ mod tests {
         let result = MassiveRestClient::new("test_api_key")
             .expect("client builds")
             .with_base_url("not a url");
+        assert!(matches!(result, Err(MassiveError::InvalidInput { .. })));
+    }
+
+    #[test]
+    fn with_base_url_rejects_non_http_scheme() {
+        // A base URL that *parses* but uses a non-http(s) scheme (e.g. `file:`)
+        // yields an opaque origin that never compares equal — which would brick
+        // every subsequent request with a misleading UntrustedNextUrl. It must
+        // instead fail fast at construction as InvalidInput (#198). Distinct from
+        // the parse-failure path above: `file:///data` parses successfully, so
+        // this exercises the scheme check specifically, not `Url::parse` erroring.
+        let result = MassiveRestClient::new("test_api_key")
+            .expect("client builds")
+            .with_base_url("file:///data");
         assert!(matches!(result, Err(MassiveError::InvalidInput { .. })));
     }
 }
