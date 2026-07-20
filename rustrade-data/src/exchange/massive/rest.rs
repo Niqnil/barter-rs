@@ -8,6 +8,7 @@ use super::transformer::{
     AggregatesResponse, QuotesResponse, TradesResponse, parse_aggregates_response,
     parse_quotes_response, parse_trades_response, timespan_to_step,
 };
+use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped};
 use crate::subscription::{
     book::OrderBookL1,
     candle::{Candle, open_time_from_close},
@@ -88,6 +89,18 @@ impl MassiveRestClient {
     /// an unexpected 3xx surfaces as [`MassiveError::Api`] rather than being
     /// followed. A base URL set via [`Self::with_base_url`] must therefore serve
     /// responses directly, without redirect indirection.
+    ///
+    /// # Known limitation
+    ///
+    /// Redirect-following is disabled *wholesale* (`reqwest::redirect::Policy::none()`),
+    /// so this applies to **same-origin** redirects too: even a same-origin 301/308
+    /// — e.g. trailing-slash normalization by a load balancer or CDN — is surfaced
+    /// as a terminal [`MassiveError::Api`] with the 3xx status rather than being
+    /// transparently followed. This is a deliberate trade-off: a wholesale block
+    /// keeps the "token never leaves the trusted origin" guarantee structural
+    /// rather than dependent on reqwest's cross-origin header-stripping. It relies
+    /// on Massive serving `next_url` pages directly; a deployment fronted by a
+    /// redirecting proxy is not supported.
     pub fn new(api_key: impl Into<String>) -> Result<Self, MassiveError> {
         let api_key = api_key.into();
         // Validate the key forms a well-formed `Authorization` header value now, so a
@@ -272,21 +285,23 @@ impl MassiveRestClient {
             return Err(MassiveError::RateLimited { retry_after });
         }
 
-        let body = response.text().await?;
-
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(MassiveError::Auth {
-                message: truncate_body(&body),
-            });
-        }
-
+        // A non-success body is only a diagnostic that `truncate_body` caps for the error message, so
+        // read it under a bound: a pathological proxy/CDN error page must not be buffered in full.
+        // The success body is the real JSON page and is read whole below.
         if !status.is_success() {
+            let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                return Err(MassiveError::Auth {
+                    message: truncate_body(&body),
+                });
+            }
             return Err(MassiveError::Api {
                 status: status.as_u16(),
                 message: truncate_body(&body),
             });
         }
 
+        let body = response.text().await?;
         Ok(body)
     }
 

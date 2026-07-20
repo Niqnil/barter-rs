@@ -46,6 +46,7 @@ mod corporate_action;
 
 pub use corporate_action::{IbkrFlexCorporateAction, IbkrReorgType, parse_corporate_actions};
 
+use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped};
 use quick_xml::{Reader, events::Event};
 use serde::Deserialize;
 use smol_str::SmolStr;
@@ -459,17 +460,24 @@ impl IbkrFlexClient {
         .await
     }
 
-    /// Issue a GET to `url` with the standard Flex query parameters (`t`/`q`/`v`) and read the full
+    /// Issue a GET to `url` with the standard Flex query parameters (`t`/`q`/`v`) and read the
     /// response body **regardless of HTTP status**, returning the status alongside the body.
     ///
     /// Reading the body before branching on status is deliberate: `error_for_status` discards the
-    /// body, but IBKR/proxy diagnostic bodies — and Flex application errors that arrive under a
-    /// non-2xx status — are exactly what a caller needs to diagnose a failure. The status is
+    /// body, but IBKR/proxy diagnostic bodies — and Flex application errors (e.g. `1019`) that arrive
+    /// under a non-2xx status — are exactly what a caller needs to diagnose a failure. The status is
     /// returned so the caller ([`interpret_send_response`] / [`interpret_poll_response`]) can decide
     /// whether an unrecognized body under a non-success status is a transport error
     /// ([`IbkrFlexError::HttpStatus`]) versus a genuine Flex-envelope error.
     ///
-    /// The `?` on `send`/`text` still routes any `reqwest::Error` through the URL-stripping
+    /// A **success** body is the statement payload (a `<FlexQueryResponse>`, which can be large) and
+    /// is read in full. A **non-success** body is only a small Flex status/error envelope or a
+    /// proxy/CDN diagnostic page — never the statement — so it is read only up to
+    /// `MAX_ERROR_BODY_DOWNLOAD_BYTES`, bounding a pathological error page that would otherwise be
+    /// buffered without limit (it is truncated further for storage anyway). The cap is far above any
+    /// real Flex envelope, so a `1019`/error response the poll loop still parses is never truncated.
+    ///
+    /// The `?` on `send`/`chunk`/`text` still routes any `reqwest::Error` through the URL-stripping
     /// `From<reqwest::Error>` impl, so the token never leaks into an error.
     async fn get_with_query(
         &self,
@@ -483,7 +491,11 @@ impl IbkrFlexClient {
             .send()
             .await?;
         let status = response.status();
-        let body = response.text().await?;
+        let body = if status.is_success() {
+            response.text().await?
+        } else {
+            read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?
+        };
         Ok((status, body))
     }
 
@@ -752,6 +764,13 @@ fn http_status_error(status: reqwest::StatusCode, body: &str, token: &str) -> Ib
 /// transform the reflected value in a way this scrub does not anticipate (further re-encoding,
 /// HTML-entity escaping, or truncation that splits the token). For a real IBKR token — a numeric
 /// string that encodes to itself — the raw scrub already covers it and the wire-form pass is a no-op.
+///
+/// `body` arrives already bounded: [`IbkrFlexClient::get_with_query`] reads a non-success response
+/// through [`read_body_capped`] at [`MAX_ERROR_BODY_DOWNLOAD_BYTES`] (64 KiB) before it ever reaches
+/// this function. The two caps are complementary, not redundant — the outer one bounds memory during
+/// the network read itself, this one bounds what is retained in the stored error. The 64× gap between
+/// them also means a token fragment straddling the *download* boundary cannot survive into the final
+/// message: the trailing partial token sits far past [`MAX_ERROR_BODY_BYTES`] and is truncated away.
 fn sanitize_error_body(body: &str, token: &str) -> String {
     // Redact the token over the FULL body first (order matters for correctness, not just cost):
     // bounding first could leave a credential that straddles the byte cap present only as a prefix,
@@ -768,14 +787,11 @@ fn sanitize_error_body(body: &str, token: &str) -> String {
         }
     }
     // Then bound to MAX_ERROR_BODY_BYTES so a large proxy/CDN error page can't bloat the error.
-    // `is_char_boundary` keeps the truncated string valid UTF-8 (there is always a boundary at or
-    // below the cap), which `String::truncate` requires.
+    // `floor_char_boundary` rounds the cap down to a UTF-8 char boundary (there is always one at or
+    // below it), keeping the truncated string valid — which `String::truncate` requires. Matches the
+    // idiom used across the crate (e.g. `massive::error`, `massive::rest`, `binance::error`).
     if scrubbed.len() > MAX_ERROR_BODY_BYTES {
-        let mut end = MAX_ERROR_BODY_BYTES;
-        while !scrubbed.is_char_boundary(end) {
-            end -= 1;
-        }
-        scrubbed.truncate(end);
+        scrubbed.truncate(scrubbed.floor_char_boundary(MAX_ERROR_BODY_BYTES));
     }
     scrubbed
 }
@@ -1378,5 +1394,43 @@ mod tests {
             result,
             Err(IbkrFlexError::PollTimeout { attempts: 3 })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_ready_sleeps_initial_delay_first_then_interval_between_polls() {
+        // The zero-duration tests above prove call counts and outcomes but not the *timing* wiring:
+        // that `initial_delay` is awaited **before** the first poll and `interval` between subsequent
+        // polls. Under `start_paused`, Tokio advances virtual time whenever the runtime is idle on a
+        // timer, so each `sleep` completes deterministically and we can record the clock at every poll
+        // without real sleeping.
+        let policy = FlexPollPolicy {
+            initial_delay: Duration::from_secs(5),
+            interval: Duration::from_secs(2),
+            max_attempts: 3,
+        };
+        let start = tokio::time::Instant::now();
+        let elapsed_at_poll = std::cell::RefCell::new(Vec::<Duration>::new());
+        let result = poll_until_ready(&policy, "tok", async || {
+            elapsed_at_poll.borrow_mut().push(start.elapsed());
+            // Always in-progress so the loop runs the full budget, exercising every inter-poll sleep.
+            Ok((reqwest::StatusCode::OK, GET_IN_PROGRESS.to_owned()))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(IbkrFlexError::PollTimeout { attempts: 3 })
+        ));
+
+        // Poll 1 at t=5s proves `initial_delay` elapsed *before* the first poll (not t=0); polls 2 and
+        // 3 one `interval` (2s) apart prove the between-poll sleep. A regression that polled before
+        // sleeping, or that dropped a sleep, would shift these timestamps.
+        assert_eq!(
+            *elapsed_at_poll.borrow(),
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(7),
+                Duration::from_secs(9),
+            ],
+        );
     }
 }

@@ -349,6 +349,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request path can carry it to a host that has not been validated, even if a future paginated fetch
   omitted the guard. `reqwest`'s `bearer_auth` additionally marks the header sensitive (redacted in
   its logs). No public API change and no behaviour change for well-behaved responses. (#198)
+- **Bounded error-path response reads for the REST clients** (`rustrade-data`, `massive` and `ibkr`
+  features; defense-in-depth). On a non-success HTTP status, the Massive (`fetch_page_body`) and IBKR
+  Flex (`get_with_query`) clients now read the diagnostic body only up to a fixed cap instead of
+  buffering it in full. Previously a pathological proxy/CDN returning an unbounded error body was
+  downloaded entirely before being truncated for the error message; the cap bounds that memory use
+  while staying far above any legitimate error/status envelope (so a Flex `1019`/error response is
+  never truncated). Success bodies (real payload) are still read in full. No public API or
+  error-message change.
 - Upgraded `anyhow` to 1.0.103 and `quick-xml` to 0.41.0 to clear three RUSTSEC advisories:
   RUSTSEC-2026-0190 (unsoundness in `anyhow::Error::downcast_mut`), RUSTSEC-2026-0194 (quadratic
   run time when checking a start tag for duplicate attribute names) and RUSTSEC-2026-0195

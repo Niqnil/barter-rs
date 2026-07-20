@@ -109,10 +109,20 @@ use tracing_subscriber as _;
 // (tests/massive_integration.rs), which compile as separate units.
 #[cfg(test)]
 use serial_test as _;
-// wiremock is only referenced by the pagination integration tests under the
-// `massive` feature (tests/massive_pagination.rs), which compile as separate units.
+// wiremock is referenced by the pagination integration tests under the `massive` feature
+// (tests/massive_pagination.rs, a separate compilation unit) and by `exchange::http`'s unit tests,
+// which compile only under `massive`/`ibkr`. This stub covers the build where neither is enabled.
 #[cfg(test)]
 use wiremock as _;
+// time is only referenced by the integration tests under the `databento`/`ibkr` features
+// (tests/databento_integration.rs, tests/ibkr_integration.rs) and by a databento example, which
+// compile as separate units.
+#[cfg(test)]
+use time as _;
+// temp_env is only referenced by the in-tree unit tests under the `massive` feature
+// (exchange::massive::{live, rest}), so it is unused when that feature is off.
+#[cfg(test)]
+use temp_env as _;
 
 use crate::{
     error::DataError,

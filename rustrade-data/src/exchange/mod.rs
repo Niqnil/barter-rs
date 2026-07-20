@@ -60,6 +60,10 @@ pub mod massive;
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;
 
+/// Internal HTTP helpers shared by the REST-based exchange integrations (Massive, IBKR Flex).
+#[cfg(any(feature = "massive", feature = "ibkr"))]
+pub(crate) mod http;
+
 /// Default [`Duration`] the [`Connector::SubValidator`] will wait to receive all success responses to actioned
 /// `Subscription` requests.
 pub const DEFAULT_SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
