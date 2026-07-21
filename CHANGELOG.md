@@ -29,9 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now caps the number of pages it will follow and detects a `next_url` that revisits an
   already-fetched page, yielding a terminal error instead of paginating without bound. Because a
   silently truncated result is indistinguishable from a genuinely small one for a market-data
-  client, incomplete pagination fails loudly rather than returning a partial result. Two new
-  `MassiveError` variants carry the diagnosis: `PaginationLimitExceeded { pages, limit }` and
-  `CyclicPagination { url }`.
+  client, incomplete pagination fails loudly rather than returning a partial result. Three new
+  `MassiveError` variants carry the diagnosis: `PaginationLimitExceeded { pages, limit }`,
+  `CyclicPagination { url }` and `PaginationUrlTooLong { len, limit, prefix }`. `CyclicPagination`
+  and `UntrustedNextUrl` store their URL in full but bound it when rendered via `Display`, so an
+  oversized server-supplied URL cannot flood a log line; a bounded render ends in `...` so a cut is
+  never mistaken for the whole URL.
 
 - **Corporate-action stock-split processing** (`rustrade`). The engine now handles
   `EngineEvent::CorporateAction` for stock/reverse splits, adjusting every open position on the
@@ -275,6 +278,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Published rustdoc no longer points at items readers cannot open** (`rustrade-data`). Twelve
+  public items across the IBKR Flex, Massive and Alpaca surfaces linked to private items, which
+  render on docs.rs as dead, non-hyperlinked code — a reader following "see `X`" found nothing. Each
+  now states the fact inline (e.g. a cap's literal value) or links a public item instead. Two
+  genuinely broken links in `ibkr::historical` are fixed too: they referenced
+  `HistoricalTicks::truncated_by_error`, a field renamed to `truncation_error`. Most substantively,
+  `IbkrFlexCorporateAction`'s limitations — that it is a reconciliation record and not a
+  split-ratio source, that it is post-hoc and cannot drive a live split, and that its
+  `quantity_delta` is account-scoped — were previously only in a private module's docs and so were
+  never published; they now appear on the type itself. `rustdoc::private_intra_doc_links` is denied
+  crate-wide so this cannot silently recur. Documentation only; no API or behaviour change.
 - **`Position::pnl_unrealised` fee units** (`rustrade`). The per-tick unrealised-PnL exit-fee
   estimate now uses the quote-equivalent entry fee (`fees_enter.fees_quote`, falling back to raw
   `fees` only when no quote-equivalent is derivable), matching the realised-PnL convention. Fixes a
@@ -349,14 +363,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request path can carry it to a host that has not been validated, even if a future paginated fetch
   omitted the guard. `reqwest`'s `bearer_auth` additionally marks the header sensitive (redacted in
   its logs). No public API change and no behaviour change for well-behaved responses. (#198)
-- **Bounded error-path response reads for the REST clients** (`rustrade-data`, `massive` and `ibkr`
-  features; defense-in-depth). On a non-success HTTP status, the Massive (`fetch_page_body`) and IBKR
-  Flex (`get_with_query`) clients now read the diagnostic body only up to a fixed cap instead of
-  buffering it in full. Previously a pathological proxy/CDN returning an unbounded error body was
-  downloaded entirely before being truncated for the error message; the cap bounds that memory use
-  while staying far above any legitimate error/status envelope (so a Flex `1019`/error response is
-  never truncated). Success bodies (real payload) are still read in full. No public API or
-  error-message change.
+- **Bounded error-path response reads for the REST clients** (`rustrade-data`; defense-in-depth). On
+  a non-success HTTP status, the Massive (`fetch_page_body`), IBKR Flex (`get_with_query`) and
+  Binance historical (`fetch_page`) clients now read the diagnostic body only up to a fixed cap
+  instead of buffering it in full. Previously a pathological proxy/CDN returning an unbounded error
+  body was downloaded entirely before being truncated for the error message; the cap bounds that
+  memory use while staying far above any legitimate error/status envelope (so a Flex `1019`/error
+  response is never truncated). All three REST clients are covered — Binance is the one that is not
+  feature-gated, so it is compiled into every dependent build. Success bodies (real payload) are
+  still read in full. No public API or error-message change.
+- **Bounded the memory a misbehaving Massive origin can force during pagination** (`rustrade-data`).
+  A page's `next_url` is server-supplied and success bodies are read in full, so the pagination
+  guard previously retained up to `MAX_PAGES` (10,000) unbounded URL strings per stream for cycle
+  detection, and `MassiveError::CyclicPagination` / `UntrustedNextUrl` rendered one in full into
+  every log line. The guard now records a fixed-size fingerprint per page instead of the URL itself,
+  and rejects any URL past a new byte cap up front with the additive
+  `MassiveError::PaginationUrlTooLong { len, limit, prefix }`. Fingerprints are keyed by a
+  per-stream random hash key rather than the fixed-key `DefaultHasher`, so a server cannot
+  precompute two colliding `next_url`s to force a spurious `CyclicPagination`. Cycle detection is
+  unchanged for well-behaved servers: the fingerprint covers the whole URL, so two long URLs sharing
+  a prefix remain distinct pages.
+- **Token-scrubbed and bounded `IbkrFlexError::Parse`** (`rustrade-data`, `ibkr` feature). An XML
+  deserialiser embeds fragments of the offending input in its error message, so a `Parse` message's
+  length tracked the *document* rather than the failure, and a body that reflected the request line
+  could carry the `t=` Flex token into the stored error — the protection
+  `IbkrFlexError::HttpStatus` already had. Parse messages raised while interpreting a SendRequest or
+  GetStatement response now go through the same redaction and bounding. The statement re-parse
+  behind `parse_corporate_actions` is covered too: called directly, with no token in scope to
+  redact, it still bounds its message; called from `IbkrFlexClient::fetch_corporate_actions` the
+  token is threaded into the parse, so redaction runs while the message is still unbounded. That
+  ordering is load-bearing rather than incidental — redaction matches the full token, so scrubbing
+  an already-bounded message would leave a credential straddling the cap present as an unmatched
+  prefix fragment, and both cuts use the same width, leaving no protective gap.
+  `Parse` is now bounded on every path and scrubbed on every path where a token is in scope.
 - Upgraded `anyhow` to 1.0.103 and `quick-xml` to 0.41.0 to clear three RUSTSEC advisories:
   RUSTSEC-2026-0190 (unsoundness in `anyhow::Error::downcast_mut`), RUSTSEC-2026-0194 (quadratic
   run time when checking a start tag for duplicate attribute names) and RUSTSEC-2026-0195

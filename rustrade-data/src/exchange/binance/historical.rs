@@ -59,6 +59,7 @@
 //! case rarely trips a `429` in the first place.
 
 use super::error::BinanceDataError;
+use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped, truncate_str};
 use crate::subscription::candle::{
     Candle, CandleInterval, close_time_from_open, open_time_from_close,
 };
@@ -420,19 +421,23 @@ impl BinanceHistoricalClient {
             return Err(BinanceDataError::RateLimited { retry_after });
         }
 
-        let body = response.text().await?;
-
+        // A non-success body is only a diagnostic that `truncate_str` caps for the error message, so
+        // read it under a bound: a pathological proxy/CDN error page must not be buffered in full.
+        // The success body is the real kline JSON and is read whole below.
         if !status.is_success() {
+            let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
             return Err(BinanceDataError::Api {
                 status: status.as_u16(),
-                message: truncate_body(&body),
+                message: truncate_str(&body, ERROR_MESSAGE_BODY_BYTES),
             });
         }
+
+        let body = response.text().await?;
 
         serde_json::from_str::<Vec<BinanceKlineRow>>(&body).map_err(|e| {
             BinanceDataError::Deserialize {
                 message: e.to_string(),
-                payload: truncate_body(&body),
+                payload: truncate_str(&body, ERROR_MESSAGE_BODY_BYTES),
             }
         })
     }
@@ -458,11 +463,8 @@ fn validate_symbol(symbol: &str) -> Result<String, BinanceDataError> {
     Ok(symbol.to_uppercase())
 }
 
-/// Truncate a response body for error messages (max 512 chars, UTF-8 safe).
-fn truncate_body(body: &str) -> String {
-    let boundary = body.floor_char_boundary(512);
-    body[..boundary].to_owned()
-}
+/// Byte cap applied to a response body before it is stored in a [`BinanceDataError`] message.
+const ERROR_MESSAGE_BODY_BYTES: usize = 512;
 
 /// One Binance kline, as the wire's positional array-of-arrays row.
 ///
@@ -959,6 +961,45 @@ mod tests {
             stream.next().await.is_none(),
             "the stream must end after RateLimited"
         );
+        server.join().expect("mock server panicked");
+    }
+
+    #[tokio::test]
+    async fn non_success_status_yields_api_error_carrying_the_body() {
+        // The generic non-2xx branch had no coverage — only the 429/418 short-circuit above did — so
+        // nothing pinned that a plain error status surfaces as `Api` at all, that it is reached
+        // *after* the rate-limit check rather than swallowing 429, or that the server's diagnostic
+        // body survives into the message where an operator can read it.
+        //
+        // Deliberately a *small* body. The download cap that `read_body_capped` applies is 64 KiB
+        // while `ERROR_MESSAGE_BODY_BYTES` retains 512, so the outer truncation always dominates and
+        // an oversized body here would prove nothing about the cap — the assertion would hold
+        // identically against an unbounded `response.text()`. The cap is covered where it is
+        // observable, against a real chunk stream: see `read_body_capped`'s tests in `exchange::http`.
+        let (url, server) = spawn_mock(vec![MockResponse {
+            status: 400,
+            retry_after_secs: None,
+            body: r#"{"code":-1121,"msg":"Invalid symbol."}"#.to_owned(),
+        }]);
+
+        let client = BinanceHistoricalClient::spot()
+            .with_base_url(url)
+            .with_pace(Duration::ZERO);
+        let err = client
+            .collect_candles("BTCUSDT", CandleInterval::Min1, ms(0), ms(MIN_MS))
+            .await
+            .unwrap_err();
+
+        match err {
+            BinanceDataError::Api { status, message } => {
+                assert_eq!(status, 400);
+                assert!(
+                    message.contains("Invalid symbol."),
+                    "the diagnostic body must survive into the error, got: {message}"
+                );
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
         server.join().expect("mock server panicked");
     }
 }

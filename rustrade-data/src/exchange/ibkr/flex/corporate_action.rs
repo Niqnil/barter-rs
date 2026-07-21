@@ -29,13 +29,25 @@ use serde::Deserialize;
 use smol_str::SmolStr;
 use tracing::warn;
 
-use super::{IbkrFlexError, nonempty};
+use super::{IbkrFlexError, finish_parse_error, nonempty};
 
 /// A single corporate-action row from an IBKR Flex statement, surfaced verbatim.
 ///
 /// Every field mirrors a Flex `<CorporateAction>` attribute with no interpretation applied beyond
 /// type coercion (string → `Decimal`/`NaiveDate`) and treating absent/empty attributes as `None`.
-/// See the [module docs](self) for why this is a reconciliation record and not a split-ratio source.
+///
+/// This is a **reconciliation** record, not a split-ratio source, and three limitations follow from
+/// that:
+///
+/// - **No ratio is derived.** Flex carries no standardised split-ratio field, only an action type
+///   plus an account-scoped share delta. Deriving a ratio would mean parsing the unstable free-text
+///   `action_description` or dividing post- by pre-event holdings (account state this library does
+///   not own) — both silent-failure risks, so ratio derivation is left to the caller.
+/// - **These records cannot drive a live split.** A Flex statement is *post-hoc*: `report_date` is
+///   when the broker booked the action (typically T+1 or later), not the market execution date a
+///   backtest or live engine needs.
+/// - **Records are account-scoped.** `quantity_delta` is the change to *this account's* position,
+///   not a market-wide quantity; two accounts see different deltas for the same action.
 ///
 /// `#[non_exhaustive]`: IBKR may add attributes to the Flex schema; new fields are surfaced
 /// additively without a breaking change. Construct instances via [`parse_corporate_actions`], not a
@@ -168,6 +180,25 @@ impl From<&str> for IbkrReorgType {
 /// Returns [`IbkrFlexError::Parse`] if the document is not well-formed XML or does not match the
 /// expected Flex statement shape.
 pub fn parse_corporate_actions(xml: &str) -> Result<Vec<IbkrFlexCorporateAction>, IbkrFlexError> {
+    parse_corporate_actions_scrubbed(xml, None)
+}
+
+/// [`parse_corporate_actions`], additionally redacting `token` from any error message.
+///
+/// Exists because the two callers differ in what they are able to protect. Called directly, this
+/// parser has no credential in scope and can only *bound* its messages. Called from
+/// [`IbkrFlexClient::fetch_corporate_actions`](super::IbkrFlexClient::fetch_corporate_actions) a
+/// token does exist, and the message must be redacted as well as bounded.
+///
+/// The token is threaded in *here*, rather than the caller scrubbing the returned message, because
+/// the two operations do not commute. Redaction matches the full token, so it has to run while the
+/// message is still unbounded: bounding first can leave a straddling credential present only as a
+/// prefix fragment, which a subsequent full-token match would miss. See
+/// [`sanitize_error_body`](super::sanitize_error_body), which enforces the same ordering internally.
+pub(super) fn parse_corporate_actions_scrubbed(
+    xml: &str,
+    token: Option<&str>,
+) -> Result<Vec<IbkrFlexCorporateAction>, IbkrFlexError> {
     // Assert the document is actually a `<FlexQueryResponse>` statement BEFORE deserializing.
     // quick-xml's serde path does not verify the root element, and the raw structs use
     // `#[serde(default)]`, so an IBKR error/status envelope (`<FlexStatementResponse>`, e.g. an
@@ -179,19 +210,34 @@ pub fn parse_corporate_actions(xml: &str) -> Result<Vec<IbkrFlexCorporateAction>
     match super::root_element_name(xml).as_deref() {
         Some("FlexQueryResponse") => {}
         Some(other) => {
-            return Err(IbkrFlexError::Parse(format!(
-                "expected Flex statement root <FlexQueryResponse>, found <{other}>"
-            )));
+            // `other` is a tag name lifted verbatim out of the supplied document, so an adversarial
+            // or corrupt statement could otherwise inflate the error to the size of the input.
+            // `finish_parse_error` applies the same cap the fetch-response parse path applies —
+            // after redaction, never before it.
+            return Err(finish_parse_error(
+                format!("expected Flex statement root <FlexQueryResponse>, found <{other}>"),
+                token,
+            ));
         }
         None => {
-            return Err(IbkrFlexError::Parse(
+            // Routed through the same finaliser as the branches above even though this message is a
+            // fixed literal with nothing to redact or bound. Uniformity is the point: "every `Parse`
+            // is built by `finish_parse_error`" is a property a reader can check locally, whereas
+            // "every `Parse` that *could* carry a credential is" requires re-auditing each branch
+            // whenever a message gains an interpolated value.
+            return Err(finish_parse_error(
                 "empty or unreadable Flex statement document".to_owned(),
+                token,
             ));
         }
     }
 
-    let response: RawFlexQueryResponse = quick_xml::de::from_str(xml)
-        .map_err(|e| IbkrFlexError::Parse(format!("failed to parse Flex statement XML: {e}")))?;
+    // Bounded for the same reason: a `DeError` embeds the deserialiser's rendering of the offending
+    // input (quick-xml's `UnexpectedStart` carries the raw tag bytes it choked on), so the message
+    // length tracks the document, not the failure.
+    let response: RawFlexQueryResponse = quick_xml::de::from_str(xml).map_err(|e| {
+        finish_parse_error(format!("failed to parse Flex statement XML: {e}"), token)
+    })?;
 
     Ok(response
         .flex_statements
@@ -353,6 +399,53 @@ fn opt_date(value: Option<String>) -> Option<NaiveDate> {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Tests should panic on unexpected values.
 mod tests {
     use super::*;
+    // Only the assertions below reference the cap directly — `finish_parse_error` applies it.
+    use super::super::MAX_ERROR_BODY_BYTES;
+
+    #[test]
+    fn parse_errors_are_bounded() {
+        // These messages embed the offending document, so their length must track the cap rather
+        // than the input. Both input-reflecting branches are covered: the root-element mismatch and
+        // the deserialiser failure. The short "empty or unreadable" branch is a fixed literal.
+        let huge_root = format!("<{}/>", "a".repeat(8192));
+        match parse_corporate_actions(&huge_root) {
+            Err(IbkrFlexError::Parse(message)) => {
+                assert!(
+                    message.starts_with("expected Flex statement root"),
+                    "must reach the root-element branch, got: {message}"
+                );
+                assert!(
+                    message.len() <= MAX_ERROR_BODY_BYTES,
+                    "bounded to the cap, got {} bytes",
+                    message.len()
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+
+        // A correct root that then fails to deserialize, driving the `DeError` branch. The inner
+        // tag is left unclosed so quick-xml reports a mismatched end tag, embedding the long name.
+        // (A malformed *attribute* would not do: `quantity` is `Option<String>` and an unparseable
+        // value is coerced to `0` with a warn, so it returns `Ok` and would test nothing.)
+        let huge_body = format!(
+            "<FlexQueryResponse><{}></FlexQueryResponse>",
+            "a".repeat(8192)
+        );
+        match parse_corporate_actions(&huge_body) {
+            Err(IbkrFlexError::Parse(message)) => {
+                assert!(
+                    message.starts_with("failed to parse Flex statement XML"),
+                    "must reach the deserialiser branch, got: {message}"
+                );
+                assert!(
+                    message.len() <= MAX_ERROR_BODY_BYTES,
+                    "bounded to the cap, got {} bytes",
+                    message.len()
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
 
     const ACTIVITY_FIXTURE: &str =
         include_str!("../../../../tests/fixtures/ibkr_flex/activity_corporate_actions.xml");

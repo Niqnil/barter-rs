@@ -10,6 +10,12 @@
 //! - a normal finite `next_url` chain paginates to completion with no false
 //!   positive.
 //!
+//! The cycle test is repeated across **every** paginated fetch rather than a
+//! representative one. The guard's own logic is covered by unit tests in
+//! `massive::pagination`; what these tests protect is the per-call-site *wiring* —
+//! a `guard.observe(&url)?` omitted from one loop is exactly the copy-paste slip a
+//! single representative test would miss, and each loop is hand-written.
+//!
 //! The numeric page cap (`MAX_PAGES`) is covered by fast, deterministic unit tests
 //! in `massive::pagination`; exercising it here would mean serving thousands of
 //! pages, so it is intentionally not re-tested through HTTP.
@@ -19,14 +25,28 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use chrono::{Duration, Utc};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use rustrade_data::exchange::massive::{
-    MassiveError, MassiveRestClient, OptionContractQuery, TickerQuery,
+    DividendQuery, MassiveError, MassiveRestClient, OptionContractQuery, OptionSnapshotQuery,
+    SplitQuery, TickerQuery,
 };
 use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration as StdDuration;
 use wiremock::matchers::{header, method};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+/// How long a guarded fetch may run before the test declares it non-terminating.
+///
+/// The cycle tests mount a mock that answers a self-referential `next_url` *forever*, so a
+/// regression that drops the `guard.observe(&url)?` wiring from a pagination loop does not fail —
+/// it pages indefinitely. Without this bound such a regression would hang until CI's job timeout,
+/// an opaque failure far removed from its cause. This turns "the guard is gone" into an explicit,
+/// fast assertion.
+///
+/// Generous relative to a local wiremock round-trip (milliseconds), so it can only fire on genuine
+/// non-termination, never on a slow machine.
+const TERMINATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 /// Serves pre-configured JSON pages in registration order.
 ///
@@ -67,44 +87,149 @@ fn client_for(server: &MockServer) -> MassiveRestClient {
         .expect("mock server uri is a valid base url")
 }
 
-/// A `next_url` that always points back to the same page must terminate the stream
-/// with `CyclicPagination` rather than looping forever.
-#[tokio::test]
-async fn aggregates_stream_detects_next_url_cycle() {
-    let server = MockServer::start().await;
-    // Every page reports no bars and a `next_url` that points at a single fixed
-    // page under the mock's origin — so following it revisits the same URL.
+/// Mount a catch-all mock that answers every request with an empty page whose `next_url`
+/// points at one fixed URL under the mock's own origin — so following it revisits the same
+/// URL and only the [`PaginationGuard`] can end the stream.
+///
+/// The body is a superset of the fields every Massive page response deserializes
+/// (`resultsCount`/`results`/`next_url`/`status`); each endpoint's response type takes
+/// `results` as an `Option<Vec<_>>` and ignores the fields it does not declare, so one shape
+/// serves all of them.
+async fn mount_self_referential_page(server: &MockServer) {
     let loop_url = format!("{}/loop", server.uri());
     let body = serde_json::json!({
         "resultsCount": 0,
         "results": [],
         "next_url": loop_url,
+        "status": "OK",
     });
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
-        .mount(&server)
+        .mount(server)
         .await;
+}
+
+/// Drive `stream` to completion, returning its terminal error if it yielded one.
+///
+/// Fails the test if the stream has not terminated within [`TERMINATION_TIMEOUT`] — see that
+/// constant for why an unbounded drain would fail opaquely against the cycle mocks.
+async fn drain_to_terminal_error<T>(
+    stream: impl Stream<Item = Result<T, MassiveError>>,
+) -> Option<MassiveError> {
+    let drain = async {
+        let mut stream = pin!(stream);
+        while let Some(item) = stream.next().await {
+            if let Err(error) = item {
+                return Some(error);
+            }
+        }
+        None
+    };
+    tokio::time::timeout(TERMINATION_TIMEOUT, drain)
+        .await
+        .expect("stream must terminate — a hang means the PaginationGuard wiring is missing")
+}
+
+/// [`drain_to_terminal_error`]'s counterpart for the `Vec`-returning fetches, which collect
+/// eagerly instead of streaming and so have no terminal item to drain to.
+async fn await_bounded<T>(
+    fetch: impl Future<Output = Result<T, MassiveError>>,
+) -> Result<T, MassiveError> {
+    tokio::time::timeout(TERMINATION_TIMEOUT, fetch)
+        .await
+        .expect("fetch must terminate — a hang means the PaginationGuard wiring is missing")
+}
+
+/// Assert that `error` is the terminal cycle error, with the fetch's name in the failure message
+/// so a regression names the offending call site directly.
+#[track_caller]
+fn assert_cycle_detected(fetch: &str, error: Option<MassiveError>) {
+    assert!(
+        matches!(error, Some(MassiveError::CyclicPagination { .. })),
+        "{fetch}: expected CyclicPagination, got {error:?}"
+    );
+}
+
+// ============================================================================
+// Cycle detection — one test per paginated call site
+// ============================================================================
+
+/// A `next_url` that always points back to the same page must terminate the stream
+/// with `CyclicPagination` rather than looping forever.
+#[tokio::test]
+async fn aggregates_stream_detects_next_url_cycle() {
+    let server = MockServer::start().await;
+    mount_self_referential_page(&server).await;
 
     let client = client_for(&server);
     let to = Utc::now();
     let from = to - Duration::minutes(5);
-    let mut stream = pin!(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to));
+    let error =
+        drain_to_terminal_error(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to)).await;
 
-    let mut terminal_err = None;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(_) => continue,
-            Err(e) => {
-                terminal_err = Some(e);
-                break;
-            }
-        }
-    }
+    assert_cycle_detected("fetch_aggregates", error);
+}
 
-    assert!(
-        matches!(terminal_err, Some(MassiveError::CyclicPagination { .. })),
-        "expected CyclicPagination, got {terminal_err:?}"
-    );
+#[tokio::test]
+async fn trades_stream_detects_next_url_cycle() {
+    let server = MockServer::start().await;
+    mount_self_referential_page(&server).await;
+
+    let client = client_for(&server);
+    let to = Utc::now();
+    let from = to - Duration::minutes(5);
+    let error = drain_to_terminal_error(client.fetch_trades("X:BTCUSD", from, to)).await;
+
+    assert_cycle_detected("fetch_trades", error);
+}
+
+#[tokio::test]
+async fn quotes_stream_detects_next_url_cycle() {
+    let server = MockServer::start().await;
+    mount_self_referential_page(&server).await;
+
+    let client = client_for(&server);
+    let to = Utc::now();
+    let from = to - Duration::minutes(5);
+    let error = drain_to_terminal_error(client.fetch_quotes("X:BTCUSD", from, to)).await;
+
+    assert_cycle_detected("fetch_quotes", error);
+}
+
+#[tokio::test]
+async fn dividends_stream_detects_next_url_cycle() {
+    let server = MockServer::start().await;
+    mount_self_referential_page(&server).await;
+
+    let client = client_for(&server);
+    let query = DividendQuery::new();
+    let error = drain_to_terminal_error(client.fetch_dividends(&query)).await;
+
+    assert_cycle_detected("fetch_dividends", error);
+}
+
+#[tokio::test]
+async fn splits_stream_detects_next_url_cycle() {
+    let server = MockServer::start().await;
+    mount_self_referential_page(&server).await;
+
+    let client = client_for(&server);
+    let query = SplitQuery::new();
+    let error = drain_to_terminal_error(client.fetch_splits_raw(&query)).await;
+
+    assert_cycle_detected("fetch_splits_raw", error);
+}
+
+#[tokio::test]
+async fn tickers_stream_detects_next_url_cycle() {
+    let server = MockServer::start().await;
+    mount_self_referential_page(&server).await;
+
+    let client = client_for(&server);
+    let query = TickerQuery::new();
+    let error = drain_to_terminal_error(client.fetch_tickers(&query)).await;
+
+    assert_cycle_detected("fetch_tickers", error);
 }
 
 /// The `Vec`-returning fetches (`fetch_option_contracts` / `fetch_option_chain_snapshot`)
@@ -114,28 +239,30 @@ async fn aggregates_stream_detects_next_url_cycle() {
 #[tokio::test]
 async fn option_contracts_detects_next_url_cycle() {
     let server = MockServer::start().await;
-    // Empty results + a `next_url` that points back at a single fixed page under the
-    // mock's origin — so following it revisits the same URL.
-    let loop_url = format!("{}/loop", server.uri());
-    let body = serde_json::json!({
-        "results": [],
-        "next_url": loop_url,
-        "status": "OK",
-    });
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body))
-        .mount(&server)
-        .await;
+    mount_self_referential_page(&server).await;
 
     let client = client_for(&server);
     let query = OptionContractQuery::new();
-    let result = client.fetch_option_contracts(&query).await;
+    let result = await_bounded(client.fetch_option_contracts(&query)).await;
 
-    assert!(
-        matches!(result, Err(MassiveError::CyclicPagination { .. })),
-        "expected CyclicPagination, got {result:?}"
-    );
+    assert_cycle_detected("fetch_option_contracts", result.err());
 }
+
+#[tokio::test]
+async fn option_chain_snapshot_detects_next_url_cycle() {
+    let server = MockServer::start().await;
+    mount_self_referential_page(&server).await;
+
+    let client = client_for(&server);
+    let query = OptionSnapshotQuery::new();
+    let result = await_bounded(client.fetch_option_chain_snapshot("AAPL", &query)).await;
+
+    assert_cycle_detected("fetch_option_chain_snapshot", result.err());
+}
+
+// ============================================================================
+// Origin validation, redirects, and the no-false-positive baseline
+// ============================================================================
 
 /// A normal finite `next_url` chain paginates to completion: every item is yielded,
 /// the stream ends cleanly (no error), and the guard does not false-positive on
@@ -217,18 +344,8 @@ async fn aggregates_stream_rejects_cross_origin_next_url_without_leaking_token()
     let client = client_for(&primary);
     let to = Utc::now();
     let from = to - Duration::minutes(5);
-    let mut stream = pin!(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to));
-
-    let mut terminal_err = None;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(_) => continue,
-            Err(e) => {
-                terminal_err = Some(e);
-                break;
-            }
-        }
-    }
+    let terminal_err =
+        drain_to_terminal_error(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to)).await;
 
     assert!(
         matches!(terminal_err, Some(MassiveError::UntrustedNextUrl { .. })),
@@ -307,18 +424,8 @@ async fn aggregates_stream_does_not_follow_redirect_off_origin() {
     let client = client_for(&primary);
     let to = Utc::now();
     let from = to - Duration::minutes(5);
-    let mut stream = pin!(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to));
-
-    let mut terminal_err = None;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(_) => continue,
-            Err(e) => {
-                terminal_err = Some(e);
-                break;
-            }
-        }
-    }
+    let terminal_err =
+        drain_to_terminal_error(client.fetch_aggregates("X:BTCUSD", 1, "minute", from, to)).await;
 
     assert!(
         matches!(terminal_err, Some(MassiveError::Api { status, .. }) if (300..400).contains(&status)),

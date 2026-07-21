@@ -3,7 +3,12 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    // A public item linking to a private one renders as dead, non-hyperlinked code on docs.rs — the
+    // reader is pointed at something they cannot open. Denied rather than warned because these
+    // accumulate silently: `cargo doc` is not part of the normal build or the pre-commit gate, so a
+    // warning here is one nobody sees. Fix by inlining the fact or linking a public item instead.
+    rustdoc::private_intra_doc_links
 )]
 #![warn(
     unused,
@@ -111,7 +116,9 @@ use tracing_subscriber as _;
 use serial_test as _;
 // wiremock is referenced by the pagination integration tests under the `massive` feature
 // (tests/massive_pagination.rs, a separate compilation unit) and by `exchange::http`'s unit tests,
-// which compile only under `massive`/`ibkr`. This stub covers the build where neither is enabled.
+// which are no longer feature-gated and so reference it in every `cfg(test)` build. This stub is
+// therefore redundant today; it is kept alongside its siblings so re-gating those tests cannot
+// silently reintroduce the warning.
 #[cfg(test)]
 use wiremock as _;
 // time is only referenced by the integration tests under the `databento`/`ibkr` features
@@ -123,6 +130,10 @@ use time as _;
 // (exchange::massive::{live, rest}), so it is unused when that feature is off.
 #[cfg(test)]
 use temp_env as _;
+// http is only referenced by the in-tree unit tests under the `ibkr` feature
+// (exchange::ibkr::flex), which build synthetic `reqwest::Response`s without a socket.
+#[cfg(test)]
+use http as _;
 
 use crate::{
     error::DataError,

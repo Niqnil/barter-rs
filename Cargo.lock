@@ -4498,6 +4498,7 @@ dependencies = [
  "fnv",
  "futures",
  "futures-util",
+ "http 1.4.0",
  "hyperliquid_rust_sdk",
  "ibapi",
  "itertools 0.15.0",

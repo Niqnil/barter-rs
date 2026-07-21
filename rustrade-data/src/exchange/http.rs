@@ -1,5 +1,20 @@
 //! Small HTTP helpers shared by the REST-based exchange integrations.
 
+/// Truncate `s` to at most `max_bytes` bytes, rounding down to a UTF-8 char boundary.
+///
+/// A byte budget can land mid-character, which `String::truncate` and a naive `&s[..n]` both
+/// reject (panicking on a non-boundary index). [`str::floor_char_boundary`] rounds down to the
+/// nearest boundary — one always exists at or below any index — so the result is always a valid
+/// `str`, at the cost of dropping the straddling character.
+///
+/// The cap is a parameter rather than a constant because callers budget differently for different
+/// contexts: a full error message, a short inline snippet, and a proxy/CDN error page are not the
+/// same size problem. Sharing the *function* keeps the boundary-safety logic in one place; sharing
+/// one *constant* across those contexts would be false consistency.
+pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> String {
+    s[..s.floor_char_boundary(max_bytes)].to_owned()
+}
+
 /// Cap for error-path body reads (see [`read_body_capped`]).
 ///
 /// Generous relative to any real diagnostic envelope — so it never truncates a legitimate error or
@@ -45,6 +60,37 @@ pub(crate) async fn read_body_capped(
     // actually split a multi-byte character.
     Ok(String::from_utf8(buf)
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
+}
+
+#[cfg(test)]
+mod truncate_str_tests {
+    use super::*;
+
+    #[test]
+    fn shorter_than_the_cap_is_returned_whole() {
+        assert_eq!(truncate_str("abc", 512), "abc");
+    }
+
+    #[test]
+    fn longer_than_the_cap_is_cut_at_the_exact_byte() {
+        assert_eq!(truncate_str("0123456789", 4), "0123");
+    }
+
+    #[test]
+    fn a_cap_splitting_a_multi_byte_char_rounds_down_instead_of_panicking() {
+        // `€` is 3 bytes, so a cap of 2 lands inside it. Rounding down drops the whole character
+        // rather than slicing it into an invalid `str` (which would panic).
+        assert_eq!(truncate_str("€", 2), "");
+        assert_eq!(truncate_str("a€", 3), "a");
+        assert_eq!(truncate_str("a€", 4), "a€");
+    }
+
+    #[test]
+    fn a_cap_beyond_the_string_is_not_out_of_bounds() {
+        // `floor_char_boundary` saturates at `len`, so an over-large cap is a no-op rather than a
+        // panicking slice.
+        assert_eq!(truncate_str("abc", usize::MAX), "abc");
+    }
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use super::transformer::{
     AggregatesResponse, QuotesResponse, TradesResponse, parse_aggregates_response,
     parse_quotes_response, parse_trades_response, timespan_to_step,
 };
-use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped};
+use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped, truncate_str};
 use crate::subscription::{
     book::OrderBookL1,
     candle::{Candle, open_time_from_close},
@@ -25,11 +25,8 @@ use url::Url;
 const BASE_URL: &str = "https://api.massive.com";
 const ENV_API_KEY: &str = "MASSIVE_API_KEY";
 
-/// Truncate response body for error messages (max 512 chars, UTF-8 safe).
-fn truncate_body(body: &str) -> String {
-    let boundary = body.floor_char_boundary(512);
-    body[..boundary].to_owned()
-}
+/// Byte cap applied to a response body before it is stored in a [`MassiveError`] message.
+const ERROR_MESSAGE_BODY_BYTES: usize = 512;
 
 /// REST client for Massive historical and intraday market data.
 ///
@@ -82,8 +79,8 @@ impl MassiveRestClient {
     /// # Redirects
     ///
     /// The client does **not** follow HTTP redirects. The API key is attached as
-    /// an `Authorization: Bearer` header to each request (from the origin-validated
-    /// [`fetch_page_body`](Self::fetch_page_body) chokepoint), so auto-following a
+    /// an `Authorization: Bearer` header to each request, from a single
+    /// origin-validated chokepoint, so auto-following a
     /// server-issued 3xx could carry it off the trusted origin. Massive uses
     /// explicit `next_url` cursor pagination and is not expected to redirect, so
     /// an unexpected 3xx surfaces as [`MassiveError::Api`] rather than being
@@ -159,7 +156,10 @@ impl MassiveRestClient {
     ///
     /// # Errors
     ///
-    /// Returns [`MassiveError::InvalidInput`] if `base_url` does not parse as a URL.
+    /// Returns [`MassiveError::InvalidInput`] if `base_url` does not parse as a
+    /// URL, or if it parses but uses a scheme other than `http`/`https` — a
+    /// non-special scheme (e.g. `file:`) yields an opaque origin that would
+    /// reject every subsequent request, so it is refused up front.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Result<Self, MassiveError> {
         let base_url = base_url.into();
         self.base_origin = Self::parse_base_origin(&base_url)?;
@@ -285,19 +285,19 @@ impl MassiveRestClient {
             return Err(MassiveError::RateLimited { retry_after });
         }
 
-        // A non-success body is only a diagnostic that `truncate_body` caps for the error message, so
+        // A non-success body is only a diagnostic that `truncate_str` caps for the error message, so
         // read it under a bound: a pathological proxy/CDN error page must not be buffered in full.
         // The success body is the real JSON page and is read whole below.
         if !status.is_success() {
             let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 return Err(MassiveError::Auth {
-                    message: truncate_body(&body),
+                    message: truncate_str(&body, ERROR_MESSAGE_BODY_BYTES),
                 });
             }
             return Err(MassiveError::Api {
                 status: status.as_u16(),
-                message: truncate_body(&body),
+                message: truncate_str(&body, ERROR_MESSAGE_BODY_BYTES),
             });
         }
 

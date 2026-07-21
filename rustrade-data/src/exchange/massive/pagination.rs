@@ -17,7 +17,10 @@
 //! genuinely small result set, so incomplete pagination must fail loudly.
 
 use super::error::MassiveError;
+use crate::exchange::http::truncate_str;
 use std::collections::HashSet;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 
 /// Maximum number of pages a single paginated fetch will follow.
 ///
@@ -26,6 +29,21 @@ use std::collections::HashSet;
 /// universe), so reaching it signals a pathological query or a misbehaving
 /// server rather than normal operation.
 pub(super) const MAX_PAGES: usize = 10_000;
+
+/// Maximum byte length of a URL this paginator will follow.
+///
+/// Like [`MAX_PAGES`], a runaway backstop rather than a business limit: a real
+/// Massive cursor URL is a few hundred bytes, and no mainstream HTTP stack
+/// accepts a request line beyond a few KiB, so this only rejects pathological
+/// input. It matters because a page's `next_url` is server-controlled and
+/// success bodies are read unbounded — without a cap, a misbehaving origin
+/// could hand back arbitrarily long URLs, and the guard would retain one per
+/// page for the life of the stream.
+pub(super) const MAX_URL_BYTES: usize = 8 * 1024;
+
+/// Bytes of a rejected URL retained for diagnosis (see
+/// [`MassiveError::PaginationUrlTooLong`]).
+const URL_PREFIX_BYTES: usize = 200;
 
 /// Tracks pagination progress across a single Massive REST stream, enforcing a
 /// page-count cap and detecting `next_url` cycles.
@@ -38,12 +56,31 @@ pub(super) const MAX_PAGES: usize = 10_000;
 #[derive(Debug, Default)]
 pub(super) struct PaginationGuard {
     pages: usize,
-    /// URLs already fetched, for cycle detection. Bounded by [`MAX_PAGES`]
-    /// entries: [`observe`] checks the page cap before inserting, so growth
-    /// cannot exceed the cap before the stream terminates.
+    /// Fixed-size fingerprints of the URLs already fetched, for cycle detection.
+    /// Bounded by [`MAX_PAGES`] entries: [`observe`] checks the page cap before
+    /// inserting, so growth cannot exceed the cap before the stream terminates.
+    ///
+    /// Fingerprints rather than the URLs themselves so each entry costs a
+    /// constant 8 bytes regardless of URL length — the URLs are server-supplied
+    /// and would otherwise be retained in full, up to [`MAX_PAGES`] of them.
+    /// Storing a *truncated* URL would not work: two distinct URLs sharing a
+    /// long prefix would compare equal and be reported as a false cycle, whereas
+    /// a hash is computed over the whole string.
     ///
     /// [`observe`]: PaginationGuard::observe
-    visited: HashSet<String>,
+    visited: HashSet<u64>,
+    /// Per-guard (and therefore per-stream) hash key.
+    ///
+    /// Deliberately [`RandomState`] rather than [`DefaultHasher::new`], whose
+    /// SipHash key is a fixed `(0, 0)` published in std's source. With a known
+    /// key, a misbehaving origin could precompute two distinct, well-formed
+    /// `next_url`s that collide and so force a spurious
+    /// [`MassiveError::CyclicPagination`] on a legitimate stream. A key the
+    /// server cannot know removes that possibility — which is precisely the
+    /// hash-flooding threat model SipHash was designed for.
+    ///
+    /// [`DefaultHasher::new`]: std::hash::DefaultHasher::new
+    hasher: RandomState,
 }
 
 impl PaginationGuard {
@@ -51,11 +88,20 @@ impl PaginationGuard {
     ///
     /// Returns:
     /// - [`MassiveError::PaginationLimitExceeded`] once more than [`MAX_PAGES`]
-    ///   pages have been observed, and
+    ///   pages have been observed,
+    /// - [`MassiveError::PaginationUrlTooLong`] if `url` exceeds
+    ///   [`MAX_URL_BYTES`], and
     /// - [`MassiveError::CyclicPagination`] if `url` was already observed.
     ///
-    /// Both are terminal: propagate them to end the stream rather than continuing
-    /// to page.
+    /// All three are terminal: propagate them to end the stream rather than
+    /// continuing to page.
+    ///
+    /// The length check runs before the URL is hashed or requested, so a
+    /// pathological value is rejected without being retained. It applies to
+    /// every URL the paginator follows — in practice always a server-supplied
+    /// `next_url`, but the first page's URL (built by this client from the
+    /// caller's query) passes through the same check, which is why the error is
+    /// named for the paginator rather than for `next_url`.
     pub(super) fn observe(&mut self, url: &str) -> Result<(), MassiveError> {
         self.pages += 1;
         if self.pages > MAX_PAGES {
@@ -64,7 +110,14 @@ impl PaginationGuard {
                 limit: MAX_PAGES,
             });
         }
-        if !self.visited.insert(url.to_owned()) {
+        if url.len() > MAX_URL_BYTES {
+            return Err(MassiveError::PaginationUrlTooLong {
+                len: url.len(),
+                limit: MAX_URL_BYTES,
+                prefix: truncate_str(url, URL_PREFIX_BYTES),
+            });
+        }
+        if !self.visited.insert(self.hasher.hash_one(url)) {
             return Err(MassiveError::CyclicPagination {
                 url: url.to_owned(),
             });
@@ -137,5 +190,58 @@ mod tests {
         guard
             .observe("https://api.massive.com/x?cursor=b")
             .expect("page 2 is a different URL");
+    }
+
+    #[test]
+    fn long_urls_sharing_a_prefix_are_not_a_false_cycle() {
+        // The property that rules out storing a *truncated* URL as the dedup key: these two differ
+        // only in their final byte, far beyond any sane truncation point, yet are distinct pages.
+        // Hashing the whole string keeps them distinct; a truncating key would report a cycle and
+        // kill a legitimate stream.
+        let mut guard = PaginationGuard::default();
+        let base = format!("https://api.massive.com/x?cursor={}", "a".repeat(2048));
+        guard.observe(&format!("{base}1")).expect("page 1");
+        guard
+            .observe(&format!("{base}2"))
+            .expect("page 2 differs only in its last byte but is a different URL");
+    }
+
+    #[test]
+    fn a_url_at_the_byte_cap_is_accepted() {
+        let mut guard = PaginationGuard::default();
+        let url = "a".repeat(MAX_URL_BYTES);
+        guard.observe(&url).expect("exactly at the cap is allowed");
+    }
+
+    #[test]
+    fn a_url_over_the_byte_cap_is_rejected_with_a_bounded_prefix() {
+        let mut guard = PaginationGuard::default();
+        let url = format!("https://api.massive.com/{}", "a".repeat(MAX_URL_BYTES));
+        let err = guard
+            .observe(&url)
+            .expect_err("past the cap must be rejected");
+
+        match err {
+            MassiveError::PaginationUrlTooLong { len, limit, prefix } => {
+                assert_eq!(len, url.len());
+                assert_eq!(limit, MAX_URL_BYTES);
+                assert_eq!(prefix.len(), URL_PREFIX_BYTES);
+                assert!(prefix.starts_with("https://api.massive.com/"));
+            }
+            other => panic!("expected PaginationUrlTooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_url_is_rejected_before_being_recorded() {
+        // The point of checking length *before* insertion: the guard must not retain the very value
+        // it just refused, or the bound would be pointless.
+        let mut guard = PaginationGuard::default();
+        let url = "a".repeat(MAX_URL_BYTES + 1);
+        guard.observe(&url).expect_err("rejected");
+        assert!(
+            guard.visited.is_empty(),
+            "a rejected URL must leave no trace in the visited set"
+        );
     }
 }

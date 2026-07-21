@@ -46,7 +46,7 @@ mod corporate_action;
 
 pub use corporate_action::{IbkrFlexCorporateAction, IbkrReorgType, parse_corporate_actions};
 
-use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped};
+use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped, truncate_str};
 use quick_xml::{Reader, events::Event};
 use serde::Deserialize;
 use smol_str::SmolStr;
@@ -127,11 +127,11 @@ pub enum IbkrFlexError {
     /// Web Service.
     ///
     /// The body is read before the status is inspected (so the diagnostic is preserved rather than
-    /// discarded by `error_for_status`), then bounded to [`MAX_ERROR_BODY_BYTES`] and
+    /// discarded by `error_for_status`), then bounded to 1 KiB and
     /// **token-scrubbed** before storage: the Flex token rides in the request URL's `t=` parameter,
     /// so a proxy that echoes the request line into its error page could otherwise reflect the
     /// credential into this body. The scrub is best-effort defense-in-depth — it redacts both the
-    /// raw token and the encoded form it takes on the wire (see [`sanitize_error_body`]). An IBKR
+    /// raw token and the encoded form it takes on the wire. An IBKR
     /// *application* error that arrives under a non-2xx status is still surfaced as the richer
     /// [`IbkrFlexError::Flex`], not here.
     #[error("HTTP status {status}: {body}")]
@@ -155,12 +155,24 @@ pub enum IbkrFlexError {
     #[error("Flex statement not ready after {attempts} poll attempts")]
     PollTimeout {
         /// Number of poll attempts made before giving up — the configured
-        /// [`FlexPollPolicy::max_attempts`] ([`POLL_MAX_ATTEMPTS`] by default), since this error
+        /// [`FlexPollPolicy::max_attempts`] (12 by default), since this error
         /// fires only after every attempt reported the statement still generating.
         attempts: u32,
     },
 
     /// The statement or status XML could not be parsed.
+    ///
+    /// A parse message embeds the deserialiser's own rendering of the offending input, so its
+    /// length tracks the *document* rather than the failure, and a document that reflected the
+    /// request line could carry the `t=` credential into it. This variant is therefore **always
+    /// bounded** to 1 KiB, and **token-scrubbed** on every path where a token is in scope — the
+    /// same protection [`IbkrFlexError::HttpStatus`] gets, for the same reason.
+    ///
+    /// Scrubbing covers every `Parse` returned by [`IbkrFlexClient::fetch_statement_xml`] and
+    /// [`IbkrFlexClient::fetch_corporate_actions`]. The one path it cannot cover is calling
+    /// [`parse_corporate_actions`] directly: there the caller supplies its own XML and no token
+    /// exists to redact. Such a message is still bounded — just not scrubbed, since there is
+    /// nothing to scrub against.
     #[error("Flex XML parse error: {0}")]
     Parse(String),
 }
@@ -490,20 +502,14 @@ impl IbkrFlexClient {
             .query(&[("t", self.token.as_str()), ("q", q), ("v", FLEX_VERSION)])
             .send()
             .await?;
-        let status = response.status();
-        let body = if status.is_success() {
-            response.text().await?
-        } else {
-            read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?
-        };
-        Ok((status, body))
+        read_status_and_body(response).await
     }
 
     /// Fetch the statement and parse its Corporate Actions section into faithful records.
     ///
     /// Convenience over [`fetch_statement_xml`](Self::fetch_statement_xml) +
     /// [`parse_corporate_actions`]. Returns **all** reorg rows; filtering to splits is the caller's
-    /// job. See [`corporate_action`] for the record contract and limitations.
+    /// job. See [`IbkrFlexCorporateAction`] for the record contract and limitations.
     ///
     /// # Errors
     ///
@@ -512,8 +518,41 @@ impl IbkrFlexClient {
         &self,
     ) -> Result<Vec<IbkrFlexCorporateAction>, IbkrFlexError> {
         let xml = self.fetch_statement_xml().await?;
-        parse_corporate_actions(&xml)
+        // The token is threaded *into* the parse rather than scrubbed off its result: redaction
+        // matches the full token, so it must run before the message is bounded, and
+        // `parse_corporate_actions` bounds before returning. Scrubbing afterwards would leave a
+        // credential straddling the cap present only as an unmatched prefix fragment. This re-parses
+        // a body that already crossed the network, and a misconfigured proxy that echoed the request
+        // line into it would have put `t=<TOKEN>` in reach of a deserialiser message.
+        corporate_action::parse_corporate_actions_scrubbed(&xml, Some(&self.token))
     }
+}
+
+/// Read a response's HTTP status and body, bounding the read on the error path.
+///
+/// Split out of [`IbkrFlexClient::get_with_query`] so this contract can be exercised against a
+/// synthetic [`reqwest::Response`] with no live socket (reqwest exposes
+/// `From<http::Response<_>>`), which the caller's `send()` cannot be. That matters because the
+/// ordering here is the load-bearing part: the body is read **before** the status is judged, so a
+/// Flex envelope arriving under a non-2xx status — notably the retryable `1019` "still generating"
+/// — survives to be classified. `error_for_status()?.text().await?` would discard it and abort the
+/// poll, and every test that drives [`interpret_poll_response`] with a synthetic `(status, body)`
+/// tuple would still pass. See `read_status_and_body_*` in this module's tests.
+///
+/// A **success** body is the statement payload (a `<FlexQueryResponse>`, which can be large) and is
+/// read in full. A **non-success** body is only a small Flex status/error envelope or a proxy/CDN
+/// diagnostic page — never the statement — so it is capped at [`MAX_ERROR_BODY_DOWNLOAD_BYTES`],
+/// far above any real Flex envelope.
+async fn read_status_and_body(
+    response: reqwest::Response,
+) -> Result<(reqwest::StatusCode, String), IbkrFlexError> {
+    let status = response.status();
+    let body = if status.is_success() {
+        response.text().await?
+    } else {
+        read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?
+    };
+    Ok((status, body))
 }
 
 /// Poll GetStatement until the statement is ready or `policy`'s attempt budget is exhausted,
@@ -704,7 +743,8 @@ fn flex_error(resp: FlexStatementResponse, stage: &str) -> IbkrFlexError {
 /// a non-2xx status still surfaces as the richer [`IbkrFlexError::Flex`] (e.g. `1003` invalid
 /// token). A body that is *not* a recognizable Flex envelope under a non-success status becomes
 /// [`IbkrFlexError::HttpStatus`] (a proxy/CDN error page) rather than a misleading XML parse error;
-/// the same malformed body under a 2xx status stays a genuine [`IbkrFlexError::Parse`].
+/// the same malformed body under a 2xx status stays a genuine [`IbkrFlexError::Parse`] — with its
+/// message token-scrubbed, since an XML deserialiser embeds fragments of the offending input.
 fn interpret_send_response(
     status: reqwest::StatusCode,
     body: &str,
@@ -714,6 +754,7 @@ fn interpret_send_response(
         Err(IbkrFlexError::Parse(_)) if !status.is_success() => {
             Err(http_status_error(status, body, token))
         }
+        Err(IbkrFlexError::Parse(message)) => Err(finish_parse_error(message, Some(token))),
         other => other,
     }
 }
@@ -734,8 +775,35 @@ fn interpret_poll_response(
         Err(IbkrFlexError::Parse(_)) if !status.is_success() => {
             Err(http_status_error(status, body, token))
         }
+        Err(IbkrFlexError::Parse(message)) => Err(finish_parse_error(message, Some(token))),
         other => other,
     }
+}
+
+/// Build an [`IbkrFlexError::Parse`] from an **unbounded** message: redact `token` when one is in
+/// scope, then bound the result to [`MAX_ERROR_BODY_BYTES`].
+///
+/// A parse failure message embeds the deserialiser's own rendering of the offending input —
+/// quick-xml's `DeError::UnexpectedStart`, for instance, carries the raw tag bytes it choked on. A
+/// body that reflected the request line (a misconfigured proxy echoing `?t=<TOKEN>`) could
+/// therefore carry the credential into the stored error, which [`IbkrFlexError::HttpStatus`] is
+/// already protected against but this variant was not.
+///
+/// **Every** `Parse` in this module is constructed here, including the token-less case, so that the
+/// redact-before-bound ordering exists in exactly one place. That ordering is a security invariant,
+/// not an implementation detail: redaction matches the full token, so bounding first can leave a
+/// credential straddling the cap present only as an unmatched prefix fragment. Two helpers that had
+/// to be kept in step would be one edit away from diverging on it.
+///
+/// `message` must therefore arrive unbounded — a caller that has already truncated at
+/// [`MAX_ERROR_BODY_BYTES`] has already lost the guarantee, and passing it here cannot recover it.
+/// Both branches end at the same cap and differ only in whether a redaction pass runs first, so the
+/// bound is applied exactly once either way.
+fn finish_parse_error(message: String, token: Option<&str>) -> IbkrFlexError {
+    IbkrFlexError::Parse(match token {
+        Some(token) => sanitize_error_body(&message, token),
+        None => truncate_str(&message, MAX_ERROR_BODY_BYTES),
+    })
 }
 
 /// Build an [`IbkrFlexError::HttpStatus`] from a non-success response, bounding and token-scrubbing
@@ -765,14 +833,43 @@ fn http_status_error(status: reqwest::StatusCode, body: &str, token: &str) -> Ib
 /// HTML-entity escaping, or truncation that splits the token). For a real IBKR token — a numeric
 /// string that encodes to itself — the raw scrub already covers it and the wire-form pass is a no-op.
 ///
-/// `body` arrives already bounded: [`IbkrFlexClient::get_with_query`] reads a non-success response
-/// through [`read_body_capped`] at [`MAX_ERROR_BODY_DOWNLOAD_BYTES`] (64 KiB) before it ever reaches
-/// this function. The two caps are complementary, not redundant — the outer one bounds memory during
-/// the network read itself, this one bounds what is retained in the stored error. The 64× gap between
-/// them also means a token fragment straddling the *download* boundary cannot survive into the final
-/// message: the trailing partial token sits far past [`MAX_ERROR_BODY_BYTES`] and is truncated away.
+/// How `body` is bounded depends on the caller, and only one of the two arrives pre-bounded:
+///
+/// - Via [`http_status_error`] (non-success status), `body` has already passed through
+///   [`read_body_capped`] at [`MAX_ERROR_BODY_DOWNLOAD_BYTES`] (64 KiB) in
+///   [`IbkrFlexClient::get_with_query`]. The two caps are complementary, not redundant — the outer
+///   one bounds memory during the network read itself, this one bounds what is retained in the
+///   stored error. The 64× gap between them also means a token fragment straddling the *download*
+///   boundary cannot survive into the final message: the trailing partial token sits far past
+///   [`MAX_ERROR_BODY_BYTES`] and is truncated away.
+/// - Via [`finish_parse_error`] (2xx status), `body` is a deserialiser message — raised either
+///   while interpreting a SendRequest/GetStatement response or while re-parsing a statement in
+///   [`parse_corporate_actions_scrubbed`](corporate_action::parse_corporate_actions_scrubbed) —
+///   derived from an **unbounded** `response.text()` read,
+///   so no download-level cap applies to it. This function therefore applies the coarse
+///   [`MAX_ERROR_BODY_DOWNLOAD_BYTES`] bound itself, on entry, reproducing the same 64× gap the
+///   non-success path gets for free — wide enough that it cannot split a token whose fragment would
+///   then survive into the retained message, but narrow enough that the redaction passes below do
+///   not scan an unbounded string.
+///
+/// Callers must pass a message that has **not** already been truncated at
+/// [`MAX_ERROR_BODY_BYTES`]: redaction matches the full token, so a caller-side cut at the same
+/// width this function retains could leave a straddling credential as an unmatched prefix. Both 2xx
+/// callers hand over their message unbounded for exactly this reason.
 fn sanitize_error_body(body: &str, token: &str) -> String {
-    // Redact the token over the FULL body first (order matters for correctness, not just cost):
+    // Bound the input before the redaction passes. `redact` allocates a full copy per pass even when
+    // the needle is absent, and a 2xx `Parse` message derives from an unbounded read, so without
+    // this an oversized message is copied twice before the trailing truncate discards nearly all of
+    // it. Slicing (rather than `truncate_str`) keeps the common under-cap case allocation-free, and
+    // the cap sits 64× above what is retained, so it cannot create the straddling-fragment problem
+    // the redact-then-bound ordering below exists to avoid.
+    let body = if body.len() > MAX_ERROR_BODY_DOWNLOAD_BYTES {
+        &body[..body.floor_char_boundary(MAX_ERROR_BODY_DOWNLOAD_BYTES)]
+    } else {
+        body
+    };
+    // Redact the token over the (coarsely bounded) body first — order matters for correctness, not
+    // just cost:
     // bounding first could leave a credential that straddles the byte cap present only as a prefix,
     // which the full-token `contains`/`replace` would then miss, and redacting after bounding could
     // also push the result back over the cap (`[REDACTED]` is longer than a short token). Scanning
@@ -1211,6 +1308,49 @@ mod tests {
         }
     }
 
+    /// Build a `reqwest::Response` directly, with no socket and no mock server, via reqwest's
+    /// `From<http::Response<_>>` impl. This is what makes the transport-layer read testable without
+    /// relaxing the client's `https_only(true)` guard — the Flex token rides in the request URL, so
+    /// a plaintext test server would mean building a client that is not the production one.
+    fn synthetic_response(status: u16, body: &'static str) -> reqwest::Response {
+        reqwest::Response::from(
+            http::Response::builder()
+                .status(status)
+                .body(body)
+                .expect("status and body are valid"),
+        )
+    }
+
+    #[tokio::test]
+    async fn read_status_and_body_keeps_a_1019_body_under_a_non_2xx_status() {
+        // The regression this pins, and the one no `interpret_*` test can catch: reverting
+        // `get_with_query` to `error_for_status()?.text().await?` discards the body on a non-2xx,
+        // so the retryable 1019 envelope never reaches `interpret_poll_response` and the poll
+        // aborts instead of retrying. Here the body must survive the non-success status intact.
+        let (status, body) = read_status_and_body(synthetic_response(503, GET_IN_PROGRESS))
+            .await
+            .expect("a non-success status must still yield its body");
+
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            classify_get_statement(&body).expect("body is a Flex envelope"),
+            GetStatementOutcome::InProgress,
+            "a 1019 arriving under a non-2xx status must still classify as retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_status_and_body_reads_a_success_body_in_full() {
+        // The success path is the statement payload and must not be routed through the error-path
+        // cap, which would silently truncate a large `<FlexQueryResponse>`.
+        let (status, body) = read_status_and_body(synthetic_response(200, GET_READY))
+            .await
+            .expect("success body reads");
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, GET_READY);
+    }
+
     #[test]
     fn http_status_body_is_token_scrubbed() {
         // A misconfigured proxy could reflect the request URL (with the `t=` token) into its error
@@ -1223,6 +1363,65 @@ mod tests {
                 assert!(body.contains("[REDACTED]"));
             }
             other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_message_is_token_scrubbed_under_2xx() {
+        // The `HttpStatus` path is covered above; this pins the sibling `Parse` path, which is only
+        // reachable under a *success* status and so never passes through `http_status_error`. A
+        // deserialiser message embeds fragments of the offending input, so a body that reflected the
+        // request line must not carry the credential into the stored error either. Both interpreters
+        // route their `Parse` arm through `finish_parse_error`; assert both.
+        let token = "super-secret-token";
+        // The root-element check formats the tag name verbatim into the message, so naming the root
+        // after the token is the shortest body that reflects it into a `Parse`.
+        let body = format!("<{token}/>");
+
+        match interpret_send_response(reqwest::StatusCode::OK, &body, token) {
+            Err(IbkrFlexError::Parse(message)) => {
+                assert!(
+                    !message.contains(token),
+                    "token must be redacted, got: {message}"
+                );
+                assert!(message.contains("[REDACTED]"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+
+        match interpret_poll_response(reqwest::StatusCode::OK, &body, token) {
+            Err(IbkrFlexError::Parse(message)) => {
+                assert!(
+                    !message.contains(token),
+                    "token must be redacted, got: {message}"
+                );
+                assert!(message.contains("[REDACTED]"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_message_is_bounded_under_2xx() {
+        // `Parse` messages derive from an unbounded 2xx `response.text()` read, so — unlike the
+        // `HttpStatus` path — `sanitize_error_body`'s trailing truncate is the *only* thing bounding
+        // them. Multi-byte chars confirm the cap lands on a char boundary rather than panicking.
+        let body = format!("<{}/>", "€".repeat(1000)); // 3000 bytes of tag name, exceeds the cap
+        match interpret_send_response(reqwest::StatusCode::OK, &body, "tok") {
+            Err(IbkrFlexError::Parse(message)) => {
+                // Guard against a vacuous pass: the short "empty or unreadable" fallback is under
+                // the cap regardless, so confirm this really is the input-reflecting message.
+                assert!(
+                    message.starts_with("unexpected"),
+                    "fixture must reach the root-element path, got: {message}"
+                );
+                assert!(
+                    message.len() <= MAX_ERROR_BODY_BYTES,
+                    "message bounded to the cap, got {} bytes",
+                    message.len()
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 
@@ -1277,13 +1476,102 @@ mod tests {
     }
 
     #[test]
-    fn flex_poll_policy_default_matches_constants() {
+    fn corporate_action_parse_scrubs_token_straddling_the_cap() {
+        // Sibling of `http_status_body_scrubs_token_straddling_the_cap`, for the path that reaches
+        // `Parse` through `fetch_corporate_actions`. Regression: `parse_corporate_actions` bounds its
+        // own message, so scrubbing its *result* (the previous shape) redacted an already-truncated
+        // string — a token straddling the cap survived as an unmatched prefix fragment, because both
+        // truncations used MAX_ERROR_BODY_BYTES and left no protective gap. The token is now threaded
+        // into the parse so redaction runs while the message is still unbounded.
+        let token = "SECRETTOKEN1234567890"; // 21 bytes
+        // Sweep the token across the cap rather than pinning one offset: the straddling position
+        // depends on the byte length of the message's fixed prefix, which is not a contract and
+        // shifts if the wording is ever edited. `straddled` guards against that drift silently
+        // emptying this test — without it, a reworded message could move the boundary outside the
+        // swept range and every assertion below would pass vacuously, losing the coverage that is
+        // the entire reason this test exists.
+        let mut straddled = false;
+        for pad in (MAX_ERROR_BODY_BYTES - 80)..(MAX_ERROR_BODY_BYTES - 40) {
+            let xml = format!("<{}{token}/>", "x".repeat(pad));
+            // The unscrubbed message the same input would produce. A genuine straddle shows up as a
+            // non-empty *proper prefix* of the token left at its end — distinct from the token
+            // landing entirely past the cap (nothing of it remains) or entirely before it (all of it
+            // remains), neither of which exercises the boundary.
+            let Err(IbkrFlexError::Parse(plain)) =
+                corporate_action::parse_corporate_actions_scrubbed(&xml, None)
+            else {
+                panic!("expected Parse from the token-less parse at pad {pad}");
+            };
+            straddled |= (1..token.len()).any(|cut| plain.ends_with(&token[..cut]));
+
+            match corporate_action::parse_corporate_actions_scrubbed(&xml, Some(token)) {
+                Err(IbkrFlexError::Parse(message)) => {
+                    assert!(
+                        !message.contains(token),
+                        "full token must be redacted at pad {pad}"
+                    );
+                    // A straddling leak surfaces as a token *prefix* left at the truncation
+                    // boundary, so check every prefix length rather than one fixed substring — a
+                    // 5-byte fragment is as much a credential leak as a 6-byte one.
+                    for cut in 1..token.len() {
+                        assert!(
+                            !message.ends_with(&token[..cut]),
+                            "a {cut}-byte token fragment survived the boundary at pad {pad}, got: {message}"
+                        );
+                    }
+                    assert!(
+                        message.len() <= MAX_ERROR_BODY_BYTES,
+                        "redaction must not push the message over the cap at pad {pad}, len = {}",
+                        message.len()
+                    );
+                }
+                other => panic!("expected Parse, got {other:?}"),
+            }
+        }
+        assert!(
+            straddled,
+            "the swept range no longer places the token across the {MAX_ERROR_BODY_BYTES}-byte cap \
+             — widen it, or this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn corporate_action_parse_without_a_token_is_still_bounded() {
+        // The public `parse_corporate_actions` has no credential in scope, so it only bounds. Pins
+        // that routing both callers through one finaliser did not drop the bound on the `None` arm.
+        let xml = format!("<{}/>", "€".repeat(1000)); // 3000 bytes of tag name, exceeds the cap
+        match parse_corporate_actions(&xml) {
+            Err(IbkrFlexError::Parse(message)) => assert!(
+                message.len() <= MAX_ERROR_BODY_BYTES,
+                "len = {}",
+                message.len()
+            ),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_error_body_bytes_is_the_documented_cap() {
+        // Pinned against a literal because the public rustdoc on `IbkrFlexError` states this bound as
+        // "1 KiB" in prose (it cannot link a private constant under
+        // `deny(rustdoc::private_intra_doc_links)`). Changing the constant without the docs would
+        // otherwise drift silently.
+        assert_eq!(MAX_ERROR_BODY_BYTES, 1024);
+    }
+
+    #[test]
+    fn flex_poll_policy_default_is_the_documented_budget() {
+        // Asserted against literals, not against the constants the impl already reads: comparing
+        // `Default::default()` to a struct built from those same constants is a tautology that
+        // holds for any value, and — since `POLL_INITIAL_DELAY` and `POLL_INTERVAL` are both 5s —
+        // would not even catch the two being transposed. These literals are the budget the public
+        // rustdoc promises (~65s total), so a change here is a deliberate, visible contract change.
         assert_eq!(
             FlexPollPolicy::default(),
             FlexPollPolicy {
-                initial_delay: POLL_INITIAL_DELAY,
-                interval: POLL_INTERVAL,
-                max_attempts: POLL_MAX_ATTEMPTS,
+                initial_delay: Duration::from_secs(5),
+                interval: Duration::from_secs(5),
+                max_attempts: 12,
             }
         );
     }

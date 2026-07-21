@@ -282,13 +282,13 @@ impl IbkrHistoricalData {
     ///   native unique identifier.
     /// - A mid-stream IB API error is surfaced two ways: ibapi 3.1+ yields it as
     ///   an `Err` on the tick iterator, so this method logs a `warn!`, ends
-    ///   iteration, and sets [`HistoricalTicks::truncated_by_error`] on the
+    ///   iteration, and sets [`HistoricalTicks::truncation_error`] on the
     ///   returned value (the ticks received before the error are still returned).
     ///   Separately, this method also emits a `warn!` when the number of raw ticks
     ///   received is less than `request.number_of_ticks`. Because a short batch is
     ///   also a normal end-of-data signal, treat that warning as a flag for
     ///   investigation (or a prompt to paginate), **not** as proof of an error;
-    ///   `truncated_by_error` is the authoritative signal for a confirmed error.
+    ///   `truncation_error.is_some()` is the authoritative signal for a confirmed error.
     pub async fn fetch_historical_ticks(
         &self,
         request: HistoricalTickRequest,
@@ -396,13 +396,13 @@ impl IbkrHistoricalData {
     /// - For larger ranges, paginate using last tick's timestamp as new `start`
     /// - A mid-stream IB API error is surfaced two ways: ibapi 3.1+ yields it as
     ///   an `Err` on the tick iterator, so this method logs a `warn!`, ends
-    ///   iteration, and sets [`HistoricalTicks::truncated_by_error`] on the
+    ///   iteration, and sets [`HistoricalTicks::truncation_error`] on the
     ///   returned value (the ticks received before the error are still returned).
     ///   Separately, this method also emits a `warn!` when the number of raw ticks
     ///   received is less than `request.number_of_ticks`. Because a short batch is
     ///   also a normal end-of-data signal, treat that warning as a flag for
     ///   investigation (or a prompt to paginate), **not** as proof of an error;
-    ///   `truncated_by_error` is the authoritative signal for a confirmed error.
+    ///   `truncation_error.is_some()` is the authoritative signal for a confirmed error.
     pub async fn fetch_historical_bid_ask(
         &self,
         request: HistoricalTickRequest,
