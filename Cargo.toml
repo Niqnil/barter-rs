@@ -54,6 +54,9 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 # Protocol
 url = { version = "2.5.4" }
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "json", "query"] }
+# HTTP type definitions. Used in tests to build synthetic `reqwest::Response`s via reqwest's
+# `From<http::Response<_>>`; already in the tree as a reqwest dependency.
+http = { version = "1" }
 tokio-tungstenite = { version = "0.30.0", features = ["url","rustls-tls-webpki-roots"] }
 
 # Data Structures

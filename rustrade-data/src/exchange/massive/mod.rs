@@ -82,6 +82,7 @@ mod corporate_action;
 mod error;
 pub(crate) mod live;
 pub(crate) mod options;
+mod pagination;
 pub(crate) mod reference;
 pub(crate) mod rest;
 pub(crate) mod transformer;

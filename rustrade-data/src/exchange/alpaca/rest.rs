@@ -79,9 +79,7 @@ pub enum AlpacaRestError {
 ///
 /// Holds the configured [`reqwest::Client`] (with auth headers + timeout) plus the broker and data
 /// API base URLs. Endpoint-family wrappers (`AlpacaOptionsClient`, the corporate-action source, …)
-/// build requests against these bases and drive them through [`request_with_retry`].
-///
-/// [`request_with_retry`]: AlpacaRestClient::request_with_retry
+/// build requests against these bases and drive them through a shared retrying request helper.
 #[derive(Clone)]
 pub struct AlpacaRestClient {
     http: reqwest::Client,

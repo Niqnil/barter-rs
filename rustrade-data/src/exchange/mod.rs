@@ -60,6 +60,13 @@ pub mod massive;
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;
 
+/// Internal HTTP helpers shared by the REST-based exchange integrations (Massive, IBKR Flex,
+/// Binance).
+///
+/// Not feature-gated: the Binance surface is always compiled and uses every helper here, so all
+/// three REST clients bound their error-path body reads identically.
+pub(crate) mod http;
+
 /// Default [`Duration`] the [`Connector::SubValidator`] will wait to receive all success responses to actioned
 /// `Subscription` requests.
 pub const DEFAULT_SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);

@@ -1,10 +1,9 @@
 //! Alpaca corporate-actions reference data (`GET /v1beta1/corporate-actions`).
 //!
-//! The raw REST surface behind the [`StockSplitSource`] adapter (see
-//! [`corporate_action`](super::corporate_action)): a [`CorporateActionsQuery`] builder, the nested
-//! response types, and the paginated [`AlpacaRestClient::fetch_splits_raw`] stream. Only stock-split
-//! actions are requested (`types=forward_split,reverse_split`); each row is normalised into an
-//! [`AlpacaStockSplit`].
+//! The raw REST surface behind the [`StockSplitSource`] adapter: a [`CorporateActionsQuery`]
+//! builder, the nested response types, and the paginated
+//! [`AlpacaRestClient::fetch_splits_raw`] stream. Only stock-split actions are requested
+//! (`types=forward_split,reverse_split`); each row is normalised into an [`AlpacaStockSplit`].
 //!
 //! # Date semantics
 //!
@@ -12,8 +11,8 @@
 //! re-bases and the price adjusts (observed equal to `process_date` across every sampled split).
 //! It is the field the [`StockSplitSource`] adapter maps onto the descriptor's `effective_date`.
 //! Alpaca also returns `payable_date`, which can fall a trading day *before* `ex_date` for forward
-//! splits and therefore must NOT be used as the effective date — see
-//! [`corporate_action`](super::corporate_action) for the full rationale.
+//! splits and therefore must NOT be used as the effective date: an effective date earlier than the
+//! true ex-date would re-base a position before the market actually did.
 //!
 //! [`StockSplitSource`]: rustrade_integration::corporate_action::StockSplitSource
 
@@ -64,7 +63,7 @@ pub struct CorporateActionsQuery {
     pub start: Option<NaiveDate>,
     /// Inclusive upper bound on the action's effective date.
     pub end: Option<NaiveDate>,
-    /// Results per page (clamped to [`MAX_LIMIT`]).
+    /// Results per page (clamped to 1000, the API maximum).
     pub limit: Option<u16>,
 }
 
@@ -214,7 +213,7 @@ impl AlpacaRestClient {
     ///
     /// Returns a stream that handles `page_token` pagination automatically, yielding each
     /// forward/reverse split as a normalised [`AlpacaStockSplit`]. The stream stops after
-    /// [`MAX_PAGES`] pages as a safety bound and logs a warning if that limit is hit.
+    /// 1000 pages as a safety bound and logs a warning if that limit is hit.
     ///
     /// # Example
     ///
@@ -311,6 +310,17 @@ mod tests {
     fn query_limit_clamped_to_max() {
         let params = CorporateActionsQuery::new().limit(5000).to_query_params();
         assert!(params.iter().any(|(k, v)| *k == "limit" && v == "1000"));
+    }
+
+    #[test]
+    fn documented_limits_match_their_constants() {
+        // Pinned against literals because the public rustdoc states both bounds in prose ("clamped
+        // to 1000", "1000 pages") — it cannot link these private constants under
+        // `deny(rustdoc::private_intra_doc_links)`. Without this, changing a constant would leave
+        // the documented contract silently wrong. `MAX_LIMIT` is also covered indirectly by the
+        // wire-param assertions above; `MAX_PAGES` has no other pin.
+        assert_eq!(MAX_LIMIT, 1000);
+        assert_eq!(MAX_PAGES, 1000);
     }
 
     #[test]
