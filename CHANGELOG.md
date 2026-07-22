@@ -396,6 +396,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an already-bounded message would leave a credential straddling the cap present as an unmatched
   prefix fragment, and both cuts use the same width, leaving no protective gap.
   `Parse` is now bounded on every path and scrubbed on every path where a token is in scope.
+- **Token-scrubbed and bounded `IbkrFlexError::Flex`** (`rustrade-data`, `ibkr` feature). A terminal
+  Flex error's `message` is the `<ErrorMessage>` element lifted verbatim from the same server-supplied
+  body that `HttpStatus`/`Parse` already scrub, so a proxy reflecting the request line into it could
+  carry the `t=` token into the stored error, and an oversized element could bloat it. Both fields
+  (`code` and `message`) now pass through the same redact-before-bound path (capped at 1 KiB) when the
+  interpreter finalises a Flex error; the scrub is a no-op for a real numeric Flex code/message. No
+  public API change and no change for well-behaved responses.
 - Upgraded `anyhow` to 1.0.103 and `quick-xml` to 0.41.0 to clear three RUSTSEC advisories:
   RUSTSEC-2026-0190 (unsoundness in `anyhow::Error::downcast_mut`), RUSTSEC-2026-0194 (quadratic
   run time when checking a start tag for duplicate attribute names) and RUSTSEC-2026-0195

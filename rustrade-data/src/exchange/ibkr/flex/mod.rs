@@ -85,6 +85,28 @@ const GENERATION_IN_PROGRESS_CODE: &str = "1019";
 /// and IBKR error envelopes are tiny; this only bounds an unexpectedly large proxy/CDN error page.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 
+// The redact-before-bound ordering in `sanitize_error_body` is only safe while the *gap* between the
+// download and retained caps exceeds the token length. A token straddling the coarse
+// `MAX_ERROR_BODY_DOWNLOAD_BYTES` pre-bound survives redaction as an unmatched prefix fragment pinned
+// to the tail of the pre-bounded slice: it ends at the download cap, so a fragment of length `f`
+// starts at `MAX_ERROR_BODY_DOWNLOAD_BYTES - f`. The final `MAX_ERROR_BODY_BYTES` truncation discards
+// it when that start lands at or past the retained cap — i.e. when `f` is at most the gap
+// `MAX_ERROR_BODY_DOWNLOAD_BYTES - MAX_ERROR_BODY_BYTES`. A straddling fragment is always shorter than
+// the whole token, so once the gap exceeds the longest possible token every such fragment is
+// truncated away. That is the invariant.
+//
+// The assert below is a proportional proxy for that gap, not a proof for arbitrary token lengths: a
+// 4x ratio keeps the gap at a floor of 3 * MAX_ERROR_BODY_BYTES (3 KiB at the current retained cap;
+// the actual current gap is far larger), which dwarfs any real Flex token (a short opaque string).
+// Its job is to fail the build — the two constants live in different modules — if a future edit
+// collapses the caps close enough together to shrink that margin below a plausible token, silently
+// reopening the straddling leak.
+const _: () = assert!(
+    MAX_ERROR_BODY_DOWNLOAD_BYTES >= MAX_ERROR_BODY_BYTES * 4,
+    "MAX_ERROR_BODY_DOWNLOAD_BYTES must stay well above MAX_ERROR_BODY_BYTES so a token straddling \
+     the download-cap boundary is truncated away by the retained-cap bound (see sanitize_error_body)"
+);
+
 /// Errors from IBKR Flex Web Service operations.
 ///
 /// `#[non_exhaustive]`: the Flex service may introduce new failure conditions over time, so new
@@ -143,11 +165,18 @@ pub enum IbkrFlexError {
     },
 
     /// The Flex service returned a non-success status (e.g. invalid token, throttled, expired).
+    ///
+    /// `message` is the `<ErrorMessage>` element lifted from a server-supplied body, so — like
+    /// [`IbkrFlexError::HttpStatus`] and [`IbkrFlexError::Parse`] — both fields are bounded to 1 KiB
+    /// and **token-scrubbed** before storage: a proxy that reflected the request line into its
+    /// `<ErrorMessage>` could otherwise carry the `t=` Flex token into it. The scrub is a no-op for a
+    /// real numeric Flex code/message that does not contain the token.
     #[error("Flex service error ({code}): {message}")]
     Flex {
-        /// The Flex `ErrorCode` (empty if the response carried none).
+        /// The Flex `ErrorCode` (empty if the response carried none), bounded and token-scrubbed
+        /// like `message`.
         code: String,
-        /// The Flex `ErrorMessage` (or a synthesised description).
+        /// The Flex `ErrorMessage` (or a synthesised description), bounded and token-scrubbed.
         message: String,
     },
 
@@ -737,6 +766,23 @@ fn flex_error(resp: FlexStatementResponse, stage: &str) -> IbkrFlexError {
     }
 }
 
+/// Scrub the Flex `token` from, and bound, a terminal [`IbkrFlexError::Flex`]'s fields.
+///
+/// A `Flex` error's `message` is the `<ErrorMessage>` element lifted verbatim from a server-supplied
+/// body — the same untrusted source [`IbkrFlexError::HttpStatus`] and [`IbkrFlexError::Parse`]
+/// scrub. A body that reflected the request line (a misconfigured proxy echoing `?t=<TOKEN>` into
+/// its `<ErrorMessage>`) could otherwise carry the credential into the stored error, and an
+/// oversized element could bloat it. `code` is a short structured field in practice, but running it
+/// through the same [`sanitize_error_body`] (redact-before-bound, capped at [`MAX_ERROR_BODY_BYTES`])
+/// costs nothing on this error path and closes the gap uniformly — the scrub is a no-op for a real
+/// numeric Flex code that does not contain the token.
+fn scrub_flex_error(code: String, message: String, token: &str) -> IbkrFlexError {
+    IbkrFlexError::Flex {
+        code: sanitize_error_body(&code, token),
+        message: sanitize_error_body(&message, token),
+    }
+}
+
 /// Interpret a SendRequest response given its HTTP `status` and `body`.
 ///
 /// The body is parsed as a Flex envelope **first**, so an IBKR application error that arrives under
@@ -744,7 +790,9 @@ fn flex_error(resp: FlexStatementResponse, stage: &str) -> IbkrFlexError {
 /// token). A body that is *not* a recognizable Flex envelope under a non-success status becomes
 /// [`IbkrFlexError::HttpStatus`] (a proxy/CDN error page) rather than a misleading XML parse error;
 /// the same malformed body under a 2xx status stays a genuine [`IbkrFlexError::Parse`] — with its
-/// message token-scrubbed, since an XML deserialiser embeds fragments of the offending input.
+/// message token-scrubbed, since an XML deserialiser embeds fragments of the offending input. A
+/// genuine Flex error envelope surfaces as [`IbkrFlexError::Flex`], its fields likewise scrubbed and
+/// bounded ([`scrub_flex_error`]), since `<ErrorMessage>` is server-supplied free text.
 fn interpret_send_response(
     status: reqwest::StatusCode,
     body: &str,
@@ -755,6 +803,7 @@ fn interpret_send_response(
             Err(http_status_error(status, body, token))
         }
         Err(IbkrFlexError::Parse(message)) => Err(finish_parse_error(message, Some(token))),
+        Err(IbkrFlexError::Flex { code, message }) => Err(scrub_flex_error(code, message, token)),
         other => other,
     }
 }
@@ -765,7 +814,8 @@ fn interpret_send_response(
 /// non-2xx status is still recognized as retryable — previously `error_for_status` aborted the poll
 /// before the body was classified. A body that is not a recognizable Flex envelope under a
 /// non-success status becomes [`IbkrFlexError::HttpStatus`]; a terminal Flex error envelope under a
-/// non-2xx status stays the richer [`IbkrFlexError::Flex`].
+/// non-2xx status stays the richer [`IbkrFlexError::Flex`], its fields scrubbed and bounded
+/// ([`scrub_flex_error`]) since `<ErrorMessage>` is server-supplied free text.
 fn interpret_poll_response(
     status: reqwest::StatusCode,
     body: &str,
@@ -776,6 +826,7 @@ fn interpret_poll_response(
             Err(http_status_error(status, body, token))
         }
         Err(IbkrFlexError::Parse(message)) => Err(finish_parse_error(message, Some(token))),
+        Err(IbkrFlexError::Flex { code, message }) => Err(scrub_flex_error(code, message, token)),
         other => other,
     }
 }
@@ -789,11 +840,22 @@ fn interpret_poll_response(
 /// therefore carry the credential into the stored error, which [`IbkrFlexError::HttpStatus`] is
 /// already protected against but this variant was not.
 ///
-/// **Every** `Parse` in this module is constructed here, including the token-less case, so that the
-/// redact-before-bound ordering exists in exactly one place. That ordering is a security invariant,
-/// not an implementation detail: redaction matches the full token, so bounding first can leave a
-/// credential straddling the cap present only as an unmatched prefix fragment. Two helpers that had
-/// to be kept in step would be one edit away from diverging on it.
+/// This is the single **finaliser** for a `Parse` that leaves the module — not the single
+/// construction point. The raw parsers [`parse_send_request_response`] and [`classify_get_statement`]
+/// build *unbounded, unscrubbed* `Parse` values directly, but they are private and every production
+/// caller routes their `Err(Parse(_))` back through here (or, for a non-2xx non-envelope body,
+/// through [`http_status_error`]): see [`interpret_send_response`]/[`interpret_poll_response`], and
+/// [`parse_corporate_actions_scrubbed`](corporate_action::parse_corporate_actions_scrubbed) for the
+/// statement re-parse. Keeping the redact-before-bound ordering in exactly one place is what makes
+/// that safe: it is a security invariant, not an implementation detail — redaction matches the full
+/// token, so bounding first can leave a credential straddling the cap present only as an unmatched
+/// prefix fragment. A finaliser duplicated across callers would be one edit away from diverging on
+/// it.
+///
+/// Maintainer corollary: the guarantee is caller discipline over two private parsers, **not** a
+/// property the type system enforces. A *new* call site for either raw parser must route its `Parse`
+/// through this function (or `http_status_error`) too, or it reintroduces the unbounded/unscrubbed
+/// leak this exists to prevent.
 ///
 /// `message` must therefore arrive unbounded — a caller that has already truncated at
 /// [`MAX_ERROR_BODY_BYTES`] has already lost the guarantee, and passing it here cannot recover it.
@@ -1290,6 +1352,98 @@ mod tests {
         match interpret_poll_response(reqwest::StatusCode::BAD_REQUEST, GET_FAIL, "tok") {
             Err(IbkrFlexError::Flex { code, .. }) => assert_eq!(code, "1020"),
             other => panic!("expected Flex error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_send_response_flex_error_message_is_token_scrubbed() {
+        // A genuine Flex error envelope's <ErrorMessage> is server-supplied free text — a
+        // misconfigured proxy could reflect the request line (with the `t=` token) into it. The
+        // stored Flex error must never carry the credential, the same protection HttpStatus/Parse
+        // already have. The Flex code is still preserved so consumers can match on it.
+        let token = "super-secret-token";
+        let body = format!(
+            "<FlexStatementResponse><Status>Fail</Status><ErrorCode>1003</ErrorCode>\
+             <ErrorMessage>invalid token for GET /SendRequest?t={token}&amp;q=1&amp;v=3</ErrorMessage>\
+             </FlexStatementResponse>"
+        );
+        match interpret_send_response(reqwest::StatusCode::OK, &body, token) {
+            Err(IbkrFlexError::Flex { code, message }) => {
+                assert_eq!(code, "1003", "the Flex code is preserved for matching");
+                assert!(
+                    !message.contains(token),
+                    "token must be redacted, got: {message}"
+                );
+                assert!(message.contains("[REDACTED]"));
+            }
+            other => panic!("expected Flex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_poll_response_flex_error_message_is_token_scrubbed() {
+        // Sibling of the SendRequest case above, for the GetStatement poll path.
+        let token = "super-secret-token";
+        let body = format!(
+            "<FlexStatementResponse><Status>Fail</Status><ErrorCode>1020</ErrorCode>\
+             <ErrorMessage>bad reference for GET /GetStatement?t={token}&amp;q=1&amp;v=3</ErrorMessage>\
+             </FlexStatementResponse>"
+        );
+        match interpret_poll_response(reqwest::StatusCode::OK, &body, token) {
+            Err(IbkrFlexError::Flex { code, message }) => {
+                assert_eq!(code, "1020");
+                assert!(
+                    !message.contains(token),
+                    "token must be redacted, got: {message}"
+                );
+                assert!(message.contains("[REDACTED]"));
+            }
+            other => panic!("expected Flex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_send_response_flex_error_code_is_token_scrubbed() {
+        // `scrub_flex_error` runs `code` through the same redact-before-bound path as `message`, so a
+        // token reflected into a `<ErrorCode>` (a no-op for the real numeric codes IBKR returns, but
+        // the field is still server-supplied) must not survive into the stored error either.
+        let token = "super-secret-token";
+        let body = format!(
+            "<FlexStatementResponse><Status>Fail</Status>\
+             <ErrorCode>bogus t={token}</ErrorCode>\
+             <ErrorMessage>rejected</ErrorMessage></FlexStatementResponse>"
+        );
+        match interpret_send_response(reqwest::StatusCode::OK, &body, token) {
+            Err(IbkrFlexError::Flex { code, message }) => {
+                assert!(
+                    !code.contains(token),
+                    "token must be redacted from code, got: {code}"
+                );
+                assert!(code.contains("[REDACTED]"));
+                assert_eq!(message, "rejected");
+            }
+            other => panic!("expected Flex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flex_error_message_is_bounded() {
+        // A `Flex` message derives from an unbounded 2xx `response.text()` read, so an adversarial or
+        // buggy server returning a well-formed Flex error envelope with a huge <ErrorMessage> must be
+        // bounded like HttpStatus/Parse, not stored whole. Multi-byte chars confirm the cap lands on
+        // a char boundary rather than panicking.
+        let body = format!(
+            "<FlexStatementResponse><Status>Fail</Status><ErrorCode>1003</ErrorCode>\
+             <ErrorMessage>{}</ErrorMessage></FlexStatementResponse>",
+            "€".repeat(1000) // 3000 bytes, exceeds the 1024-byte cap
+        );
+        match interpret_send_response(reqwest::StatusCode::OK, &body, "tok") {
+            Err(IbkrFlexError::Flex { message, .. }) => assert!(
+                message.len() <= MAX_ERROR_BODY_BYTES,
+                "message bounded to the cap, got {} bytes",
+                message.len()
+            ),
+            other => panic!("expected Flex, got {other:?}"),
         }
     }
 
