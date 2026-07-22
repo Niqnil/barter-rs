@@ -276,6 +276,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `OptionPositionsRequireIdentityChange` (non-standard, wrapper-handled). Relevant only to code
   tracking this unreleased development line, where both the old and new variants are pre-release.
 
+- **BREAKING**: **`Ord`/`PartialOrd` on `Timed<T>` — and transitively on
+  `DefaultInstrumentMarketData` (`Ord`/`PartialOrd`) and `AssetState` (`PartialOrd`)** (`rustrade`).
+  The derived `Timed` ordering compared `value` before `time`, so `Vec<Timed<_>>::sort()` silently
+  produced a value-sorted, non-chronological order — and a time-first ordering is no safer (it would
+  collapse same-instant entries in `BTreeSet`/`BinaryHeap` via the `Ord`/`Eq` contract). Ordering is
+  now intentionally not provided; sorting on a chosen field fails to compile instead of silently
+  misbehaving. Migration: `events.sort_by_key(|timed| timed.time)` for chronological order (the
+  in-tree practice already everywhere). The two containing types lose their (equally meaningless,
+  lexicographic field-order) derived orderings with it.
+
 ### Fixed
 
 - **Published rustdoc no longer points at items readers cannot open** (`rustrade-data`). Twelve
