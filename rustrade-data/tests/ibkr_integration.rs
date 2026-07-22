@@ -934,11 +934,15 @@ async fn resolve_aapl_call_option(client: &IbkrHistoricalData) -> Contract {
         .expect("fetch AAPL option chain to resolve a valid option contract");
 
     // Prefer the standard SMART "AAPL" trading class (densest, most reliable
-    // strike/expiration coverage); fall back to any returned chain.
+    // strike/expiration coverage); fall back to any returned chain. Partial
+    // results are acceptable here: even a truncated enumeration is usable as
+    // long as it contains one workable entry (each entry is complete in
+    // isolation), which is exactly what `OptionChainResult` preserves.
     let chain = chains
+        .entries
         .iter()
         .find(|c| c.exchange == "SMART" && c.trading_class == "AAPL")
-        .or_else(|| chains.first())
+        .or_else(|| chains.entries.first())
         .expect("at least one AAPL option chain entry");
 
     // Earliest expiration at least ~2 weeks out: avoids about-to-expire
@@ -1119,7 +1123,8 @@ async fn test_fetch_option_chain() {
         .await;
 
     match chains {
-        Ok(entries) => {
+        Ok(result) => {
+            let entries = &result.entries;
             println!("Received {} option chain entries:", entries.len());
             for (i, entry) in entries.iter().take(3).enumerate() {
                 println!("Entry {}:", i + 1);
@@ -1141,6 +1146,15 @@ async fn test_fetch_option_chain() {
                     );
                 }
             }
+
+            // The pre-`OptionChainResult` API surfaced a mid-stream IB error as
+            // a bare `Err`; assert the flag so a truncated (but non-empty)
+            // enumeration still fails this test with the recorded reason.
+            assert!(
+                result.truncation_error.is_none(),
+                "option chain enumeration was truncated: {:?}",
+                result.truncation_error
+            );
 
             assert!(
                 !entries.is_empty(),

@@ -142,6 +142,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `IbkrHistoricalData::fetch_option_chain` now returns `OptionChainResult`, and no
+  longer discards already-decoded entries on a mid-stream IB error** (`rustrade-data`, `ibkr`
+  feature). The method previously failed fast on the first error yielded mid-enumeration,
+  returning `Err` and dropping every `OptionChainEntry` already received — even though each entry
+  is decoded from one complete IB message and is valid in isolation. It now mirrors the historical
+  tick methods: entries received before the error are returned in the new `#[non_exhaustive]`
+  `OptionChainResult { entries, truncation_error }`, with `truncation_error: Some(reason)` flagging
+  a confirmed early end of enumeration (`None` on a clean end — which also disambiguates a
+  legitimately empty catalog, e.g. a routing-`exchange` filter, from a truncated one).
+  Migration: read the entries via `result.entries` (or iterate the result directly —
+  `IntoIterator` yields the entries, preserving the old `for chain in chains` ergonomics) and
+  check `result.truncation_error` where completeness matters. (#184)
 - **`MassiveError` is now `#[non_exhaustive]`** (`rustrade-data`). Lets new variants (such as the
   pagination-robustness errors above) be added without further breaking changes. **Breaking** for
   downstream code matching `MassiveError` exhaustively — add a wildcard (`_`) arm.

@@ -43,7 +43,7 @@
 //! };
 //!
 //! let fetched = client.fetch_historical_ticks(request).await?;
-//! let trades = fetched.ticks; // `fetched.truncated_by_error` flags a short read
+//! let trades = fetched.ticks; // `fetched.truncation_error` flags a confirmed short read
 //! ```
 //!
 //! # Why Vec Instead of Stream
@@ -263,7 +263,7 @@ impl IbkrHistoricalData {
     /// # Returns
     ///
     /// A [`HistoricalTicks`] carrying the trades in chronological order plus a
-    /// `truncated_by_error` flag. Invalid ticks (non-finite prices) are filtered
+    /// `truncation_error` flag. Invalid ticks (non-finite prices) are filtered
     /// out with a warning.
     ///
     /// # Errors
@@ -383,7 +383,7 @@ impl IbkrHistoricalData {
     /// # Returns
     ///
     /// A [`HistoricalTicks`] carrying the L1 quotes in chronological order plus a
-    /// `truncated_by_error` flag. Invalid ticks (non-finite prices) are filtered
+    /// `truncation_error` flag. Invalid ticks (non-finite prices) are filtered
     /// out with a warning.
     ///
     /// # Errors
@@ -667,11 +667,24 @@ impl IbkrHistoricalData {
     ///
     /// # Returns
     ///
-    /// Vector of [`OptionChainEntry`] for each exchange/trading class combination.
+    /// An [`OptionChainResult`] carrying one [`OptionChainEntry`] per
+    /// exchange/trading-class combination plus a
+    /// [`truncation_error`](OptionChainResult::truncation_error) flag.
     ///
     /// # Errors
     ///
-    /// Returns `DataError::Socket` if IB rejects the request.
+    /// Returns `DataError::Socket` if IB rejects the request up front.
+    ///
+    /// # Notes
+    ///
+    /// A mid-stream IB error (pacing/permission error, decode failure,
+    /// disconnect) does **not** discard the entries already decoded: each entry
+    /// is built from one complete IB message, so every received entry is valid
+    /// in isolation. This method logs a `warn!`, ends enumeration, and sets
+    /// [`OptionChainResult::truncation_error`] on the returned value — the
+    /// same contract as [`fetch_historical_ticks`](Self::fetch_historical_ticks).
+    /// Check `truncation_error.is_none()` before treating the entry list as the
+    /// complete chain catalog.
     ///
     /// # Example
     ///
@@ -681,6 +694,9 @@ impl IbkrHistoricalData {
     /// // 265598 is AAPL's underlying conId; resolve via contract details for other symbols.
     /// // Empty exchange returns every exchange's option parameters.
     /// let chains = client.fetch_option_chain("AAPL", "", SecurityType::Stock, 265598).await?;
+    /// if let Some(reason) = &chains.truncation_error {
+    ///     eprintln!("chain enumeration was cut short: {reason}");
+    /// }
     /// for chain in chains {
     ///     println!("Exchange: {}, Expirations: {:?}", chain.exchange, chain.expirations);
     /// }
@@ -691,7 +707,7 @@ impl IbkrHistoricalData {
         exchange: &str,
         security_type: SecurityType,
         contract_id: i32,
-    ) -> Result<Vec<OptionChainEntry>, DataError> {
+    ) -> Result<OptionChainResult, DataError> {
         let client = self.client.clone();
         let symbol = symbol.to_string();
         let exchange = exchange.to_string();
@@ -707,17 +723,39 @@ impl IbkrHistoricalData {
                 .option_chain(&symbol, &exchange, security_type, contract_id)
                 .map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
 
-            // ibapi 3.x: `iter_data()` yields `Result<OptionChain, Error>`, filtering
-            // subscription-level notices. Surface the first error to the caller.
-            let mut entries = Vec::with_capacity(16);
-            for chain in subscription.iter_data() {
-                let chain = chain.map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
-                entries.push(OptionChainEntry::from_ib(&chain));
-            }
+            // ibapi 3.x: `iter_data()` yields `Result<OptionChain, Error>`,
+            // filtering subscription-level notices, so an `Err` here is a
+            // genuine mid-stream failure. Option chains use the same
+            // Subscription/StreamDecoder machinery as historical ticks (N
+            // complete per-exchange messages + an end sentinel swallowed as
+            // `EndOfStream`), so mirror the tick methods: keep the entries
+            // already decoded — each is a complete, valid message — record the
+            // reason, and stop, instead of discarding them with a fail-fast Err.
+            let (entries, _received, truncation_error) = drain_until_error(
+                subscription.iter_data(),
+                16,
+                |chain, _seq| Some(OptionChainEntry::from_ib(chain)),
+                |e| {
+                    warn!(
+                        symbol = %symbol,
+                        error = %e,
+                        "Option chain enumeration ended with an IB error; \
+                         entries may be incomplete"
+                    );
+                },
+            );
 
-            debug!(symbol = %symbol, count = entries.len(), "Received option chain entries");
+            debug!(
+                symbol = %symbol,
+                count = entries.len(),
+                truncation_error = ?truncation_error,
+                "Received option chain entries"
+            );
 
-            Ok::<_, DataError>(entries)
+            Ok::<_, DataError>(OptionChainResult {
+                entries,
+                truncation_error,
+            })
         })
         .await
         .map_err(|e| {
@@ -897,33 +935,78 @@ impl<T> IntoIterator for HistoricalTicks<T> {
     }
 }
 
-/// Drain a tick iterator into a `HistoricalTicks<Out>`, stopping at the first
-/// `Err` yielded by `iter`. `iter_data()` already filters non-fatal notices, so
-/// an `Err` here is a genuine mid-stream failure, not a warning-level notice.
+/// Outcome of an option chain fetch.
 ///
-/// `map(&raw, seq)` decodes/validates a raw tick; `seq` is the zero-based index
-/// among *raw* ticks received so far (gaps from rejected ticks are not reflected
-/// in `seq`, matching the numbering `tick_last_to_public_trade` uses for ID
-/// generation). Returning `None` from `map` silently drops an invalid tick — a
-/// data-quality filter that does **not** set `truncation_error`.
+/// Wraps the collected [`OptionChainEntry`]s together with whether enumeration
+/// was cut short by a mid-stream IB error. An empty `entries` on its own is
+/// ambiguous — a wrong `exchange` filter also legitimately returns zero rows —
+/// so [`truncation_error`](Self::truncation_error) disambiguates the
+/// *confirmed* error case, letting callers react programmatically (retry,
+/// alert) instead of parsing logs.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionChainResult {
+    /// Entries received before enumeration ended, one per
+    /// (exchange, trading class) combination.
+    ///
+    /// Each entry is decoded from one complete IB message, so every entry
+    /// present is valid in isolation even when the enumeration was truncated.
+    pub entries: Vec<OptionChainEntry>,
+
+    /// `Some(reason)` if a mid-stream IB error ended enumeration early —
+    /// `reason` is the formatted `ibapi::Error` — meaning
+    /// [`entries`](Self::entries) may be incomplete. `None` on a clean
+    /// end-of-enumeration; an empty `entries` with `None` means the underlying
+    /// genuinely has no listed options for the requested `exchange` filter,
+    /// not an error.
+    ///
+    /// The reason is a formatted string rather than a typed error for the same
+    /// reasons as [`HistoricalTicks::truncation_error`]: do not match on the
+    /// string contents — treat it as human-facing detail and use `.is_some()`
+    /// as the programmatic "was this truncated?" check.
+    pub truncation_error: Option<String>,
+}
+
+/// Consumes the wrapper and iterates its [`entries`](OptionChainResult::entries),
+/// discarding [`truncation_error`](OptionChainResult::truncation_error). Lets
+/// callers that only need the data write `for chain in chains { .. }`, matching
+/// the pre-`OptionChainResult` `Vec<OptionChainEntry>` ergonomics; inspect the
+/// flag before iterating when truncation matters.
+impl IntoIterator for OptionChainResult {
+    type Item = OptionChainEntry;
+    type IntoIter = std::vec::IntoIter<OptionChainEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+/// Drain a subscription iterator, stopping at the first `Err` yielded by
+/// `iter`. Shared by `collect_ticks` and `fetch_option_chain` — both consume
+/// the same `Subscription`/`iter_data()` machinery, whose `Err` is a genuine
+/// mid-stream failure, not a warning-level notice (`iter_data()` already
+/// filters non-fatal notices).
 ///
-/// `on_error(&err)` runs exactly once, when `iter` yields `Err`, so callers can
-/// log a stream-specific message (trade vs. bid/ask wording and fields differ)
-/// before this function records the formatted reason in
-/// `HistoricalTicks::truncation_error` and stops. The generic short-fetch
-/// warning (`warn_if_short_tick_fetch`) fires only on a clean end-of-data —
-/// never alongside a confirmed truncation — so call sites no longer need to
-/// guard against a double warning themselves.
-fn collect_ticks<Raw, Out>(
+/// `map(&raw, seq)` decodes/validates a raw item; `seq` is the zero-based
+/// index among *raw* items received so far (gaps from rejected items are not
+/// reflected in `seq`, matching the numbering `tick_last_to_public_trade` uses
+/// for ID generation). Returning `None` from `map` silently drops an invalid
+/// item — a data-quality filter that does **not** count as truncation.
+///
+/// `on_error(&err)` runs exactly once, when `iter` yields `Err`, so callers
+/// can log a stream-specific message before this function records the
+/// formatted reason and stops.
+///
+/// Returns `(items, received, truncation_error)`, where `received` counts
+/// *raw* items pulled from `iter` before `map`'s filtering — so it reflects
+/// wire truncation rather than data-quality drops.
+fn drain_until_error<Raw, Out>(
     iter: impl Iterator<Item = Result<Raw, ibapi::Error>>,
-    symbol: &str,
-    requested: i32,
+    capacity: usize,
     mut map: impl FnMut(&Raw, usize) -> Option<Out>,
-    mut on_error: impl FnMut(&ibapi::Error),
-) -> HistoricalTicks<Out> {
-    // Pre-size to the requested count (IB caps this at 1000); a mid-stream error
-    // or short end-of-data only ever leaves this over-allocated, never under.
-    let mut ticks = Vec::with_capacity(usize::try_from(requested).unwrap_or(0));
+    on_error: impl FnOnce(&ibapi::Error),
+) -> (Vec<Out>, usize, Option<String>) {
+    let mut items = Vec::with_capacity(capacity);
     let mut received = 0usize;
     let mut truncation_error = None;
 
@@ -938,9 +1021,29 @@ fn collect_ticks<Raw, Out>(
         };
         received += 1;
         if let Some(out) = map(&raw, seq) {
-            ticks.push(out);
+            items.push(out);
         }
     }
+
+    (items, received, truncation_error)
+}
+
+/// Drain a tick iterator into a `HistoricalTicks<Out>` via
+/// [`drain_until_error`], layering the tick-specific short-fetch heuristic on
+/// top: the generic warning (`warn_if_short_tick_fetch`) fires only on a clean
+/// end-of-data — never alongside a confirmed truncation — so call sites no
+/// longer need to guard against a double warning themselves.
+fn collect_ticks<Raw, Out>(
+    iter: impl Iterator<Item = Result<Raw, ibapi::Error>>,
+    symbol: &str,
+    requested: i32,
+    map: impl FnMut(&Raw, usize) -> Option<Out>,
+    on_error: impl FnOnce(&ibapi::Error),
+) -> HistoricalTicks<Out> {
+    // Pre-size to the requested count (IB caps this at 1000); a mid-stream error
+    // or short end-of-data only ever leaves this over-allocated, never under.
+    let capacity = usize::try_from(requested).unwrap_or(0);
+    let (ticks, received, truncation_error) = drain_until_error(iter, capacity, map, on_error);
 
     // Only run the ambiguous short-batch heuristic when the stream ended
     // gracefully; a confirmed truncation is already recorded and logged above.
@@ -1594,5 +1697,84 @@ mod tests {
             fetched.truncation_error, None,
             "filtering is not truncation"
         );
+    }
+
+    // ========================================================================
+    // drain_until_error: shared drain loop (ticks + option chains)
+    // ========================================================================
+    //
+    // The `collect_ticks` tests above exercise the helper through the tick
+    // path; these drive it directly with `OptionChain` items — the
+    // `fetch_option_chain` usage, whose truncation branch the live
+    // integration tests cannot reach without a real IB Gateway.
+
+    fn make_option_chain(exchange: &str) -> ibapi::contracts::OptionChain {
+        ibapi::contracts::OptionChain {
+            underlying_contract_id: 265598,
+            trading_class: "AAPL".to_string(),
+            multiplier: "100".to_string(),
+            exchange: exchange.to_string(),
+            expirations: vec!["20300118".to_string()],
+            strikes: vec![100.0, 105.0],
+        }
+    }
+
+    #[test]
+    fn drain_until_error_keeps_entries_decoded_before_the_error() {
+        // Two good chains, then an IB error, then a chain that must never be
+        // reached because iteration stops at the first `Err`.
+        let items: Vec<Result<ibapi::contracts::OptionChain, ibapi::Error>> = vec![
+            Ok(make_option_chain("SMART")),
+            Ok(make_option_chain("CBOE")),
+            Err(ibapi::Error::Simple("pacing violation".into())),
+            Ok(make_option_chain("NASDAQOM")),
+        ];
+        let mut on_error_calls = 0;
+
+        let (entries, received, truncation_error) = drain_until_error(
+            items.into_iter(),
+            16,
+            |chain, _seq| Some(OptionChainEntry::from_ib(chain)),
+            |_e| on_error_calls += 1,
+        );
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.exchange.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SMART", "CBOE"],
+            "entries decoded before the error are preserved; later ones dropped"
+        );
+        assert_eq!(received, 2, "raw items received before the error");
+        // Substring, not exact match: the "error occurred: " prefix is
+        // ibapi's thiserror wording, and `truncation_error`'s own contract
+        // says not to match on the string contents.
+        assert!(
+            truncation_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("pacing violation")),
+            "the formatted ibapi::Error must be recorded, got {truncation_error:?}"
+        );
+        assert_eq!(on_error_calls, 1, "on_error fires exactly once");
+    }
+
+    #[test]
+    fn drain_until_error_clean_end_reports_no_truncation() {
+        let items: Vec<Result<ibapi::contracts::OptionChain, ibapi::Error>> = vec![
+            Ok(make_option_chain("SMART")),
+            Ok(make_option_chain("CBOE")),
+        ];
+
+        let (entries, received, truncation_error) = drain_until_error(
+            items.into_iter(),
+            16,
+            |chain, _seq| Some(OptionChainEntry::from_ib(chain)),
+            |_e| panic!("on_error must not fire when the stream never yields Err"),
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(received, 2);
+        assert_eq!(truncation_error, None);
     }
 }
