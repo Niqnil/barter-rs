@@ -59,9 +59,10 @@ pub trait InstrumentDataState<
 /// This is a simple example of instrument level data. Trading strategies typically maintain more
 /// comprehensive data, such as candles, technical indicators, market depth (L2 book), volatility metrics,
 /// or strategy-specific state data.
-#[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize, Constructor,
-)]
+///
+/// Does not implement `Ord`/`PartialOrd`: `last_traded_price` holds a [`Timed`] value, whose
+/// whole-struct ordering is intentionally not provided (see [`Timed`] docs).
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Default, Deserialize, Serialize, Constructor)]
 pub struct DefaultInstrumentMarketData {
     pub l1: OrderBookL1,
     pub last_traded_price: Option<Timed<Decimal>>,

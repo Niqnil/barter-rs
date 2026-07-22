@@ -124,20 +124,12 @@ pub mod backtest;
 pub mod shutdown;
 
 /// A timed value.
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Default,
-    Deserialize,
-    Serialize,
-    Constructor,
-)]
+///
+/// Ordering is intentionally not provided: a whole-struct order must compare either value-first
+/// (sorting `Vec<Timed<_>>` by value, not chronology) or time-first (collapsing same-instant
+/// entries in ordered collections despite differing values) — both are footguns. Sort explicitly
+/// on the field you mean, e.g. `events.sort_by_key(|timed| timed.time)`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default, Deserialize, Serialize, Constructor)]
 pub struct Timed<T> {
     pub value: T,
     pub time: DateTime<Utc>,
