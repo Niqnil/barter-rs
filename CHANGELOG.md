@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bounded, cycle-safe pagination for Alpaca REST fetches** (`rustrade-data`, `alpaca` feature).
+  Every `page_token`-paginated Alpaca fetch (`fetch_splits_raw`, `fetch_contracts`,
+  `fetch_snapshots` / `fetch_chain_snapshots`) previously stopped at its page cap with only a
+  `warn!`, returning a silently truncated result — indistinguishable from a genuinely small one
+  for a market-data client. Each fetch now fails loudly instead, mirroring the Massive pagination
+  hardening: exceeding the page cap or receiving a `next_page_token` that repeats an already-used
+  cursor surfaces as a terminal error on the fetch. Two new `AlpacaRestError` variants carry the
+  diagnosis: `PaginationLimitExceeded { pages, limit }` and `CyclicPagination { page_token }`
+  (the retained token bounded to a diagnostic prefix, as it is server-supplied).
+  `AlpacaRestError` is `#[non_exhaustive]`, so the new variants are additive. Also new:
+  `AlpacaRestClient::with_base_urls` / `AlpacaOptionsClient::with_base_urls` to point a client at
+  API-compatible non-production endpoints (mock servers in tests, proxies).
+
 - **Richer IBKR Flex transport diagnostics + configurable poll budget** (`rustrade-data`, `ibkr`
   feature). `IbkrFlexClient` now reads the HTTP response body **before** branching on status, so a
   non-2xx response's diagnostic body (IBKR/proxy/CDN error pages) is preserved instead of being

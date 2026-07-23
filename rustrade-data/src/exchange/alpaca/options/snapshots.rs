@@ -2,18 +2,20 @@
 //!
 //! Implements `GET /v1beta1/options/snapshots` for fetching option snapshots with Greeks.
 
+use super::super::pagination::PaginationGuard;
 use super::{AlpacaOptionsClient, AlpacaOptionsError};
 use crate::subscription::greeks::OptionGreeks;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Maximum symbols per snapshot request (Alpaca API limit).
 const MAX_SYMBOLS_PER_REQUEST: usize = 100;
 
-/// Maximum pages to fetch before stopping (safety limit).
+/// Maximum pages a single batch fetch will follow before failing with a terminal
+/// `PaginationLimitExceeded` (a runaway backstop, not a business limit).
 const MAX_PAGES: usize = 100;
 
 /// Alpaca options data feed.
@@ -165,7 +167,11 @@ impl AlpacaOptionsClient {
     /// Fetch option snapshots with Greeks for the given symbols.
     ///
     /// Automatically batches requests if more than 100 symbols are provided,
-    /// and paginates through all results.
+    /// and paginates through all results. Per-batch pagination is bounded: the fetch returns a
+    /// terminal [`AlpacaOptionsError::PaginationLimitExceeded`] if a batch exceeds 100 pages,
+    /// and [`AlpacaOptionsError::CyclicPagination`] if the server repeats a `page_token` — a
+    /// silently truncated result would be indistinguishable from a genuinely small one, so
+    /// incomplete pagination fails loudly instead.
     ///
     /// # Arguments
     ///
@@ -178,7 +184,8 @@ impl AlpacaOptionsClient {
     ///
     /// # Errors
     ///
-    /// Returns error on network failure, API error, or invalid response.
+    /// Returns error on network failure, API error, invalid response, or out-of-bounds
+    /// pagination (see above).
     ///
     /// # Note
     ///
@@ -212,20 +219,12 @@ impl AlpacaOptionsClient {
     ) -> Result<Vec<AlpacaOptionSnapshot>, AlpacaOptionsError> {
         let mut all_snapshots = Vec::new();
         let mut page_token: Option<String> = None;
-        let mut pages = 0usize;
+        let mut guard = PaginationGuard::new(MAX_PAGES);
 
         let symbols_param = symbols.join(",");
 
         loop {
-            if pages >= MAX_PAGES {
-                warn!(
-                    pages,
-                    snapshots = all_snapshots.len(),
-                    "Alpaca option snapshots hit the max-pages safety limit; returning truncated results"
-                );
-                break;
-            }
-            pages += 1;
+            guard.observe(page_token.as_deref())?;
 
             let mut params: Vec<(&str, &str)> =
                 vec![("symbols", &symbols_param), ("feed", feed.as_str())];
@@ -250,7 +249,7 @@ impl AlpacaOptionsClient {
                 }));
 
                 debug!(
-                    page = pages,
+                    page = guard.pages(),
                     count,
                     total = all_snapshots.len(),
                     "fetched snapshots page"

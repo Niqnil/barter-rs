@@ -86,6 +86,8 @@ pub mod trade;
 
 // `StockSplitSource` adapter for `AlpacaRestClient` (no public items of its own — just the impl).
 mod corporate_action;
+// Shared page-cap + `page_token` cycle guard for the paginated REST fetches.
+mod pagination;
 
 pub use reference::{AlpacaStockSplit, CorporateActionsQuery};
 pub use rest::{AlpacaRestClient, AlpacaRestError};

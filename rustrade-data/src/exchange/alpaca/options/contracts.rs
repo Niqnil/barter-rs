@@ -2,6 +2,7 @@
 //!
 //! Implements `GET /v2/options/contracts` for querying available option contracts.
 
+use super::super::pagination::PaginationGuard;
 use super::{AlpacaOptionsClient, AlpacaOptionsError};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -16,7 +17,8 @@ const MAX_PAGE_SIZE: usize = 10_000;
 /// Default page size for contract queries.
 const DEFAULT_PAGE_SIZE: usize = 1_000;
 
-/// Maximum pages to fetch before stopping (safety limit).
+/// Maximum pages a single fetch will follow before failing with a terminal
+/// `PaginationLimitExceeded` (a runaway backstop, not a business limit).
 const MAX_PAGES: usize = 100;
 
 /// Query parameters for option contract discovery.
@@ -265,7 +267,11 @@ struct ContractsResponse {
 impl AlpacaOptionsClient {
     /// Fetch option contracts matching the query.
     ///
-    /// Automatically paginates through all results up to the safety limit.
+    /// Automatically paginates through all results. Pagination is bounded: the fetch returns a
+    /// terminal [`AlpacaOptionsError::PaginationLimitExceeded`] if it exceeds 100 pages, and
+    /// [`AlpacaOptionsError::CyclicPagination`] if the server repeats a `page_token` — a
+    /// silently truncated result would be indistinguishable from a genuinely small one, so
+    /// incomplete pagination fails loudly instead.
     ///
     /// # Arguments
     ///
@@ -277,14 +283,15 @@ impl AlpacaOptionsClient {
     ///
     /// # Errors
     ///
-    /// Returns error on network failure, API error, or invalid response.
+    /// Returns error on network failure, API error, invalid response, or out-of-bounds
+    /// pagination (see above).
     pub async fn fetch_contracts(
         &self,
         query: &AlpacaOptionContractQuery,
     ) -> Result<Vec<AlpacaOptionContract>, AlpacaOptionsError> {
         let mut all_contracts = Vec::new();
         let mut page_token: Option<String> = None;
-        let mut pages = 0usize;
+        let mut guard = PaginationGuard::new(MAX_PAGES);
 
         // Warn once per logical query (not once per page) if the caller requested a style Alpaca
         // cannot filter on. `to_query_params` silently omits the `style` param in that case; this
@@ -298,15 +305,7 @@ impl AlpacaOptionsClient {
         }
 
         loop {
-            if pages >= MAX_PAGES {
-                warn!(
-                    pages,
-                    contracts = all_contracts.len(),
-                    "Alpaca option contracts hit the max-pages safety limit; returning truncated results"
-                );
-                break;
-            }
-            pages += 1;
+            guard.observe(page_token.as_deref())?;
 
             let mut params = query.to_query_params();
             if let Some(ref token) = page_token {
@@ -323,7 +322,7 @@ impl AlpacaOptionsClient {
             all_contracts.extend(contracts);
 
             debug!(
-                page = pages,
+                page = guard.pages(),
                 count,
                 total = all_contracts.len(),
                 "fetched contracts page"

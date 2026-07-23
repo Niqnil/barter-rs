@@ -31,7 +31,7 @@ rust_decimal_macros = { workspace = true }
 time = { version = "0.3", features = ["macros"] }  # For ibkr tests and databento examples
 temp-env = { workspace = true }
 serial_test = { workspace = true }  # For Massive WebSocket tests (1 connection limit)
-wiremock = { workspace = true }  # For Massive REST pagination tests (mock next_url chains)
+wiremock = { workspace = true }  # For Massive/Alpaca REST pagination tests (mock next_url/page_token chains) and http.rs unit tests
 http = { workspace = true }  # Builds synthetic `reqwest::Response`s (via reqwest's `From<http::Response<_>>`) for socket-free transport tests; already in the tree via reqwest
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }  # `test-util` = paused-clock poll-timing tests
 
