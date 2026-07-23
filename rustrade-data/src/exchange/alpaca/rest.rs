@@ -73,6 +73,27 @@ pub enum AlpacaRestError {
     /// shared retry helper recovers instead of aborting the task.
     #[error("request body is not cloneable; cannot retry (streaming bodies are unsupported)")]
     NotCloneable,
+
+    /// A paginated fetch exceeded the maximum number of pages before the API reported the end of
+    /// the result set.
+    ///
+    /// Returned as a terminal error on the affected fetch. For a market-data client a silent
+    /// truncation is indistinguishable from a genuinely small result set, so pagination fails
+    /// loudly rather than returning a partial result. Hitting this limit indicates either an
+    /// unexpectedly large query or a server that never signals the final page — inspect the query
+    /// before retrying.
+    #[error("pagination exceeded the {limit}-page safety limit (attempted page {pages})")]
+    PaginationLimitExceeded { pages: usize, limit: usize },
+
+    /// A paginated fetch received a `next_page_token` it had already used as a cursor.
+    ///
+    /// Returned as a terminal error on the affected fetch. A repeated token would otherwise
+    /// re-fetch the same pages until the page cap ran out; detecting the cycle turns silent
+    /// non-termination into an observable failure after a single wasted round-trip. The token is
+    /// server-supplied, so the retained value is truncated to a bounded diagnostic prefix (real
+    /// Alpaca tokens are far shorter than the bound and are retained whole).
+    #[error("pagination cycle detected: page_token {page_token:?} was already used")]
+    CyclicPagination { page_token: String },
 }
 
 /// Authenticated Alpaca REST client.
@@ -164,6 +185,27 @@ impl AlpacaRestClient {
             .unwrap_or(false);
 
         Self::new(&api_key, &api_secret, paper)
+    }
+
+    /// Override both API base URLs (broker and data).
+    ///
+    /// Points the client at API-compatible endpoints other than the production Alpaca hosts —
+    /// a local mock server in tests, or a proxy/gateway. Credentials, timeouts and retry
+    /// behaviour are unchanged.
+    ///
+    /// Infallible by design: unlike a `next_url`-following client, this client only ever
+    /// requests URLs it builds itself from these bases (pagination advances via an opaque
+    /// `page_token` query parameter, never a server-supplied URL), so there is no trusted
+    /// origin to derive — and nothing to fail on — at construction.
+    #[must_use]
+    pub fn with_base_urls(
+        mut self,
+        broker_base: impl Into<String>,
+        data_base: impl Into<String>,
+    ) -> Self {
+        self.broker_base = broker_base.into();
+        self.data_base = data_base.into();
+        self
     }
 
     /// The broker API base URL (`https://api.alpaca.markets`, or the paper endpoint).

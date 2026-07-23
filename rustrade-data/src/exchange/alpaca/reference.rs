@@ -16,6 +16,7 @@
 //!
 //! [`StockSplitSource`]: rustrade_integration::corporate_action::StockSplitSource
 
+use super::pagination::PaginationGuard;
 use super::rest::{AlpacaRestClient, AlpacaRestError};
 use async_stream::try_stream;
 use chrono::NaiveDate;
@@ -23,12 +24,13 @@ use futures::Stream;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use smol_str::SmolStr;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Maximum results per page (Alpaca API limit).
 const MAX_LIMIT: u16 = 1000;
 
-/// Maximum pages to fetch before stopping (safety limit against an unbounded `page_token` loop).
+/// Maximum pages a single fetch will follow before failing with a terminal
+/// `PaginationLimitExceeded` (a runaway backstop, not a business limit).
 const MAX_PAGES: usize = 1000;
 
 /// The `types` filter value — this surface only fetches stock splits, never other action kinds.
@@ -212,8 +214,11 @@ impl AlpacaRestClient {
     /// Fetch stock splits matching `query` from `GET /v1beta1/corporate-actions`.
     ///
     /// Returns a stream that handles `page_token` pagination automatically, yielding each
-    /// forward/reverse split as a normalised [`AlpacaStockSplit`]. The stream stops after
-    /// 1000 pages as a safety bound and logs a warning if that limit is hit.
+    /// forward/reverse split as a normalised [`AlpacaStockSplit`]. Pagination is bounded: the
+    /// stream yields a terminal [`AlpacaRestError::PaginationLimitExceeded`] if it exceeds
+    /// 1000 pages, and [`AlpacaRestError::CyclicPagination`] if the server repeats a
+    /// `page_token` — a silently truncated result would be indistinguishable from a genuinely
+    /// small one, so incomplete pagination fails loudly instead.
     ///
     /// # Example
     ///
@@ -235,21 +240,17 @@ impl AlpacaRestClient {
         try_stream! {
             let url = format!("{}/v1beta1/corporate-actions", self.data_base());
             let mut page_token: Option<String> = None;
-            let mut pages = 0usize;
+            let mut guard = PaginationGuard::new(MAX_PAGES);
 
             loop {
-                if pages >= MAX_PAGES {
-                    warn!(pages, "Alpaca corporate-actions hit the max-pages safety limit; stopping");
-                    break;
-                }
-                pages += 1;
+                guard.observe(page_token.as_deref())?;
 
                 let mut params = query.to_query_params();
                 if let Some(ref token) = page_token {
                     params.push(("page_token", token.clone()));
                 }
 
-                debug!(url = %url, page = pages, "Fetching Alpaca corporate-actions page");
+                debug!(url = %url, page = guard.pages(), "Fetching Alpaca corporate-actions page");
                 let request = self.get(&url).query(&params);
                 let response: CorporateActionsResponse = self.request_with_retry(request).await?;
 

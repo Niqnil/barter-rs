@@ -117,6 +117,21 @@ impl AlpacaOptionsClient {
             rest: AlpacaRestClient::from_env()?,
         })
     }
+
+    /// Override both API base URLs (broker and data) on the underlying transport.
+    ///
+    /// See [`AlpacaRestClient::with_base_urls`] — points the client at API-compatible
+    /// endpoints other than the production Alpaca hosts (a local mock server in tests, or a
+    /// proxy/gateway).
+    #[must_use]
+    pub fn with_base_urls(
+        mut self,
+        broker_base: impl Into<String>,
+        data_base: impl Into<String>,
+    ) -> Self {
+        self.rest = self.rest.with_base_urls(broker_base, data_base);
+        self
+    }
 }
 
 #[cfg(test)]
