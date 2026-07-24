@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`aggregate_candles` candle→candle OHLCV aggregation helper** (`rustrade-data`,
+  `subscription::candle`). A pure, venue-agnostic batch primitive that rolls fixed-interval
+  `Candle`s up into a coarser fixed interval (e.g. Binance-native `1s` bars → `3s` bars no venue
+  serves), with epoch-anchored bucketing, `Decimal`-exact OHLCV/trade-count aggregation, and the
+  bucket `close_time` derived through the shared `close_time_from_open` boundary helper. Empty
+  buckets are omitted (gap-fill stays a consumer policy, composing correctly on either side of the
+  call) and invalid arguments or non-monotonic input surface as the new `#[non_exhaustive]`
+  `AggregateCandlesError` — never a silently wrong bar.
+
 - **Bounded, cycle-safe pagination for Alpaca REST fetches** (`rustrade-data`, `alpaca` feature).
   Every `page_token`-paginated Alpaca fetch (`fetch_splits_raw`, `fetch_contracts`,
   `fetch_snapshots` / `fetch_chain_snapshots`) previously stopped at its page cap with only a
