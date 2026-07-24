@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::str::FromStr;
+use thiserror::Error;
 
 /// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`Candle`]
 /// [`MarketEvent<T>`](crate::event::MarketEvent) events.
@@ -40,10 +41,32 @@ impl std::fmt::Display for Candles {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use rust_decimal_macros::dec;
 
     /// Parse an RFC3339 UTC instant in tests.
     fn dt(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// Build a test [`Candle`] closing at the given RFC3339 instant.
+    fn bar(
+        close_time: &str,
+        open: Decimal,
+        high: Decimal,
+        low: Decimal,
+        close: Decimal,
+        volume: Decimal,
+        trade_count: u64,
+    ) -> Candle {
+        Candle {
+            close_time: dt(close_time),
+            open,
+            high,
+            low,
+            close,
+            volume,
+            trade_count,
+        }
     }
 
     #[test]
@@ -255,6 +278,625 @@ mod tests {
         assert_eq!(kind.as_str(), "candles");
         assert_eq!(kind.to_string(), "candles");
     }
+
+    #[test]
+    fn aggregate_rolls_three_1s_bars_into_one_3s_bar() {
+        let bars = [
+            bar(
+                "2024-01-15T12:00:01Z",
+                dec!(10),
+                dec!(12),
+                dec!(9),
+                dec!(11),
+                dec!(1),
+                5,
+            ),
+            bar(
+                "2024-01-15T12:00:02Z",
+                dec!(11),
+                dec!(15),
+                dec!(10),
+                dec!(14),
+                dec!(2),
+                3,
+            ),
+            bar(
+                "2024-01-15T12:00:03Z",
+                dec!(14),
+                dec!(16),
+                dec!(13),
+                dec!(15),
+                dec!(3),
+                2,
+            ),
+        ];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert_eq!(
+            out,
+            vec![bar(
+                "2024-01-15T12:00:03Z",
+                dec!(10),
+                dec!(16),
+                dec!(9),
+                dec!(15),
+                dec!(6),
+                10
+            )]
+        );
+    }
+
+    #[test]
+    fn aggregate_splits_six_1s_bars_into_two_3s_bars() {
+        let bars = [
+            bar(
+                "2024-01-15T12:00:01Z",
+                dec!(10),
+                dec!(12),
+                dec!(9),
+                dec!(11),
+                dec!(1),
+                1,
+            ),
+            bar(
+                "2024-01-15T12:00:02Z",
+                dec!(11),
+                dec!(15),
+                dec!(10),
+                dec!(14),
+                dec!(2),
+                2,
+            ),
+            bar(
+                "2024-01-15T12:00:03Z",
+                dec!(14),
+                dec!(16),
+                dec!(13),
+                dec!(15),
+                dec!(3),
+                3,
+            ),
+            bar(
+                "2024-01-15T12:00:04Z",
+                dec!(15),
+                dec!(17),
+                dec!(14),
+                dec!(16),
+                dec!(4),
+                4,
+            ),
+            bar(
+                "2024-01-15T12:00:05Z",
+                dec!(16),
+                dec!(18),
+                dec!(15),
+                dec!(17),
+                dec!(5),
+                5,
+            ),
+            bar(
+                "2024-01-15T12:00:06Z",
+                dec!(17),
+                dec!(19),
+                dec!(12),
+                dec!(13),
+                dec!(6),
+                6,
+            ),
+        ];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                bar(
+                    "2024-01-15T12:00:03Z",
+                    dec!(10),
+                    dec!(16),
+                    dec!(9),
+                    dec!(15),
+                    dec!(6),
+                    6
+                ),
+                bar(
+                    "2024-01-15T12:00:06Z",
+                    dec!(15),
+                    dec!(19),
+                    dec!(12),
+                    dec!(13),
+                    dec!(15),
+                    15
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_buckets_snap_to_the_epoch_grid_not_the_first_sample() {
+        // Opens land at :01, :02, :03. First-sample anchoring would merge all
+        // three into one [:01, :04) bucket; the epoch grid splits them into
+        // [:00, :03) and [:03, :06).
+        let bars = [
+            bar(
+                "2024-01-15T12:00:02Z",
+                dec!(10),
+                dec!(12),
+                dec!(9),
+                dec!(11),
+                dec!(1),
+                1,
+            ),
+            bar(
+                "2024-01-15T12:00:03Z",
+                dec!(11),
+                dec!(15),
+                dec!(10),
+                dec!(14),
+                dec!(2),
+                2,
+            ),
+            bar(
+                "2024-01-15T12:00:04Z",
+                dec!(14),
+                dec!(16),
+                dec!(13),
+                dec!(15),
+                dec!(4),
+                3,
+            ),
+        ];
+        let target = Duration::seconds(3);
+        let out = aggregate_candles(&bars, Duration::seconds(1), target).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].close_time, dt("2024-01-15T12:00:03Z"));
+        assert_eq!(out[0].volume, dec!(3));
+        assert_eq!(out[1].close_time, dt("2024-01-15T12:00:06Z"));
+        assert_eq!(out[1].volume, dec!(4));
+        // Every output boundary sits on the epoch-anchored target grid.
+        for candle in &out {
+            assert_eq!(
+                candle
+                    .close_time
+                    .timestamp_millis()
+                    .rem_euclid(target.num_milliseconds()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_partial_bucket_does_not_scale_volume_to_bucket_width() {
+        let bars = [bar(
+            "2024-01-15T12:00:02Z",
+            dec!(10),
+            dec!(12),
+            dec!(9),
+            dec!(11),
+            dec!(5),
+            4,
+        )];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert_eq!(
+            out,
+            vec![bar(
+                "2024-01-15T12:00:03Z",
+                dec!(10),
+                dec!(12),
+                dec!(9),
+                dec!(11),
+                dec!(5),
+                4
+            )]
+        );
+    }
+
+    #[test]
+    fn aggregate_omits_fully_empty_buckets() {
+        // Bars in the [:00, :03) and [:09, :12) buckets; [:03, :09) is a gap.
+        let bars = [
+            bar(
+                "2024-01-15T12:00:01Z",
+                dec!(10),
+                dec!(12),
+                dec!(9),
+                dec!(11),
+                dec!(1),
+                1,
+            ),
+            bar(
+                "2024-01-15T12:00:11Z",
+                dec!(20),
+                dec!(22),
+                dec!(19),
+                dec!(21),
+                dec!(2),
+                2,
+            ),
+        ];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        // No synthetic bars for the empty buckets: gap policy is the caller's.
+        assert_eq!(
+            out,
+            vec![
+                bar(
+                    "2024-01-15T12:00:03Z",
+                    dec!(10),
+                    dec!(12),
+                    dec!(9),
+                    dec!(11),
+                    dec!(1),
+                    1
+                ),
+                bar(
+                    "2024-01-15T12:00:12Z",
+                    dec!(20),
+                    dec!(22),
+                    dec!(19),
+                    dec!(21),
+                    dec!(2),
+                    2
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_rejects_invalid_interval_arguments() {
+        let base = Duration::seconds(2);
+        assert_eq!(
+            aggregate_candles(&[], base, Duration::seconds(5)).unwrap_err(),
+            AggregateCandlesError::TargetNotMultipleOfBase {
+                base,
+                target: Duration::seconds(5)
+            }
+        );
+        assert_eq!(
+            aggregate_candles(&[], base, Duration::seconds(1)).unwrap_err(),
+            AggregateCandlesError::TargetSmallerThanBase {
+                base,
+                target: Duration::seconds(1)
+            }
+        );
+        assert_eq!(
+            aggregate_candles(&[], Duration::zero(), Duration::seconds(3)).unwrap_err(),
+            AggregateCandlesError::NonPositiveInterval {
+                base: Duration::zero(),
+                target: Duration::seconds(3)
+            }
+        );
+        assert_eq!(
+            aggregate_candles(&[], base, Duration::seconds(-3)).unwrap_err(),
+            AggregateCandlesError::NonPositiveInterval {
+                base,
+                target: Duration::seconds(-3)
+            }
+        );
+    }
+
+    #[test]
+    fn aggregate_rejects_sub_millisecond_intervals() {
+        // 1.5ms floors to 1ms at the bucketing granularity, which would
+        // silently mis-bucket — rejected at entry instead.
+        let base = Duration::nanoseconds(1_500_000);
+        let target = Duration::milliseconds(3);
+        assert_eq!(
+            aggregate_candles(&[], base, target).unwrap_err(),
+            AggregateCandlesError::SubMillisecondInterval { base, target }
+        );
+        let base = Duration::milliseconds(1);
+        let target = Duration::nanoseconds(2_500_000);
+        assert_eq!(
+            aggregate_candles(&[], base, target).unwrap_err(),
+            AggregateCandlesError::SubMillisecondInterval { base, target }
+        );
+    }
+
+    #[test]
+    fn aggregate_of_empty_input_is_empty() {
+        let out = aggregate_candles(&[], Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn aggregate_close_time_round_trips_through_the_shared_boundary_helper() {
+        let bars = [bar(
+            "2024-01-15T12:00:01Z",
+            dec!(10),
+            dec!(12),
+            dec!(9),
+            dec!(11),
+            dec!(1),
+            1,
+        )];
+        let target = Duration::seconds(3);
+        let out = aggregate_candles(&bars, Duration::seconds(1), target).unwrap();
+        // close_time == bucket_open + target, via the single-sourced helper.
+        assert_eq!(
+            out[0].close_time,
+            close_time_from_open(dt("2024-01-15T12:00:00Z"), IntervalStep::Fixed(target)).unwrap()
+        );
+    }
+
+    #[test]
+    fn aggregate_surfaces_bucket_close_overflow_as_an_error() {
+        let target = Duration::seconds(3);
+        // The final epoch-grid bucket below the maximum representable instant:
+        // a 1ms sub-bar at its very start is itself representable, but the
+        // bucket's exclusive close boundary is not.
+        let bucket_open_ms = DateTime::<Utc>::MAX_UTC
+            .timestamp_millis()
+            .div_euclid(target.num_milliseconds())
+            * target.num_milliseconds();
+        let close_time = DateTime::from_timestamp_millis(bucket_open_ms + 1).unwrap();
+        let bars = [Candle {
+            close_time,
+            open: dec!(1),
+            high: dec!(1),
+            low: dec!(1),
+            close: dec!(1),
+            volume: dec!(1),
+            trade_count: 1,
+        }];
+        assert_eq!(
+            aggregate_candles(&bars, Duration::milliseconds(1), target).unwrap_err(),
+            AggregateCandlesError::TimestampOutOfRange { index: 0 }
+        );
+    }
+
+    #[test]
+    fn aggregate_sixty_1s_bars_matches_the_fields_of_a_native_1m_bar() {
+        let session_open = dt("2024-01-15T12:00:00Z");
+        let bars = (0..60i64)
+            .map(|i| Candle {
+                close_time: session_open + Duration::seconds(i + 1),
+                open: Decimal::from(100 + i),
+                high: Decimal::from(105 + i),
+                low: Decimal::from(95 + i),
+                close: Decimal::from(101 + i),
+                volume: Decimal::from(2),
+                trade_count: 3,
+            })
+            .collect::<Vec<_>>();
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::minutes(1)).unwrap();
+        // Exactly the fields a native 1m candle over the same trades carries.
+        assert_eq!(
+            out,
+            vec![Candle {
+                close_time: dt("2024-01-15T12:01:00Z"),
+                open: Decimal::from(100),
+                high: Decimal::from(164),
+                low: Decimal::from(95),
+                close: Decimal::from(160),
+                volume: Decimal::from(120),
+                trade_count: 180,
+            }]
+        );
+    }
+
+    #[test]
+    fn aggregate_gap_filled_input_carries_fills_without_double_counting() {
+        // Pre-gap-filled contiguous 1s series: flat v=0 fill bars around one
+        // real bar. Fills carry into open/low; zero volumes cannot
+        // double-count, so fill-before-aggregate equals fill-after.
+        let bars = [
+            bar(
+                "2024-01-15T12:00:01Z",
+                dec!(90),
+                dec!(90),
+                dec!(90),
+                dec!(90),
+                dec!(0),
+                0,
+            ),
+            bar(
+                "2024-01-15T12:00:02Z",
+                dec!(100),
+                dec!(101),
+                dec!(99),
+                dec!(100.5),
+                dec!(10),
+                7,
+            ),
+            bar(
+                "2024-01-15T12:00:03Z",
+                dec!(100.5),
+                dec!(100.5),
+                dec!(100.5),
+                dec!(100.5),
+                dec!(0),
+                0,
+            ),
+        ];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert_eq!(
+            out,
+            vec![bar(
+                "2024-01-15T12:00:03Z",
+                dec!(90),
+                dec!(101),
+                dec!(90),
+                dec!(100.5),
+                dec!(10),
+                7
+            )]
+        );
+    }
+
+    #[test]
+    fn aggregate_bucket_of_only_zero_volume_bars_emits_one_flat_bar() {
+        // "Non-empty" means has-candles, not has-volume.
+        let bars = [
+            bar(
+                "2024-01-15T12:00:01Z",
+                dec!(50),
+                dec!(50),
+                dec!(50),
+                dec!(50),
+                dec!(0),
+                0,
+            ),
+            bar(
+                "2024-01-15T12:00:02Z",
+                dec!(50),
+                dec!(50),
+                dec!(50),
+                dec!(50),
+                dec!(0),
+                0,
+            ),
+            bar(
+                "2024-01-15T12:00:03Z",
+                dec!(50),
+                dec!(50),
+                dec!(50),
+                dec!(50),
+                dec!(0),
+                0,
+            ),
+        ];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert_eq!(
+            out,
+            vec![bar(
+                "2024-01-15T12:00:03Z",
+                dec!(50),
+                dec!(50),
+                dec!(50),
+                dec!(50),
+                dec!(0),
+                0
+            )]
+        );
+    }
+
+    #[test]
+    fn aggregate_rejects_unsorted_and_duplicate_input_observably() {
+        let first = bar(
+            "2024-01-15T12:00:02Z",
+            dec!(10),
+            dec!(12),
+            dec!(9),
+            dec!(11),
+            dec!(1),
+            1,
+        );
+        let second = bar(
+            "2024-01-15T12:00:01Z",
+            dec!(11),
+            dec!(15),
+            dec!(10),
+            dec!(14),
+            dec!(2),
+            2,
+        );
+        assert_eq!(
+            aggregate_candles(&[first, second], Duration::seconds(1), Duration::seconds(3))
+                .unwrap_err(),
+            AggregateCandlesError::NonMonotonicInput { index: 1 }
+        );
+        // Strict ordering also rejects duplicate close_times (double-fetch /
+        // overlapping-page data bugs) rather than double-counting their volume.
+        assert_eq!(
+            aggregate_candles(&[first, first], Duration::seconds(1), Duration::seconds(3))
+                .unwrap_err(),
+            AggregateCandlesError::NonMonotonicInput { index: 1 }
+        );
+    }
+
+    #[test]
+    fn aggregate_surfaces_sub_bar_open_underflow_as_an_error() {
+        // close_time at the minimum representable instant: the sub-bar's open
+        // (close − base) underflows and must surface, not panic.
+        let bars = [Candle {
+            close_time: DateTime::<Utc>::MIN_UTC,
+            open: dec!(1),
+            high: dec!(1),
+            low: dec!(1),
+            close: dec!(1),
+            volume: dec!(1),
+            trade_count: 1,
+        }];
+        assert_eq!(
+            aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap_err(),
+            AggregateCandlesError::TimestampOutOfRange { index: 0 }
+        );
+    }
+
+    #[test]
+    fn aggregate_surfaces_bucket_open_underflow_from_grid_flooring_as_an_error() {
+        // The sub-bar's own open is exactly the minimum representable instant,
+        // so the per-candle underflow check passes — but flooring that open
+        // onto a coarse 3-day grid lands below it, a distinct underflow that
+        // only the bucket-level check catches.
+        let base = Duration::milliseconds(1);
+        let bars = [Candle {
+            close_time: DateTime::<Utc>::MIN_UTC + base,
+            open: dec!(1),
+            high: dec!(1),
+            low: dec!(1),
+            close: dec!(1),
+            volume: dec!(1),
+            trade_count: 1,
+        }];
+        assert_eq!(
+            aggregate_candles(&bars, base, Duration::days(3)).unwrap_err(),
+            AggregateCandlesError::TimestampOutOfRange { index: 0 }
+        );
+    }
+
+    #[test]
+    fn aggregate_floors_pre_epoch_opens_toward_negative_infinity() {
+        // Sub-bar open is 1s *before* the epoch. Euclidean flooring snaps it to
+        // -3s, so the bucket closes exactly on the epoch. Plain `/` truncates
+        // toward zero, snapping to 0s and mis-bucketing the bar one bucket late.
+        let bars = [bar(
+            "1970-01-01T00:00:00Z",
+            dec!(10),
+            dec!(12),
+            dec!(9),
+            dec!(11),
+            dec!(1),
+            1,
+        )];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert_eq!(
+            out,
+            vec![bar(
+                "1970-01-01T00:00:00Z",
+                dec!(10),
+                dec!(12),
+                dec!(9),
+                dec!(11),
+                dec!(1),
+                1
+            )]
+        );
+    }
+
+    #[test]
+    fn aggregate_with_target_equal_to_base_is_an_identity_regrid() {
+        // k = 1 passes validation deliberately: on-grid input passes through.
+        let bars = [
+            bar(
+                "2024-01-15T12:00:01Z",
+                dec!(10),
+                dec!(12),
+                dec!(9),
+                dec!(11),
+                dec!(1),
+                1,
+            ),
+            bar(
+                "2024-01-15T12:00:02Z",
+                dec!(11),
+                dec!(15),
+                dec!(10),
+                dec!(14),
+                dec!(2),
+                2,
+            ),
+        ];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(1)).unwrap();
+        assert_eq!(out, bars.to_vec());
+    }
 }
 
 /// Normalised Barter OHLCV [`Candle`] model.
@@ -390,6 +1032,332 @@ pub fn open_time_from_close(close: DateTime<Utc>, step: IntervalStep) -> Option<
         IntervalStep::Fixed(duration) => close.checked_sub_signed(duration),
         IntervalStep::Months(n) => close.checked_sub_months(chrono::Months::new(n)),
     }
+}
+
+/// Error returned by [`aggregate_candles`] for invalid arguments or input.
+///
+/// Every variant is an observable failure: the aggregation never silently
+/// repairs, reorders or drops input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum AggregateCandlesError {
+    /// `base_interval` or `target` is zero or negative.
+    #[error("candle intervals must be positive (base: {base}, target: {target})")]
+    NonPositiveInterval {
+        /// The `base_interval` argument as supplied.
+        base: Duration,
+        /// The `target` argument as supplied.
+        target: Duration,
+    },
+    /// `base_interval` or `target` has a sub-millisecond component. Bucketing
+    /// operates at millisecond granularity (venue candle timestamps are
+    /// millisecond-resolution), so a sub-millisecond interval would silently
+    /// mis-bucket — it is rejected instead.
+    #[error("candle intervals must be whole milliseconds (base: {base}, target: {target})")]
+    SubMillisecondInterval {
+        /// The `base_interval` argument as supplied.
+        base: Duration,
+        /// The `target` argument as supplied.
+        target: Duration,
+    },
+    /// `target` is shorter than `base_interval` — aggregation only coarsens.
+    #[error(
+        "target interval must not be smaller than the base interval (base: {base}, target: {target})"
+    )]
+    TargetSmallerThanBase {
+        /// The `base_interval` argument as supplied.
+        base: Duration,
+        /// The `target` argument as supplied.
+        target: Duration,
+    },
+    /// `target` is not an integer multiple of `base_interval`, so base candles
+    /// cannot tile target buckets exactly.
+    #[error(
+        "target interval must be an integer multiple of the base interval (base: {base}, target: {target})"
+    )]
+    TargetNotMultipleOfBase {
+        /// The `base_interval` argument as supplied.
+        base: Duration,
+        /// The `target` argument as supplied.
+        target: Duration,
+    },
+    /// The input candle at `index` is not strictly later (by `close_time`) than
+    /// its predecessor. Strictness also rejects duplicate timestamps: no two
+    /// distinct fixed-interval candles can legitimately share a `close_time`,
+    /// so a duplicate is a data bug (e.g. an overlapping-page double fetch)
+    /// whose volume must not be double-counted.
+    #[error("input candles must be strictly ascending by close_time (violation at index {index})")]
+    NonMonotonicInput {
+        /// Index into the input slice of the offending candle.
+        index: usize,
+    },
+    /// A boundary computed for the candle at `index` falls outside the
+    /// representable [`DateTime<Utc>`] range. Three computations can fail this
+    /// way: the sub-bar `open` underflowed (input near the minimum instant);
+    /// the bucket's epoch-grid-floored open underflowed (flooring a
+    /// *representable* open onto a coarse `target` grid can still land below
+    /// the minimum instant); or the bucket `close_time` overflowed (input near
+    /// the maximum instant).
+    #[error(
+        "candle at index {index} yields a boundary outside the representable DateTime<Utc> range"
+    )]
+    TimestampOutOfRange {
+        /// Index into the input slice attributing the failure: the offending
+        /// candle itself for a sub-bar `open` underflow, or the affected
+        /// bucket's first sub-bar for a bucket-level boundary failure (whose
+        /// own sub-bar boundary need not be invalid).
+        index: usize,
+    },
+}
+
+/// Aggregate fixed-interval OHLCV [`Candle`]s into a coarser fixed interval.
+///
+/// A pure, venue-agnostic batch primitive: `candles` at resolution
+/// `base_interval` are bucketed onto the epoch-anchored `target` grid, and one
+/// aggregated [`Candle`] is emitted per **non-empty** bucket, ascending by
+/// `close_time`. All price/volume arithmetic is [`Decimal`]-exact — no
+/// floating point.
+///
+/// # Aggregation rule
+///
+/// Each output candle carries, over its bucket's sub-bars:
+///
+/// - `open`: the earliest sub-bar's `open`
+/// - `close`: the latest sub-bar's `close`
+/// - `high` / `low`: the maximum / minimum across the bucket
+/// - `volume` / `trade_count`: sums across the bucket
+/// - `close_time`: the bucket's exclusive close boundary
+///   (`bucket_open + target`), computed via [`close_time_from_open`] so the
+///   [`Candle::close_time`] contract stays single-sourced
+///
+/// A **partial** bucket (fewer than `target / base_interval` sub-bars present)
+/// aggregates only the sub-bars actually present — `volume` is never scaled up
+/// to the bucket width.
+///
+/// # Bucketing: epoch anchoring
+///
+/// Each sub-bar's open (recovered as `close_time − base_interval` via
+/// [`open_time_from_close`]) is floored onto the grid of integer multiples of
+/// `target` since the Unix epoch. This is the natural anchoring for every
+/// target that divides a day (seconds through hours). **Caveat**: the Unix
+/// epoch was a *Thursday*, so for multi-day targets — e.g. 3-day or weekly
+/// buckets — the epoch grid diverges from venue-native anchoring (venues serve
+/// Monday-anchored weekly candles). Callers wanting venue-native weekly bars
+/// should fetch them from the venue rather than aggregate.
+///
+/// # Caller obligations
+///
+/// - **Strictly ascending**: input must be strictly ascending by `close_time`.
+///   Violations (including duplicate timestamps) surface as
+///   [`AggregateCandlesError::NonMonotonicInput`] — input is never silently
+///   reordered or deduplicated.
+/// - **Uniform resolution**: every input candle must span exactly
+///   `base_interval` (its open is `close_time − base_interval`). This cannot
+///   be validated from a [`Candle`] alone (candles carry no interval field)
+///   and is trusted.
+/// - **Grid alignment is _not_ validated**: sub-bar opens are floored onto the
+///   epoch grid wherever they fall, so legitimately non-epoch-anchored input
+///   (e.g. venue-native Monday-anchored weekly bars) is accepted — but its
+///   buckets are epoch-anchored regardless (see above).
+/// - **Millisecond timestamps**: bucketing operates at millisecond
+///   granularity (venue candle timestamps are millisecond-resolution). A
+///   `close_time` with a sub-millisecond component has that component ignored
+///   during bucketing. Sub-millisecond *intervals* are rejected as
+///   [`AggregateCandlesError::SubMillisecondInterval`].
+///
+/// # Gap policy: none (deliberately)
+///
+/// A fully-empty bucket emits **no** output candle — synthesising flat bars
+/// (forward-fill) is consumer policy, not a library concern. The primitive is
+/// neutral about which side of the call that policy runs on:
+///
+/// - feed raw, sparse candles and gap-fill the *output*, or
+/// - feed a pre-gap-filled contiguous series — zero-volume fill bars aggregate
+///   consistently (they carry into `open`/`high`/`low`/`close`; volume sums
+///   are unchanged, so fills cannot double-count).
+///
+/// "Non-empty" means *has input candles*, not *has volume*: a bucket
+/// containing only zero-volume fill bars emits one flat zero-volume candle.
+///
+/// # Trailing bucket
+///
+/// Batch semantics: the final bucket is emitted even if the input merely
+/// *ends* mid-bucket — indistinguishable from a trailing gap. Live/streaming
+/// callers must withhold input until a bucket completes (or drop the tail)
+/// themselves — and should feed bounded windows, not re-aggregate a growing
+/// history buffer per event: every call re-validates and re-scans its entire
+/// input.
+///
+/// # Limitations
+///
+/// Fixed durations only: calendar-month aggregation (variable-length buckets,
+/// [`IntervalStep::Months`]) is out of scope. `target == base_interval` is
+/// accepted and acts as an identity/re-grid pass.
+///
+/// # Panics
+///
+/// Panics if a bucket's accumulated `volume` overflows [`Decimal`] or its
+/// accumulated `trade_count` overflows `u64`. Both require magnitudes no
+/// venue feed produces (~7.9 × 10²⁸ summed volume, ~1.8 × 10¹⁹ summed
+/// trades), so either indicates corrupt input; the panic keeps that failure
+/// loud on every build profile rather than wrapping silently.
+///
+/// # Errors
+///
+/// See [`AggregateCandlesError`]. Boundary computations that leave the
+/// representable [`DateTime<Utc>`] range — sub-bar open underflow near the
+/// minimum instant, epoch-grid flooring pushing a bucket's open below the
+/// minimum instant, or bucket `close_time` overflow near the maximum — surface
+/// as [`AggregateCandlesError::TimestampOutOfRange`] — never a silent
+/// plausible-but-wrong timestamp.
+pub fn aggregate_candles(
+    candles: &[Candle],
+    base_interval: Duration,
+    target: Duration,
+) -> Result<Vec<Candle>, AggregateCandlesError> {
+    if base_interval <= Duration::zero() || target <= Duration::zero() {
+        return Err(AggregateCandlesError::NonPositiveInterval {
+            base: base_interval,
+            target,
+        });
+    }
+    // Bucketing operates at millisecond granularity (venue candle timestamps
+    // are ms); a sub-ms interval would floor and silently mis-bucket.
+    if Duration::milliseconds(base_interval.num_milliseconds()) != base_interval
+        || Duration::milliseconds(target.num_milliseconds()) != target
+    {
+        return Err(AggregateCandlesError::SubMillisecondInterval {
+            base: base_interval,
+            target,
+        });
+    }
+    if target < base_interval {
+        return Err(AggregateCandlesError::TargetSmallerThanBase {
+            base: base_interval,
+            target,
+        });
+    }
+    let target_ms = target.num_milliseconds();
+    if target_ms % base_interval.num_milliseconds() != 0 {
+        return Err(AggregateCandlesError::TargetNotMultipleOfBase {
+            base: base_interval,
+            target,
+        });
+    }
+
+    /// An in-progress epoch-grid bucket accumulator.
+    struct Bucket {
+        /// The bucket's open instant in epoch milliseconds (on the `target` grid).
+        open_ms: i64,
+        /// Index of the bucket's first sub-bar, for error attribution.
+        first_index: usize,
+        open: Decimal,
+        high: Decimal,
+        low: Decimal,
+        close: Decimal,
+        volume: Decimal,
+        trade_count: u64,
+    }
+
+    /// Emit a completed bucket as an aggregated [`Candle`], deriving its
+    /// exclusive close boundary through the shared [`close_time_from_open`]
+    /// helper.
+    fn flush(bucket: Bucket, target: Duration) -> Result<Candle, AggregateCandlesError> {
+        let out_of_range = AggregateCandlesError::TimestampOutOfRange {
+            index: bucket.first_index,
+        };
+        // `open_ms` is grid-floored, so it can sit *below* a representable
+        // sub-bar open that already passed the per-candle range check —
+        // a distinct underflow that must surface here too.
+        let bucket_open = DateTime::from_timestamp_millis(bucket.open_ms).ok_or(out_of_range)?;
+        let close_time =
+            close_time_from_open(bucket_open, IntervalStep::Fixed(target)).ok_or(out_of_range)?;
+        Ok(Candle {
+            close_time,
+            open: bucket.open,
+            high: bucket.high,
+            low: bucket.low,
+            close: bucket.close,
+            volume: bucket.volume,
+            trade_count: bucket.trade_count,
+        })
+    }
+
+    // Empty input is valid (arguments were still checked above) and needs no
+    // allocation at all — `Vec::new()` rather than the 1-slot hint below.
+    if candles.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Dense-case capacity estimate (one output per `target / base_interval`
+    // sub-bars), not an upper bound: sparse input can emit up to one bucket
+    // per candle, in which case the `Vec` grows normally past the hint. The
+    // `usize::MAX` fallback (quotient overflowing `usize` on 32-bit platforms,
+    // where `usize::MAX < i64::MAX`) degrades to a capacity of 1.
+    let sub_bars_per_bucket =
+        usize::try_from(target_ms / base_interval.num_milliseconds()).unwrap_or(usize::MAX);
+    let mut output = Vec::with_capacity(candles.len() / sub_bars_per_bucket + 1);
+    let mut bucket: Option<Bucket> = None;
+    let mut prev_close_time: Option<DateTime<Utc>> = None;
+
+    for (index, candle) in candles.iter().enumerate() {
+        if prev_close_time.is_some_and(|prev| candle.close_time <= prev) {
+            return Err(AggregateCandlesError::NonMonotonicInput { index });
+        }
+        prev_close_time = Some(candle.close_time);
+
+        // Recover the sub-bar's open through the shared boundary helper, then
+        // snap it onto the epoch grid. `div_euclid` (not `/`) floors toward
+        // negative infinity, which keeps pre-1970 instants correctly bucketed.
+        // The re-multiply cannot overflow: floor-then-remultiply stays within
+        // one `target_ms` of the input, and a representable `DateTime<Utc>` is
+        // ~±8.3 × 10¹⁵ ms — three orders of magnitude inside `i64`.
+        let sub_open = open_time_from_close(candle.close_time, IntervalStep::Fixed(base_interval))
+            .ok_or(AggregateCandlesError::TimestampOutOfRange { index })?;
+        let bucket_open_ms = sub_open.timestamp_millis().div_euclid(target_ms) * target_ms;
+
+        match &mut bucket {
+            Some(current) if current.open_ms == bucket_open_ms => {
+                current.high = current.high.max(candle.high);
+                current.low = current.low.min(candle.low);
+                current.close = candle.close;
+                current.volume += candle.volume;
+                // A raw u64 `+=` would wrap silently in release builds (no
+                // overflow-checks profile); a checked add keeps overflow loud
+                // on every profile. The `expect` is the deliberate documented
+                // panic of `# Panics`: overflow means corrupt input, not a
+                // recoverable state.
+                #[allow(clippy::expect_used)]
+                {
+                    current.trade_count = current
+                        .trade_count
+                        .checked_add(candle.trade_count)
+                        .expect("bucket trade_count overflows u64");
+                }
+            }
+            _ => {
+                if let Some(completed) = bucket.take() {
+                    output.push(flush(completed, target)?);
+                }
+                bucket = Some(Bucket {
+                    open_ms: bucket_open_ms,
+                    first_index: index,
+                    open: candle.open,
+                    high: candle.high,
+                    low: candle.low,
+                    close: candle.close,
+                    volume: candle.volume,
+                    trade_count: candle.trade_count,
+                });
+            }
+        }
+    }
+
+    if let Some(last) = bucket.take() {
+        output.push(flush(last, target)?);
+    }
+
+    Ok(output)
 }
 
 /// Candle interval/resolution, shared across every venue that produces candles.
