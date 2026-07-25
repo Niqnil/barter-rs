@@ -269,6 +269,10 @@ where
 
 /// Determines whether the [`Connector`] associated with this [`ExchangeId`] supports the
 /// ingestion of market data for the provided [`MarketDataInstrumentKind`] and [`SubKind`] combination.
+///
+/// [`SubKind::Candles`] carries its resolution, so support is checked **per interval**:
+/// [`CandleInterval`] is the venue-agnostic union of every resolution any connector
+/// serves, and no venue serves all of it (Binance publishes no `5s`/`15s`/`30s` kline).
 pub fn exchange_supports_instrument_kind_sub_kind(
     exchange_id: &ExchangeId,
     instrument_kind: &MarketDataInstrumentKind,
@@ -279,12 +283,18 @@ pub fn exchange_supports_instrument_kind_sub_kind(
     use SubKind::*;
 
     match (exchange_id, instrument_kind, sub_kind) {
-        (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2 | Candles { .. }) => true,
+        (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
+        (BinanceSpot, Spot, Candles { interval }) => {
+            crate::exchange::binance::supports_candle_interval(interval)
+        }
         (
             BinanceFuturesUsd,
             Perpetual,
-            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations | Candles { .. },
+            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations,
         ) => true,
+        (BinanceFuturesUsd, Perpetual, Candles { interval }) => {
+            crate::exchange::binance::supports_candle_interval(interval)
+        }
         (Bitfinex, Spot, PublicTrades) => true,
         (Bitmex, Perpetual, PublicTrades) => true,
         (BybitSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
@@ -625,25 +635,29 @@ mod tests {
         }
 
         #[test]
-        fn candles_supported_on_both_binance_venues_for_every_interval() {
-            // Both Binance venues serve the full interval set on the dynamic path; no interval
-            // is rejected (the Hyperliquid interval guard lives only in its typed historical path).
+        fn candles_supported_per_interval_on_both_binance_venues() {
+            // `CandleInterval` is a venue-agnostic union, so candle support is decided
+            // per interval, not per `SubKind`: both Binance venues serve every interval
+            // Binance publishes a kline for, and neither serves `5s`/`15s`/`30s`.
             for interval in CandleInterval::ALL {
-                assert!(
+                let expected = crate::exchange::binance::supports_candle_interval(interval);
+                assert_eq!(
                     exchange_supports_instrument_kind_sub_kind(
                         &ExchangeId::BinanceSpot,
                         &MarketDataInstrumentKind::Spot,
                         SubKind::Candles { interval },
                     ),
-                    "BinanceSpot/Spot must support Candles {interval:?}"
+                    expected,
+                    "BinanceSpot/Spot Candles {interval:?}"
                 );
-                assert!(
+                assert_eq!(
                     exchange_supports_instrument_kind_sub_kind(
                         &ExchangeId::BinanceFuturesUsd,
                         &MarketDataInstrumentKind::Perpetual,
                         SubKind::Candles { interval },
                     ),
-                    "BinanceFuturesUsd/Perpetual must support Candles {interval:?}"
+                    expected,
+                    "BinanceFuturesUsd/Perpetual Candles {interval:?}"
                 );
             }
         }

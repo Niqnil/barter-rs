@@ -8,7 +8,12 @@ use crate::{
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
     subscriber::{WebSocketSubscriber, validator::WebSocketSubValidator},
-    subscription::{Map, book::OrderBooksL1, candle::Candles, trade::PublicTrades},
+    subscription::{
+        Map,
+        book::OrderBooksL1,
+        candle::{CandleInterval, Candles},
+        trade::PublicTrades,
+    },
     transformer::stateless::StatelessTransformer,
 };
 use rustrade_instrument::exchange::ExchangeId;
@@ -61,6 +66,40 @@ pub mod trade;
 
 /// Convenient type alias for a Binance [`ExchangeWsStream`] using [`WebSocketSerdeParser`].
 pub type BinanceWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
+
+/// Whether Binance publishes klines at the given [`CandleInterval`].
+///
+/// [`CandleInterval`] is the venue-agnostic union of every resolution any connector
+/// supports, so it is a **superset** of Binance's kline menu: Binance's only
+/// sub-minute kline is `1s`, and it serves no `5s`/`15s`/`30s` stream (nor the
+/// matching REST `interval`, which 400s).
+///
+/// This is the pre-flight gate — [`BinanceChannel::spot_candle`](channel::BinanceChannel::spot_candle)
+/// and [`futures_candle`](channel::BinanceChannel::futures_candle) are infallible by
+/// the [`Identifier`](crate::Identifier) contract, so without checking here an
+/// unsupported interval is only rejected once Binance answers the SUBSCRIBE.
+#[must_use]
+pub fn supports_candle_interval(interval: CandleInterval) -> bool {
+    match interval {
+        CandleInterval::Sec5 | CandleInterval::Sec15 | CandleInterval::Sec30 => false,
+        CandleInterval::Sec1
+        | CandleInterval::Min1
+        | CandleInterval::Min3
+        | CandleInterval::Min5
+        | CandleInterval::Min15
+        | CandleInterval::Min30
+        | CandleInterval::Hour1
+        | CandleInterval::Hour2
+        | CandleInterval::Hour4
+        | CandleInterval::Hour6
+        | CandleInterval::Hour8
+        | CandleInterval::Hour12
+        | CandleInterval::Day1
+        | CandleInterval::Day3
+        | CandleInterval::Week1
+        | CandleInterval::Month1 => true,
+    }
+}
 
 /// Generic [`Binance<Server>`](Binance) exchange.
 ///
@@ -201,5 +240,28 @@ where
         S: serde::ser::Serializer,
     {
         serializer.serialize_str(Self::ID.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `CandleInterval` is a union across venues, so this guard must be re-reviewed
+    /// whenever a variant is added — the exhaustive `match` inside
+    /// `supports_candle_interval` is the compile gate, and this test pins the answer.
+    #[test]
+    fn supports_candle_interval_rejects_only_the_sub_minute_intervals_binance_lacks() {
+        for interval in CandleInterval::ALL {
+            let expected = !matches!(
+                interval,
+                CandleInterval::Sec5 | CandleInterval::Sec15 | CandleInterval::Sec30
+            );
+            assert_eq!(
+                supports_candle_interval(interval),
+                expected,
+                "interval {interval}"
+            );
+        }
     }
 }

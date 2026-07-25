@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CandleInterval` gains the sub-minute resolutions `Sec5`, `Sec15` and `Sec30`**
+  (`rustrade-data`, `subscription::candle`). `CandleInterval` is the venue-agnostic *union* of
+  every resolution any connector serves, and providers exist that publish `5s`/`15s`/`30s` bars
+  natively; the enum previously jumped straight from `Sec1` to `Min1`, so those resolutions were
+  inexpressible. `ALL`, `as_str`/`FromStr` (`"5s"`/`"15s"`/`"30s"`, and therefore `Display` and
+  the serde impls), and `to_step` all cover the new variants. Because the union is a superset of
+  any one venue's menu, each connector's interval guard was re-reviewed: Databento (whose OHLCV
+  schemas are `1s`/`1m`/`1h`/`1d` only) and Hyperliquid (whose `candleSnapshot` menu starts at
+  `1m`) reject all three with the existing `DataError::UnsupportedInterval`. Binance publishes no
+  `5s`/`15s`/`30s` kline either, and its channel-name mapping is infallible by the `Identifier`
+  contract, so the new `binance::supports_candle_interval` is the pre-flight gate;
+  `exchange_supports_instrument_kind_sub_kind` now consults it, checking `SubKind::Candles`
+  support **per interval** rather than treating every resolution alike.
+  *Note:* `CandleInterval` is not `#[non_exhaustive]`, so a downstream exhaustive `match` on it
+  must gain arms for the three new variants.
+
 - **`aggregate_candles` candle→candle OHLCV aggregation helper** (`rustrade-data`,
   `subscription::candle`). A pure, venue-agnostic batch primitive that rolls fixed-interval
   `Candle`s up into a coarser fixed interval (e.g. Binance-native `1s` bars → `3s` bars no venue
@@ -164,6 +180,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `Candle.volume` and `Candle.trade_count` are now `Option` (`Option<Decimal>` /
+  `Option<u64>`)** (`rustrade-data`, `subscription::candle`). A candle producer that carries no
+  consolidated volume or no trade count must now say so with `None` — an un-ignorable "unknown" —
+  rather than fabricating a `0` a consumer cannot distinguish from a genuine zero-volume /
+  zero-trade bar (the direct precedent is `PublicTrade.side: Option<Side>`). Per-producer: Binance
+  klines/REST and Hyperliquid carry real values (`Some`, including a venue-reported `Some(0)` on a
+  gap-filled bar); Databento OHLCV has no trade-count field, now `trade_count: None` (was `0`); IBKR
+  maps its `-1` "not available" sentinel on volume/count to `None` (was a clamped `0`); Massive now
+  passes its already-optional trade count through unchanged (was `unwrap_or(0)`). `aggregate_candles`
+  propagates absence: any `None` constituent makes the aggregated bucket's `volume`/`trade_count`
+  `None` (an unknown component makes the sum unknown, never a silent under-count). `Candle` also now
+  derives `Eq` and `Hash` (all fields qualify), so it can be embedded in `Eq`/`Hash` engine state.
+  Migration: match/handle the `Option` (e.g. `candle.volume.unwrap_or_default()` for the old
+  behaviour where a fabricated zero is acceptable).
 - **BREAKING: `IbkrHistoricalData::fetch_option_chain` now returns `OptionChainResult`, and no
   longer discards already-decoded entries on a mid-stream IB error** (`rustrade-data`, `ibkr`
   feature). The method previously failed fast on the first error yielded mid-enumeration,

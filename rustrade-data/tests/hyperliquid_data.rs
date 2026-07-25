@@ -89,7 +89,10 @@ async fn test_historical_candles_hourly() {
     let first = &candles[0];
     assert!(first.open > Decimal::ZERO, "Invalid open price");
     assert!(first.high >= first.low, "High < Low");
-    assert!(!first.volume.is_sign_negative(), "Negative volume");
+    assert!(
+        first.volume.is_none_or(|v| !v.is_sign_negative()),
+        "Negative volume"
+    );
 
     tracing::info!(count = candles.len(), "Received hourly candles");
 }

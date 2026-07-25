@@ -146,8 +146,8 @@ async fn test_rest_aggregates_crypto() {
         assert!(candle.open > Decimal::ZERO, "Open should be positive");
         assert!(candle.high >= candle.low, "High should be >= low");
         assert!(
-            candle.volume >= Decimal::ZERO,
-            "Volume should be non-negative"
+            candle.volume.is_none_or(|v| v >= Decimal::ZERO),
+            "Volume should be non-negative when present"
         );
         count += 1;
 
@@ -157,7 +157,7 @@ async fn test_rest_aggregates_crypto() {
                 high = %candle.high,
                 low = %candle.low,
                 close = %candle.close,
-                volume = %candle.volume,
+                volume = ?candle.volume,
                 "First crypto candle"
             );
         }
@@ -228,7 +228,7 @@ async fn test_rest_aggregates_stocks() {
                 high = %candle.high,
                 low = %candle.low,
                 close = %candle.close,
-                volume = %candle.volume,
+                volume = ?candle.volume,
                 "First stock candle"
             );
         }
@@ -286,7 +286,7 @@ async fn test_rest_aggregates_options() {
                 if count == 1 {
                     tracing::info!(
                         open = %candle.open,
-                        volume = %candle.volume,
+                        volume = ?candle.volume,
                         "First options candle"
                     );
                 }
@@ -379,7 +379,7 @@ async fn test_rest_aggregates_futures() {
                 if count == 1 {
                     tracing::info!(
                         open = %candle.open,
-                        volume = %candle.volume,
+                        volume = ?candle.volume,
                         "First futures candle"
                     );
                 }

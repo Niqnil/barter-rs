@@ -146,8 +146,8 @@ fn candle_market_data() -> Vec<MarketStreamEvent<InstrumentIndex, DataKind>> {
                 high: close + Decimal::from(20),
                 low: close - Decimal::from(20),
                 close,
-                volume: Decimal::from(5),
-                trade_count: 100,
+                volume: Some(Decimal::from(5)),
+                trade_count: Some(100),
             };
 
             MarketStreamEvent::Item(MarketEvent {

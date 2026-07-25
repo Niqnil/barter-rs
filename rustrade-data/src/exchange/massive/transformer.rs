@@ -169,8 +169,10 @@ impl AggregateBar {
             high: self.high,
             low: self.low,
             close: self.close,
-            volume: self.volume,
-            trade_count: self.trade_count.unwrap_or(0),
+            volume: Some(self.volume),
+            // Massive already models an absent trade count; carry the `None`
+            // through as "unknown" rather than the old lossy `unwrap_or(0)`.
+            trade_count: self.trade_count,
         })
     }
 }
@@ -679,8 +681,10 @@ impl WsAggregateMsg {
             high: self.high,
             low: self.low,
             close: self.close,
-            volume: self.volume,
-            trade_count: self.trade_count.unwrap_or(0),
+            volume: Some(self.volume),
+            // Massive already models an absent trade count; carry the `None`
+            // through as "unknown" rather than the old lossy `unwrap_or(0)`.
+            trade_count: self.trade_count,
         };
 
         (time, candle)
@@ -856,7 +860,7 @@ mod tests {
 
         assert_eq!(candle.open, dec!(65000.0));
         assert_eq!(candle.close, dec!(65100.0));
-        assert_eq!(candle.trade_count, 150);
+        assert_eq!(candle.trade_count, Some(150));
 
         // close_time should be 1 minute after start
         let expected_close =
@@ -1268,8 +1272,8 @@ mod tests {
         assert_eq!(candle.high, dec!(45250.0));
         assert_eq!(candle.low, dec!(45180.0));
         assert_eq!(candle.close, dec!(45230.0));
-        assert_eq!(candle.volume, dec!(10.5));
-        assert_eq!(candle.trade_count, 150);
+        assert_eq!(candle.volume, Some(dec!(10.5)));
+        assert_eq!(candle.trade_count, Some(150));
         assert_eq!(
             time,
             Utc.timestamp_millis_opt(1704067260000).single().unwrap()
