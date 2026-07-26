@@ -221,6 +221,13 @@ pub fn exchange_supports_instrument_kind(
             | GateioPerpetualsBtc,
             Spot,
         ) => false,
+        (LseFx | LseCrypto | LseEquities, Spot) => true,
+        (LseCfd | LseFutures, Spot) => false,
+        // NOTE: this default is OPEN -- an exchange that serves no spot market claims spot support
+        // unless it is denied above, with no compile error to prompt the edit. It is left open
+        // deliberately: closing it means writing an explicit arm for every existing variant and
+        // re-verifying each one's spot coverage, which is tracked separately rather than smuggled
+        // in here. Deny explicitly above when adding a non-spot exchange.
         (_, Spot) => true,
 
         // Future
@@ -238,6 +245,10 @@ pub fn exchange_supports_instrument_kind(
         // Option
         (GateioOptions | Okx, Option { .. }) => true,
         (_, Option { .. }) => false,
+
+        // Cfd
+        (LseCfd | LseFutures, Cfd) => true,
+        (_, Cfd) => false,
     }
 }
 
@@ -369,6 +380,64 @@ impl<T> Map<T> {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+
+    mod supports {
+        use super::*;
+        use rustrade_instrument::exchange::ExchangeId;
+
+        /// The London Strategic Edge datasets, paired with the single
+        /// [`MarketDataInstrumentKind`] each one serves.
+        const LSE: [(ExchangeId, MarketDataInstrumentKind); 5] = [
+            (ExchangeId::LseFx, MarketDataInstrumentKind::Spot),
+            (ExchangeId::LseCrypto, MarketDataInstrumentKind::Spot),
+            (ExchangeId::LseEquities, MarketDataInstrumentKind::Spot),
+            (ExchangeId::LseFutures, MarketDataInstrumentKind::Cfd),
+            (ExchangeId::LseCfd, MarketDataInstrumentKind::Cfd),
+        ];
+
+        #[test]
+        fn test_lse_supports_exactly_its_own_kind() {
+            // Each dataset serves one kind and must deny the others. The denials matter as much as
+            // the grants: `exchange_supports_instrument_kind`'s `(_, Spot) => true` default means
+            // a CFD-only dataset would otherwise claim spot support with no edit and no error.
+            for (exchange, supported) in LSE {
+                assert!(
+                    exchange_supports_instrument_kind(exchange, &supported),
+                    "{exchange:?} should support {supported:?}"
+                );
+
+                for denied in [
+                    MarketDataInstrumentKind::Spot,
+                    MarketDataInstrumentKind::Cfd,
+                    MarketDataInstrumentKind::Perpetual,
+                ] {
+                    if denied == supported {
+                        continue;
+                    }
+                    assert!(
+                        !exchange_supports_instrument_kind(exchange, &denied),
+                        "{exchange:?} should not support {denied:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_cfd_denied_for_non_cfd_exchanges() {
+            for exchange in [
+                ExchangeId::BinanceSpot,
+                ExchangeId::Coinbase,
+                ExchangeId::Okx,
+                ExchangeId::GateioOptions,
+                ExchangeId::Mock,
+            ] {
+                assert!(
+                    !exchange_supports_instrument_kind(exchange, &MarketDataInstrumentKind::Cfd),
+                    "{exchange:?} should not support Cfd"
+                );
+            }
+        }
+    }
 
     mod subscription {
         use super::*;

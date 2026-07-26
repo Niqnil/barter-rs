@@ -275,8 +275,9 @@ where
                         return;
                     }
                     // Unsupported instrument kind (checked first, like the live handler): equity
-                    // splits only apply to `Spot`. `id` not recorded ⇒ retryable.
-                    if !matches!(instrument_state.instrument.kind, InstrumentKind::Spot) {
+                    // splits only apply to the deliverable equity. `id` not recorded ⇒ retryable.
+                    // Shares `is_split_eligible` with the live handler so the two cannot drift.
+                    if !instrument_state.instrument.kind.is_split_eligible() {
                         return;
                     }
                 }

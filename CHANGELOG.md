@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`InstrumentKind::Cfd` — contracts-for-difference are now modelled** (`rustrade-instrument`).
+  CFDs previously had no correct representation: `Spot` would pollute every downstream `Spot`
+  filter — including the corporate-action and option-settlement scans, which mean specifically
+  *the deliverable equity* — with instruments that are never deliverable, while `Future` requires
+  an expiry a CFD does not have, and a fabricated expiry is not inert (it becomes a
+  subscription-binding key and drives contract-expiry settlement). The variant carries a
+  `CfdContract { contract_size, settlement_asset }` rather than being a unit variant, because both
+  fields are load-bearing: `contract_size` feeds fee computation, unrealised PnL and risk notional
+  (real CFDs are commonly per-point multipliers, so a unit variant would hard-code `Decimal::ONE`
+  into the money path), and `IndexedInstrumentsBuilder` registers a settlement asset only for kinds
+  that report one, so a CFD reporting `None` could never have its account currency indexed. The
+  market-data twin `MarketDataInstrumentKind::Cfd` is a unit variant — it has no expiry or strike
+  to bind on — and is kept distinct from `Spot` because one connector can serve both a spot
+  instrument and a CFD on the same `(exchange, base, quote)`, where folding them would make
+  subscription binding resolve to whichever iterated first.
+  *Note:* neither enum is `#[non_exhaustive]`, so downstream exhaustive `match`es need a new arm.
+
+- **London Strategic Edge exchange identifiers** (`rustrade-instrument`): `LseFx`, `LseCrypto`,
+  `LseEquities`, `LseFutures` and `LseCfd`, one per dataset family, so `MarketEvent.exchange`
+  carries provenance and each dataset declares its own support. Appended at the end of `ExchangeId`
+  deliberately: the enum derives `Ord` from declaration order and `IndexedInstrumentsBuilder`
+  sorts by it, so inserting mid-enum renumbers `ExchangeIndex` and `InstrumentIndex` for existing
+  configurations — indices that are serialized into engine state, the audit replica and backtest
+  replay streams. **Instrument indices are stable across releases only while variants are
+  appended.**
+
+- **London Strategic Edge symbology** (`rustrade-data`, new `lse` feature, off by default):
+  dataset → `(ExchangeId, MarketDataInstrumentKind)` mapping, display-symbol → `(base, quote)`
+  resolution, and a fallible dataset-slug helper. **⚠️ London (`.L`) listings are quoted in pence**,
+  and the provider reports no unit for them, so they quote in **GBX** — an asset distinct from GBP,
+  with prices passed through unscaled. Quoting them in GBP would inflate notional, fees, unrealised
+  PnL and every balance by 100×, silently. `.A`/`.B` are US share classes rather than venue
+  suffixes. Slug derivation is `symbol -> Result<_, _>` rather than a string transformation because
+  the mapping is not injective — thirteen futures symbols resolve to a slug shared with a different
+  series, and the provider answers `200` for it.
+  **⚠️ Licensing:** this crate is MIT-licensed; **the data this integration retrieves is not
+  redistributable**. London Strategic Edge permits use for your own research, trading and model
+  training, including commercially, but prohibits redistributing, reselling or otherwise making the
+  data available to third parties in any form. See <https://londonstrategicedge.com/terms>.
+
 - **`CandleInterval` gains the sub-minute resolutions `Sec5`, `Sec15` and `Sec30`**
   (`rustrade-data`, `subscription::candle`). `CandleInterval` is the venue-agnostic *union* of
   every resolution any connector serves, and providers exist that publish `5s`/`15s`/`30s` bars
@@ -179,6 +219,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ibkr_flex_corporate_actions`, `--features ibkr`) sketches the wrapper-side reconcile.
 
 ### Changed
+
+- **`IndexedInstrumentsBuilder` now rejects duplicate `InstrumentNameInternal`s**
+  (`rustrade-instrument`). `InstrumentStates` is keyed on `InstrumentNameInternal` but read
+  *positionally* by `InstrumentIndex`, and nothing enforced that the two agreed. The existing
+  `Instrument` dedup does not cover it — it removes only instruments equal in *every* field, so two
+  genuinely different instruments sharing a name survived it, then collapsed into one map entry.
+  Every `InstrumentIndex` past the collision then resolved to the wrong instrument's state, with
+  positions, unrealised PnL, orders and tear sheets attaching to the wrong instrument and only the
+  final index panicking. The invariant is now checked at build time: `build`/`new` panic naming the
+  duplicate, and the new fallible `IndexedInstrumentsBuilder::try_build` /
+  `IndexedInstruments::try_new` return `IndexError::DuplicateInstrumentNameInternal` instead.
+  `IndexError` is now `#[non_exhaustive]`; downstream exhaustive `match`es need a wildcard arm.
+
+- **`InstrumentKind::eq_market_data_instrument_kind` is exhaustive on `self`**
+  (`rustrade-instrument`). Its `_ => false` fallthrough meant a new `InstrumentKind` variant
+  compiled clean and then silently failed to bind its market-data subscription — an instrument
+  configured, indexed, and permanently dataless, invisible to both `cargo build` and clippy. A
+  missing arm is now a compile error. Behaviour for existing variants is unchanged.
+
+- **Corporate-action split eligibility is single-sourced as `InstrumentKind::is_split_eligible`**
+  (`rustrade`). The live handler and its audit replica previously carried hand-mirrored
+  `matches!(kind, InstrumentKind::Spot)` guards whose drift was caught only after the fact by a
+  parity test. The rule being pinned is *the deliverable equity*; `Spot` is only its current
+  spelling. No behaviour change.
 
 - **BREAKING: `Candle.volume` and `Candle.trade_count` are now `Option` (`Option<Decimal>` /
   `Option<u64>`)** (`rustrade-data`, `subscription::candle`). A candle producer that carries no
@@ -351,6 +415,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **`InstrumentNameInternal`'s two constructors produced different names for the same instrument**
+  (`rustrade-instrument`). `new_from_exchange_underlying` interpolated the `ExchangeId` directly,
+  which renders the bare *variant* name (`BinanceSpot` → `binancespot-btc_usdt`), while
+  `new_from_exchange` used the canonical `ExchangeId::as_str` (`binance_spot-btc_usdt`).
+  `InstrumentNameInternal` is an identity key — it keys the engine's instrument state map and is
+  the lookup argument of `InstrumentStates::instrument`, which panics when absent — so an
+  instrument declared through a JSON configuration and the same instrument built in-library never
+  resolved to each other. Both constructors now use `as_str`. The divergence was invisible because
+  every existing test constructed names through the second constructor.
 
 - **Published rustdoc no longer points at items readers cannot open** (`rustrade-data`). Twelve
   public items across the IBKR Flex, Massive and Alpaca surfaces linked to private items, which

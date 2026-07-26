@@ -23,6 +23,12 @@ hyperliquid = ["dep:hyperliquid_rust_sdk"]
 # deterministic, lossless string wire format for all other `Decimal` values.
 alpaca = ["rust_decimal/serde-with-float"]
 databento = ["dep:databento"]
+# London Strategic Edge. No extra dependencies today; the feature exists so the integration is
+# opt-in from the start, matching every other provider in this crate.
+#
+# ⚠️ The data this integration retrieves is NOT redistributable, whatever this crate's own licence
+# says. See `exchange::lse` and https://londonstrategicedge.com/terms
+lse = []
 massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
 
 [dev-dependencies]

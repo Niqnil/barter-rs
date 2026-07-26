@@ -1,0 +1,469 @@
+use crate::exchange::lse::error::LseError;
+use rustrade_instrument::{
+    Underlying, asset::name::AssetNameExchange, exchange::ExchangeId,
+    instrument::market_data::kind::MarketDataInstrumentKind,
+};
+use smol_str::{SmolStr, StrExt};
+
+/// A London Strategic Edge price dataset.
+///
+/// The provider also publishes reference datasets (bond yields, credit indices, economics, …).
+/// Those are not instruments and have no variant here — they are distinguishable in the catalog
+/// mechanically, since every price dataset carries an empty `frequency` and `category` while every
+/// reference dataset populates both.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum LseDataset {
+    Stocks,
+    Etf,
+    Crypto,
+    Fx,
+    Index,
+    Commodity,
+    InterestRates,
+    CurrencyIndex,
+    Volatility,
+    Futures,
+}
+
+impl LseDataset {
+    /// Every price dataset, in catalog order.
+    pub const ALL: [Self; 10] = [
+        Self::Stocks,
+        Self::Etf,
+        Self::Crypto,
+        Self::Fx,
+        Self::Index,
+        Self::Commodity,
+        Self::InterestRates,
+        Self::CurrencyIndex,
+        Self::Volatility,
+        Self::Futures,
+    ];
+
+    /// Returns the name this dataset carries in the provider's catalog.
+    pub fn as_catalog_str(&self) -> &'static str {
+        match self {
+            Self::Stocks => "stocks",
+            Self::Etf => "etf",
+            Self::Crypto => "crypto",
+            Self::Fx => "fx",
+            Self::Index => "index",
+            Self::Commodity => "commodity",
+            Self::InterestRates => "interest_rates",
+            Self::CurrencyIndex => "currency_index",
+            Self::Volatility => "volatility",
+            Self::Futures => "futures",
+        }
+    }
+
+    /// Parses a catalog dataset name.
+    ///
+    /// # Errors
+    /// Returns [`LseError::UnknownDataset`] for anything that is not a price dataset — including
+    /// the provider's reference datasets, which are not instruments.
+    pub fn from_catalog_str(dataset: &str) -> Result<Self, LseError> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_catalog_str() == dataset)
+            .ok_or_else(|| LseError::UnknownDataset(dataset.to_string()))
+    }
+
+    /// Returns the [`ExchangeId`] this dataset's market events are stamped with.
+    pub fn exchange_id(&self) -> ExchangeId {
+        match self {
+            // Stocks and ETFs share one identifier: they are the same venue, the same symbology
+            // and the same coverage, differing only in what the instrument is.
+            Self::Stocks | Self::Etf => ExchangeId::LseEquities,
+            Self::Crypto => ExchangeId::LseCrypto,
+            Self::Fx => ExchangeId::LseFx,
+            Self::Futures => ExchangeId::LseFutures,
+            Self::Index
+            | Self::Commodity
+            | Self::InterestRates
+            | Self::CurrencyIndex
+            | Self::Volatility => ExchangeId::LseCfd,
+        }
+    }
+
+    /// Returns the [`MarketDataInstrumentKind`] this dataset serves.
+    ///
+    /// # Note
+    /// The executable counterpart, `InstrumentKind::Cfd`, additionally requires a settlement asset
+    /// — the *account* currency, which is a property of the caller's account rather than of the
+    /// data — so it cannot be produced here.
+    pub fn market_data_kind(&self) -> MarketDataInstrumentKind {
+        match self {
+            // Spot: deliverable, and priced as a consolidated series rather than a broker's own.
+            // FX stays spot rather than CFD: the retail-OTC caveat that would motivate `Cfd` is
+            // already expressed un-ignorably by the vault omitting volume entirely.
+            Self::Stocks | Self::Etf | Self::Crypto | Self::Fx => MarketDataInstrumentKind::Spot,
+            // CFD: no venue, no contract size, no expiry. `futures` belongs here and NOT to
+            // `Future` — these series are continuous front-month proxies with no contract chain
+            // and no expiry, and `FutureContract` requires one. A fabricated expiry is not inert:
+            // it becomes a subscription-binding key and drives contract-expiry settlement.
+            Self::Index
+            | Self::Commodity
+            | Self::InterestRates
+            | Self::CurrencyIndex
+            | Self::Volatility
+            | Self::Futures => MarketDataInstrumentKind::Cfd,
+        }
+    }
+}
+
+/// A London Strategic Edge dataset slug — the path key of the provider's dataset-info endpoint.
+///
+/// A slug is a **discovery key, not an identity**. Candle endpoints are keyed on the display
+/// symbol, so nothing in this integration needs a slug to fetch data.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct LseSlug(SmolStr);
+
+impl LseSlug {
+    /// Returns the slug as a `str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for LseSlug {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for LseSlug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Symbol stems whose slug is shared by more than one distinct series.
+///
+/// The first eleven are Eurex futures that publish **both** a bare and a `.F` series holding
+/// different data — different tick counts over different date ranges — which collapse onto one
+/// slug, with the dataset-info endpoint answering for the `.F` series and the bare series having
+/// no reachable slug at all. The last two are futures whose stripped symbol collides with an
+/// unrelated equity ticker (`ES.F` with Eversource, `SI.F` with an unrelated listing), where the
+/// endpoint answers with the future.
+///
+/// Both spellings of each stem are ambiguous: whichever the caller asked for, the slug identifies
+/// the other series just as plausibly.
+const AMBIGUOUS_SLUG_STEMS: [&str; 13] = [
+    "fbtp", "fdax", "fdxm", "fesx", "fgbl", "fgbm", "fgbs", "fmeu", "fmwo", "foat", "fsmi", "es",
+    "si",
+];
+
+/// Suffixes that look like a venue suffix but are not, and therefore must not select a quote
+/// currency.
+///
+/// `A` and `B` are US **share classes** (`BRK.B`, `BF.A`, `HEI.A`); `F` marks a continuous futures
+/// proxy. Listing them is documentation — [`quote_asset`] defaults to USD for any unrecognised
+/// suffix — but the naive `.`-split venue parse they defeat is a real trap, so they are named.
+///
+/// Test-only because the default arm already handles them: nothing in the parse needs to consult
+/// this list, only the test that pins the behaviour it describes.
+#[cfg(test)]
+const NON_VENUE_SUFFIXES: [&str; 3] = ["A", "B", "F"];
+
+/// Returns the quote asset for a London Strategic Edge display symbol.
+///
+/// Pair-shaped symbols (`EUR/USD`, `XAU/USD`, `SPX500/USD`) state their quote directly. Bare
+/// tickers do not, so the quote is derived from the venue suffix, defaulting to USD.
+///
+/// # ⚠️ `.L` symbols are quoted in PENCE, not pounds
+/// London listings are quoted in pence and the provider's catalog reports no unit, so `.L` symbols
+/// map to **GBX** (penny sterling), a *distinct asset from GBP*. This is not cosmetic: `BP.L`
+/// prints ~548 where BP trades around £5.48, so quoting these in GBP would inflate notional, fees,
+/// unrealised PnL and every balance by 100×, silently. Prices are passed through exactly as the
+/// provider reports them — in pence — and it is the asset that carries the scale.
+///
+/// Note that GBX must be spelled distinctly rather than cased differently (`GBp`): asset names are
+/// lowercased internally, so `GBp` and `GBP` would be one and the same asset.
+///
+/// # Venue suffixes
+/// `.L` → GBX, `.T` → JPY, `.HK` → HKD, `.NS` → INR, `.AX` → AUD, `.KS` → KRW, `.TW` → TWD.
+/// Everything else — including the share-class suffixes `.A`/`.B` and the continuous-futures `.F`
+/// — is USD. The suffix is *not* stripped from the base asset; see [`underlying`].
+///
+/// Currency is deliberately **not** derived from the catalog's `country` field, which records
+/// issuer domicile rather than listing venue: Bermuda- and Ireland-domiciled names are USD-quoted,
+/// and some entries carry no country at all.
+pub fn quote_asset(symbol: &str) -> AssetNameExchange {
+    if let Some((_, quote)) = symbol.split_once('/') {
+        return AssetNameExchange::new(quote.to_uppercase_smolstr());
+    }
+
+    let quote = match symbol.rsplit_once('.') {
+        Some((_, "L")) => "GBX",
+        Some((_, "T")) => "JPY",
+        Some((_, "HK")) => "HKD",
+        Some((_, "NS")) => "INR",
+        Some((_, "AX")) => "AUD",
+        Some((_, "KS")) => "KRW",
+        Some((_, "TW")) => "TWD",
+        // Unrecognised suffix, share class, or no suffix at all.
+        _ => "USD",
+    };
+
+    AssetNameExchange::new(quote)
+}
+
+/// Splits a London Strategic Edge display symbol into its base and quote assets.
+///
+/// Pair-shaped symbols split at the `/`. Bare tickers take the whole symbol as the base —
+/// **including any venue suffix** — and derive the quote via [`quote_asset`].
+///
+/// The suffix is retained deliberately: stripping it would merge a London listing and a
+/// same-ticker US listing into one asset on one exchange, despite different currencies and
+/// different economics.
+pub fn underlying(symbol: &str) -> Underlying<AssetNameExchange> {
+    let quote = quote_asset(symbol);
+
+    let base = match symbol.split_once('/') {
+        Some((base, _)) => base,
+        None => symbol,
+    };
+
+    Underlying::new(AssetNameExchange::new(base.to_uppercase_smolstr()), quote)
+}
+
+/// Derives the dataset slug for a London Strategic Edge display symbol.
+///
+/// The slug is the path key of the provider's dataset-info endpoint. It is a **discovery helper,
+/// not an instrument identity** — candle endpoints key on the display symbol, so no data fetch
+/// needs one.
+///
+/// The transformation is: lowercase, `/` → `_`, and drop a trailing `.F`.
+///
+/// # Errors
+/// Returns [`LseError::AmbiguousSlug`] when more than one distinct series resolves to the derived
+/// slug. This is the case the signature exists for: the dataset-info endpoint answers `200` for an
+/// ambiguous slug, silently serving whichever series it prefers, so a plain string transformation
+/// would return the wrong dataset with no error. See [`AMBIGUOUS_SLUG_STEMS`].
+///
+/// # Caller obligation
+/// A derived slug is not verified to exist. The `.F` rule is measured; the behaviour of other
+/// dotted suffixes (`.L`, `.T`, `.A`, …) is not, and they are carried through verbatim. A slug
+/// that does not exist fails observably as a `404` — unlike the ambiguous case above, which is why
+/// only ambiguity is an error here.
+pub fn slug(symbol: &str) -> Result<LseSlug, LseError> {
+    let stem = symbol.strip_suffix(".F").unwrap_or(symbol);
+    let slug = stem.replace('/', "_").to_lowercase_smolstr();
+
+    if AMBIGUOUS_SLUG_STEMS.contains(&slug.as_str()) {
+        return Err(LseError::AmbiguousSlug {
+            symbol: symbol.to_string(),
+            slug: slug.to_string(),
+        });
+    }
+
+    Ok(LseSlug(slug))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quote_asset_pair_shaped_symbols() {
+        for (symbol, expected) in [
+            ("EUR/USD", "USD"),
+            ("BTC/USD", "USD"),
+            ("XAU/USD", "USD"),
+            ("SPX500/USD", "USD"),
+            ("EUR/GBP", "GBP"),
+        ] {
+            assert_eq!(quote_asset(symbol), AssetNameExchange::new(expected));
+        }
+    }
+
+    #[test]
+    fn test_quote_asset_venue_suffixes() {
+        for (symbol, expected) in [
+            ("BP.L", "GBX"),
+            ("7203.T", "JPY"),
+            ("0700.HK", "HKD"),
+            ("INFY.NS", "INR"),
+            ("BHP.AX", "AUD"),
+            ("005930.KS", "KRW"),
+            ("2330.TW", "TWD"),
+        ] {
+            assert_eq!(quote_asset(symbol), AssetNameExchange::new(expected));
+        }
+    }
+
+    #[test]
+    fn test_quote_asset_london_listings_are_pence_not_pounds() {
+        // The 100x trap. GBX must be a genuinely distinct name from GBP -- asset names are
+        // lowercased internally, so a `GBp`/`GBP` casing distinction would collapse to one asset.
+        let gbx = quote_asset("BP.L");
+        assert_eq!(gbx, AssetNameExchange::new("GBX"));
+        assert_ne!(gbx, AssetNameExchange::new("GBP"));
+        assert_ne!(gbx.name().to_lowercase_smolstr(), "gbp");
+    }
+
+    #[test]
+    fn test_quote_asset_share_classes_are_not_venues() {
+        // `.A` and `.B` are US share classes. A naive `.`-split venue parse maps `BRK.B` to a
+        // venue that does not exist; these must fall through to USD.
+        for symbol in ["BRK.B", "BF.A", "HEI.A"] {
+            assert_eq!(quote_asset(symbol), AssetNameExchange::new("USD"));
+        }
+
+        for suffix in NON_VENUE_SUFFIXES {
+            assert_eq!(
+                quote_asset(&format!("XYZ.{suffix}")),
+                AssetNameExchange::new("USD"),
+                "{suffix} must not select a quote currency"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quote_asset_bare_tickers_default_to_usd() {
+        for symbol in ["AAPL", "MSFT", "SPY", "ES.F"] {
+            assert_eq!(quote_asset(symbol), AssetNameExchange::new("USD"));
+        }
+    }
+
+    #[test]
+    fn test_underlying_retains_the_venue_suffix() {
+        // Stripping `.L` would merge the London listing with a same-ticker US listing into one
+        // asset on one exchange, despite the two being quoted in different currencies.
+        let london = underlying("BP.L");
+        assert_eq!(london.base, AssetNameExchange::new("BP.L"));
+        assert_eq!(london.quote, AssetNameExchange::new("GBX"));
+
+        let us = underlying("BP");
+        assert_eq!(us.base, AssetNameExchange::new("BP"));
+        assert_eq!(us.quote, AssetNameExchange::new("USD"));
+
+        assert_ne!(london.base, us.base);
+    }
+
+    #[test]
+    fn test_underlying_pair_shaped_symbols() {
+        let fx = underlying("EUR/USD");
+        assert_eq!(fx.base, AssetNameExchange::new("EUR"));
+        assert_eq!(fx.quote, AssetNameExchange::new("USD"));
+
+        let cfd = underlying("SPX500/USD");
+        assert_eq!(cfd.base, AssetNameExchange::new("SPX500"));
+        assert_eq!(cfd.quote, AssetNameExchange::new("USD"));
+    }
+
+    #[test]
+    fn test_slug_transformation() {
+        for (symbol, expected) in [
+            ("AAPL", "aapl"),
+            ("EUR/USD", "eur_usd"),
+            ("SPX500/USD", "spx500_usd"),
+            ("NQ.F", "nq"),
+        ] {
+            assert_eq!(slug(symbol).unwrap().as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn test_slug_rejects_ambiguous_symbols() {
+        // Both spellings must be rejected: the bare and `.F` series are different data, and the
+        // endpoint answers 200 for the slug regardless of which one the caller meant.
+        for symbol in [
+            "FBTP", "FBTP.F", "FDAX", "FDAX.F", "ES", "ES.F", "SI", "SI.F",
+        ] {
+            let error = slug(symbol).unwrap_err();
+            assert!(
+                matches!(error, LseError::AmbiguousSlug { .. }),
+                "{symbol} should be ambiguous, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_slug_ambiguity_is_case_insensitive() {
+        assert!(matches!(
+            slug("fbtp.F").unwrap_err(),
+            LseError::AmbiguousSlug { .. }
+        ));
+    }
+
+    #[test]
+    fn test_dataset_exchange_and_kind_mapping() {
+        use LseDataset::*;
+
+        for (dataset, exchange, kind) in [
+            (
+                Stocks,
+                ExchangeId::LseEquities,
+                MarketDataInstrumentKind::Spot,
+            ),
+            (Etf, ExchangeId::LseEquities, MarketDataInstrumentKind::Spot),
+            (
+                Crypto,
+                ExchangeId::LseCrypto,
+                MarketDataInstrumentKind::Spot,
+            ),
+            (Fx, ExchangeId::LseFx, MarketDataInstrumentKind::Spot),
+            (Index, ExchangeId::LseCfd, MarketDataInstrumentKind::Cfd),
+            (Commodity, ExchangeId::LseCfd, MarketDataInstrumentKind::Cfd),
+            (
+                InterestRates,
+                ExchangeId::LseCfd,
+                MarketDataInstrumentKind::Cfd,
+            ),
+            (
+                CurrencyIndex,
+                ExchangeId::LseCfd,
+                MarketDataInstrumentKind::Cfd,
+            ),
+            (
+                Volatility,
+                ExchangeId::LseCfd,
+                MarketDataInstrumentKind::Cfd,
+            ),
+            // Futures are CFDs, not `Future`: continuous proxies with no contract chain or expiry.
+            (
+                Futures,
+                ExchangeId::LseFutures,
+                MarketDataInstrumentKind::Cfd,
+            ),
+        ] {
+            assert_eq!(dataset.exchange_id(), exchange, "{dataset:?}");
+            assert_eq!(dataset.market_data_kind(), kind, "{dataset:?}");
+        }
+    }
+
+    #[test]
+    fn test_dataset_catalog_str_roundtrip() {
+        for dataset in LseDataset::ALL {
+            assert_eq!(
+                LseDataset::from_catalog_str(dataset.as_catalog_str()).unwrap(),
+                dataset
+            );
+        }
+
+        // Reference datasets are not instruments and must not parse as price datasets.
+        for reference in ["bonds", "sovereign_yields", "economics", "credit_indices"] {
+            assert!(matches!(
+                LseDataset::from_catalog_str(reference).unwrap_err(),
+                LseError::UnknownDataset(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_every_dataset_maps_to_a_declared_support_arm() {
+        // Each dataset's (exchange, kind) pair must be declared supported, or subscriptions built
+        // from this mapping would be rejected at validation.
+        for dataset in LseDataset::ALL {
+            assert!(
+                crate::subscription::exchange_supports_instrument_kind(
+                    dataset.exchange_id(),
+                    &dataset.market_data_kind()
+                ),
+                "{dataset:?} maps to an unsupported (exchange, kind) pair"
+            );
+        }
+    }
+}

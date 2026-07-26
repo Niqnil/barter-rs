@@ -11,7 +11,7 @@ use rustrade_instrument::{
     instrument::{
         Instrument,
         kind::{
-            InstrumentKind, future::FutureContract, option::OptionContract,
+            InstrumentKind, cfd::CfdContract, future::FutureContract, option::OptionContract,
             perpetual::PerpetualContract,
         },
         name::{InstrumentNameExchange, InstrumentNameInternal},
@@ -101,6 +101,10 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
                     exercise: contract.exercise,
                     expiry: contract.expiry,
                     strike: contract.strike,
+                }),
+                InstrumentKind::Cfd(contract) => InstrumentKind::Cfd(CfdContract {
+                    contract_size: contract.contract_size,
+                    settlement_asset: Asset::new_from_exchange(contract.settlement_asset),
                 }),
             },
             spec: value.spec.map(|spec| InstrumentSpec {

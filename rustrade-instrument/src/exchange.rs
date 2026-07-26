@@ -101,6 +101,26 @@ pub enum ExchangeId {
     Mexc,
     Okx,
     Poloniex,
+    // ---------------------------------------------------------------------------------------
+    // NOTE: append new variants HERE, at the end.
+    //
+    // `ExchangeId` derives `Ord` from declaration order, and `IndexedInstrumentsBuilder::build`
+    // sorts exchanges and instruments by it -- `Instrument`'s own `Ord` leads with `exchange`.
+    // Inserting a variant mid-enum therefore renumbers `ExchangeIndex` and `InstrumentIndex` for
+    // every existing configuration containing an exchange that sorts after the insertion point,
+    // and those indices are serialized into engine state, the audit replica and backtest replay
+    // streams. Appending renumbers nothing.
+    // ---------------------------------------------------------------------------------------
+    /// London Strategic Edge FX (spot currency pairs)
+    LseFx,
+    /// London Strategic Edge crypto (aggregated spot tape; no venue, funding or liquidations)
+    LseCrypto,
+    /// London Strategic Edge equities & ETFs
+    LseEquities,
+    /// London Strategic Edge futures (continuous front-month proxies; no contract chain or roll)
+    LseFutures,
+    /// London Strategic Edge CFDs (index, commodity, interest rates, currency index, volatility)
+    LseCfd,
 }
 
 impl ExchangeId {
@@ -157,6 +177,11 @@ impl ExchangeId {
             ExchangeId::HyperliquidSpot => "hyperliquid_spot",
             ExchangeId::Ibkr => "ibkr",
             ExchangeId::Kraken => "kraken",
+            ExchangeId::LseCfd => "lse_cfd",
+            ExchangeId::LseCrypto => "lse_crypto",
+            ExchangeId::LseEquities => "lse_equities",
+            ExchangeId::LseFutures => "lse_futures",
+            ExchangeId::LseFx => "lse_fx",
             ExchangeId::Kucoin => "kucoin",
             ExchangeId::Liquid => "liquid",
             ExchangeId::Massive => "massive",
@@ -182,6 +207,50 @@ mod tests {
             serde_json::from_str::<ExchangeId>(r#""huobi""#).unwrap(),
             ExchangeId::Htx
         );
+    }
+
+    #[test]
+    fn test_serde_lse_variants() {
+        // `as_str` and the serde representation must agree: `as_str` is what
+        // `InstrumentNameInternal` embeds, and the serde string is what users write in configs.
+        // A mismatch splits one exchange into two spellings across that boundary.
+        for (exchange, expected) in [
+            (ExchangeId::LseFx, "lse_fx"),
+            (ExchangeId::LseCrypto, "lse_crypto"),
+            (ExchangeId::LseEquities, "lse_equities"),
+            (ExchangeId::LseFutures, "lse_futures"),
+            (ExchangeId::LseCfd, "lse_cfd"),
+        ] {
+            assert_eq!(exchange.as_str(), expected);
+            assert_eq!(
+                serde_json::to_string(&exchange).unwrap(),
+                format!(r#""{expected}""#)
+            );
+            assert_eq!(
+                serde_json::from_str::<ExchangeId>(&format!(r#""{expected}""#)).unwrap(),
+                exchange
+            );
+        }
+    }
+
+    #[test]
+    fn test_lse_variants_are_appended_last() {
+        // `ExchangeId` derives `Ord` from declaration order, and that ordering determines
+        // `ExchangeIndex`/`InstrumentIndex` assignment in `IndexedInstrumentsBuilder::build`.
+        // Appending renumbers nothing for existing configurations; inserting mid-enum silently
+        // renumbers indices that are serialized into engine state and replay streams.
+        for exchange in [
+            ExchangeId::LseFx,
+            ExchangeId::LseCrypto,
+            ExchangeId::LseEquities,
+            ExchangeId::LseFutures,
+            ExchangeId::LseCfd,
+        ] {
+            assert!(
+                exchange > ExchangeId::Poloniex,
+                "{exchange:?} must sort after every pre-existing variant"
+            );
+        }
     }
 
     #[test]

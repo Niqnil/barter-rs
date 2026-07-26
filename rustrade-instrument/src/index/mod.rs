@@ -44,7 +44,31 @@ impl IndexedInstruments {
     /// could invalidate existing index lookup tables).
     ///
     /// For incremental initialisation, see the [`IndexedInstrumentsBuilder`].
+    ///
+    /// # Panics
+    /// Panics if the provided `Instrument`s are not a valid collection — see [`Self::try_new`],
+    /// which returns that as an [`IndexError`] instead.
     pub fn new<Iter, I>(instruments: Iter) -> Self
+    where
+        Iter: IntoIterator<Item = I>,
+        I: Into<Instrument<ExchangeId, Asset>>,
+    {
+        // Deliberate panic: `new` is the infallible convenience over `try_new`, and mirrors
+        // `IndexedInstrumentsBuilder::build`. `FromIterator` cannot return a `Result`, so an
+        // infallible constructor has to exist regardless.
+        #[allow(clippy::panic)] // Documented in this method's `# Panics` section.
+        Self::try_new(instruments)
+            .unwrap_or_else(|error| panic!("failed to build IndexedInstruments: {error}"))
+    }
+
+    /// Initialises a new `IndexedInstruments` from an iterator of [`Instrument`]s, returning an
+    /// [`IndexError`] if they are not a valid collection.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two `Instrument`s share an
+    /// [`InstrumentNameInternal`] — see [`IndexedInstrumentsBuilder::try_build`] for why that
+    /// invariant exists.
+    pub fn try_new<Iter, I>(instruments: Iter) -> Result<Self, IndexError>
     where
         Iter: IntoIterator<Item = I>,
         I: Into<Instrument<ExchangeId, Asset>>,
@@ -54,7 +78,7 @@ impl IndexedInstruments {
             .fold(Self::builder(), |builder, instrument| {
                 builder.add_instrument(instrument.into())
             })
-            .build()
+            .try_build()
     }
 
     /// Returns a new [`IndexedInstrumentsBuilder`] useful for incremental initialisation of
