@@ -35,5 +35,14 @@
 /// Errors produced by the London Strategic Edge integration.
 pub mod error;
 
+/// Paged historical candles from the vault.
+pub mod historical;
+
 /// London Strategic Edge symbology: datasets, underlying assets, quote currencies and slugs.
 pub mod market;
+
+/// The shared streaming + export allowance, as the provider reports it.
+pub mod quota;
+
+/// Authenticated REST transport for the vault data plane.
+pub mod vault;

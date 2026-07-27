@@ -49,6 +49,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   training, including commercially, but prohibits redistributing, reselling or otherwise making the
   data available to third parties in any form. See <https://londonstrategicedge.com/terms>.
 
+- **London Strategic Edge historical candles** (`rustrade-data`, `lse` feature): an authenticated
+  vault REST client (`LseVaultClient`, `x-api-key`, or `from_env` on `LSE_API_KEY`) with a paged
+  `fetch_candles` stream and a `collect_candles` convenience. Candles are keyed on the **display
+  symbol** (`EUR/USD`, `AAPL`, `ES.F`), not a dataset slug. The provider serves 14 of
+  `CandleInterval`'s variants — it publishes no `2h`/`6h`/`8h`/`12h`/`3d`, and spells one month
+  `1mo` rather than the shared enum's `1M` — and an unserved resolution is rejected before the
+  request is sent rather than relayed as a `400`.
+  `fetch_candles` follows the same range contract as the crate's other historical fetches: candles
+  whose exclusive `close_time` falls in `[start, end]`, both inclusive, matched on `close_time`.
+  This required mapping from the vault's own range, which is expressed on the bar's **open** time
+  with an **exclusive** upper bound. Several provider behaviours are handled that would otherwise
+  be silent: the resolution parameter is `timeframe` (the vault ignores unknown parameters and
+  defaults to 1-minute bars, returning a byte-identical shape, so a misspelling yields the wrong
+  resolution with a `200`); the reported timestamp is the bar's open, so `close_time` is derived
+  through the shared boundary helper rather than passed through; and the 5,000-row cap is applied
+  with no envelope, cursor or marker, so pagination continues to an empty page rather than treating
+  a short page as terminal. Zero-activity periods are **absent rather than gap-filled**, unlike
+  Binance's REST klines. FX candles report `volume: None` — the vault omits the field, and a
+  synthetic zero would aggregate into a legitimate-looking total at every derived resolution;
+  `trade_count` is `None` for every dataset, as the vault reports none.
+
+- **London Strategic Edge allowance reporting** (`rustrade-data`, `lse` feature): `QuotaStatus` and
+  `LseVaultClient::usage()`. Unlike every other provider here, London Strategic Edge meters
+  streaming **and** bulk export against a single shared allowance, so a consumer doing both must
+  budget against one pool. The type mirrors the provider's response, which is multi-dimensional
+  (bytes per month, bytes per week, exports per hour, plus static request-shaping limits) and
+  carries **no reset timestamp** — none is synthesised, because a plausible invented instant would
+  be worse than an absent one. Consistent with this crate's separation of concerns, the allowance
+  is *reported, never acted on*: nothing retries, sleeps or throttles on the caller's behalf, and a
+  `429` surfaces as a terminal `LseError::RateLimited` carrying `Retry-After` when present. Pacing
+  between pages is proactive courtesy only, defaulting to the provider's documented rate and
+  overridable via `with_pace` (including `Duration::ZERO` to disable).
+  **⚠️ Licensing:** as above — the retrieved data is **not redistributable**, whatever this crate's
+  own licence says. See <https://londonstrategicedge.com/terms>.
+
 - **`CandleInterval` gains the sub-minute resolutions `Sec5`, `Sec15` and `Sec30`**
   (`rustrade-data`, `subscription::candle`). `CandleInterval` is the venue-agnostic *union* of
   every resolution any connector serves, and providers exist that publish `5s`/`15s`/`30s` bars

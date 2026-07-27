@@ -1,0 +1,449 @@
+//! Transport, pagination and range-contract tests for the London Strategic Edge vault.
+//!
+//! Every response here is **synthetic**, shaped from measurements of the live API. No provider
+//! data is committed — the provider prohibits redistribution
+//! (<https://londonstrategicedge.com/terms>), so `wiremock` is the only in-repo option. The live
+//! API is exercised separately by the shape canary, which asserts against the real service without
+//! storing anything.
+//!
+//! Run with: `cargo test --test lse_vault --features lse`
+
+#![cfg(feature = "lse")]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+
+use chrono::{DateTime, Utc};
+use rust_decimal_macros::dec;
+use rustrade_data::exchange::lse::error::LseError;
+use rustrade_data::exchange::lse::vault::LseVaultClient;
+use rustrade_data::subscription::candle::CandleInterval;
+use std::time::Duration;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Build a client pointed at `server` with pacing disabled so tests do not sleep between pages.
+fn client(server: &MockServer) -> LseVaultClient {
+    LseVaultClient::new("test-key")
+        .unwrap()
+        .with_base_url(format!("{}/vault", server.uri()))
+        .with_pace(Duration::ZERO)
+}
+
+fn utc(raw: &str) -> DateTime<Utc> {
+    raw.parse().unwrap()
+}
+
+/// One equity-shaped candle row, as the vault serves it: `ts` is the bar's OPEN time.
+fn equity_row(ts: &str, close: &str) -> String {
+    format!(
+        r#"{{"ts":"{ts}","symbol":"AAPL","open":1.0,"high":2.0,"low":0.5,"close":{close},"volume":1000}}"#
+    )
+}
+
+/// Mount a candle page keyed on the `start` cursor the client is expected to send.
+async fn mount_page(server: &MockServer, start: &str, rows: &[String]) {
+    Mock::given(method("GET"))
+        .and(path("/vault/candles"))
+        .and(query_param("start", start))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!("[{}]", rows.join(","))))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn paginates_by_advancing_the_cursor_one_second_past_the_last_bars_open() {
+    let server = MockServer::start().await;
+
+    // Page 1 opens at the widened lower bound and returns two daily bars.
+    mount_page(
+        &server,
+        "2024-01-01 00:00:00",
+        &[
+            equity_row("2024-01-01 00:00:00.000000", "10.0"),
+            equity_row("2024-01-02 00:00:00.000000", "11.0"),
+        ],
+    )
+    .await;
+    // The cursor resumes one second past the last bar's OPEN time -- not its close. The parameter
+    // is inclusive and rejects sub-second values, so this is the smallest lossless step.
+    mount_page(
+        &server,
+        "2024-01-02 00:00:01",
+        &[equity_row("2024-01-03 00:00:00.000000", "12.0")],
+    )
+    .await;
+    // No third page: the cursor then lands exactly on the exclusive upper bound, which selects an
+    // empty window, so the fetch stops without asking.
+
+    let candles = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-04T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    // `close_time == open + interval`: the bar labelled 01-01 closes on 01-02.
+    let closes = candles
+        .iter()
+        .map(|candle| candle.close_time)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        closes,
+        vec![
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-03T00:00:00Z"),
+            utc("2024-01-04T00:00:00Z"),
+        ]
+    );
+    assert_eq!(candles[2].close, dec!(12.0));
+}
+
+#[tokio::test]
+async fn a_short_page_does_not_end_pagination() {
+    // The row cap is applied silently, so a short page is indistinguishable from the end of the
+    // data. Treating it as terminal would truncate silently if the provider lowered its cap.
+    let server = MockServer::start().await;
+
+    mount_page(
+        &server,
+        "2024-01-01 00:00:00",
+        &[equity_row("2024-01-01 00:00:00.000000", "10.0")],
+    )
+    .await;
+    mount_page(
+        &server,
+        "2024-01-01 00:00:01",
+        &[equity_row("2024-01-05 00:00:00.000000", "14.0")],
+    )
+    .await;
+    // The range extends past the data, so the fetch ends on an empty page rather than on the bound.
+    mount_page(&server, "2024-01-05 00:00:01", &[]).await;
+
+    let candles = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-10T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    // The second bar is only reachable if a one-row page did not end the fetch.
+    assert_eq!(candles.len(), 2);
+    assert_eq!(candles[1].close_time, utc("2024-01-06T00:00:00Z"));
+}
+
+#[tokio::test]
+async fn pins_the_resolution_parameter_to_timeframe() {
+    // The vault ignores unknown parameters and defaults to 1-minute bars, returning a
+    // byte-identical shape. Sending `resolution` would silently yield the wrong resolution.
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/vault/candles"))
+        .and(query_param("timeframe", "1d"))
+        .and(query_param("limit", "5000"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-03T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    // `expect(1)` is verified on drop.
+}
+
+#[tokio::test]
+async fn sends_the_provider_spelling_of_one_month() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/vault/candles"))
+        // Not the shared enum's `1M`.
+        .and(query_param("timeframe", "1mo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Month1,
+            utc("2024-02-01T00:00:00Z"),
+            utc("2024-03-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn trims_bars_outside_the_close_time_contract() {
+    let server = MockServer::start().await;
+
+    // The lower bound is widened to capture the bar whose close equals `start`, so the page can
+    // legitimately contain a bar that closes before it. That one must not be yielded.
+    mount_page(
+        &server,
+        "2024-01-03 00:00:00",
+        &[
+            equity_row("2024-01-02 00:00:00.000000", "11.0"), // closes 01-03, before `start`
+            equity_row("2024-01-03 00:00:00.000000", "12.0"), // closes 01-04, in range
+            equity_row("2024-01-04 00:00:00.000000", "13.0"), // closes 01-05, past `end`
+        ],
+    )
+    .await;
+
+    let candles = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-04T00:00:00Z"),
+            utc("2024-01-04T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(candles.len(), 1);
+    assert_eq!(candles[0].close_time, utc("2024-01-04T00:00:00Z"));
+    assert_eq!(candles[0].close, dec!(12.0));
+}
+
+#[tokio::test]
+async fn fx_candles_report_absent_volume_as_none() {
+    let server = MockServer::start().await;
+
+    // The measured FX shape: no `volume` key at all.
+    let row = r#"{"ts":"2024-01-01 00:00:00.000000","symbol":"EUR/USD","open":1.05,"high":1.06,"low":1.04,"close":1.055}"#;
+    mount_page(&server, "2024-01-01 00:00:00", &[row.to_owned()]).await;
+
+    let candles = client(&server)
+        .collect_candles(
+            "EUR/USD",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-02T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    // `None`, never `Some(0)` -- a synthetic zero would aggregate into a legitimate-looking total.
+    assert_eq!(candles[0].volume, None);
+    assert_eq!(candles[0].trade_count, None);
+}
+
+#[tokio::test]
+async fn an_inverted_range_fails_before_any_request_is_sent() {
+    let server = MockServer::start().await;
+
+    // No mock is mounted: reaching the network at all would fail the test with a 404 body.
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-05T00:00:00Z"),
+            utc("2024-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LseError::InvalidInput { .. }));
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn an_unserved_resolution_is_rejected_before_any_request_is_sent() {
+    let server = MockServer::start().await;
+
+    // The provider publishes no 6-hour bars; the caller gets a typed answer, not a relayed 400.
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Hour6,
+            utc("2024-01-01T00:00:00Z"),
+            utc("2024-01-02T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        LseError::UnsupportedInterval {
+            interval: CandleInterval::Hour6
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_rate_limit_is_terminal_and_carries_retry_after() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "42")
+                .set_body_string(r#"{"detail":"slow down"}"#),
+        )
+        // Terminal: the client must not sleep and retry on the caller's behalf.
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-03T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        LseError::RateLimited {
+            retry_after: Some(delay),
+        } if delay == Duration::from_secs(42)
+    ));
+}
+
+#[tokio::test]
+async fn a_double_encoded_error_body_surfaces_the_inner_message() {
+    let server = MockServer::start().await;
+
+    // The measured 400 shape: `detail` is itself a JSON document encoded as a string.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"detail":"{\"detail\":\"invalid timeframe '7q'; valid: 1s, 5s\"}"}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-03T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    match error {
+        LseError::Api { status, message } => {
+            assert_eq!(status, 400);
+            // Not the raw `{"detail": ...}` envelope.
+            assert_eq!(message, "invalid timeframe '7q'; valid: 1s, 5s");
+        }
+        other => panic!("expected Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_single_encoded_error_body_surfaces_the_message() {
+    let server = MockServer::start().await;
+
+    // The measured 401 shape, which nests one level less than the 400.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"detail":"invalid api key"}"#))
+        .mount(&server)
+        .await;
+
+    let error = client(&server).usage().await.unwrap_err();
+
+    match error {
+        LseError::Api { status, message } => {
+            assert_eq!(status, 401);
+            assert_eq!(message, "invalid api key");
+        }
+        other => panic!("expected Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn usage_reports_the_shared_allowance() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/vault/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"bytes_used_month":5962,"bytes_cap_month":53687091200,
+                "bytes_used_week":5962,"bytes_cap_week":16106127360,
+                "exports_this_hour":0,"exports_cap_hour":5,
+                "historical_data_months":-1,"calls_per_minute":200,
+                "max_rows_per_request":5000,"vault_concurrency":2}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let status = client(&server).usage().await.unwrap();
+
+    assert_eq!(status.exports_cap_hour, 5);
+    assert_eq!(status.max_rows_per_request, 5000);
+    assert_eq!(status.historical_limit_months(), None);
+    assert!(!status.is_exhausted());
+}
+
+#[tokio::test]
+async fn a_page_that_does_not_advance_the_cursor_is_an_error_not_an_infinite_loop() {
+    let server = MockServer::start().await;
+
+    // A provider that ignored `start` would serve page one forever. Surfaced rather than trusted:
+    // silently-ignored parameters are a measured behaviour of this API.
+    Mock::given(method("GET"))
+        .and(path("/vault/candles"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "[{}]",
+            equity_row("2023-01-01 00:00:00.000000", "9.0")
+        )))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-10T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LseError::Api { .. }));
+}
+
+#[tokio::test]
+async fn a_malformed_timestamp_surfaces_rather_than_being_skipped() {
+    let server = MockServer::start().await;
+
+    mount_page(
+        &server,
+        "2024-01-01 00:00:00",
+        &[r#"{"ts":"not-a-timestamp","symbol":"AAPL","open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":1}"#.to_owned()],
+    )
+    .await;
+
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-03T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LseError::Deserialize { .. }));
+}

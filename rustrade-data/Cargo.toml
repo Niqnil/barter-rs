@@ -123,6 +123,10 @@ name = "hyperliquid_spot_market_data"
 required-features = ["hyperliquid"]
 
 [[example]]
+name = "lse_candles"
+required-features = ["lse"]
+
+[[example]]
 name = "ibkr_historical"
 required-features = ["ibkr"]
 

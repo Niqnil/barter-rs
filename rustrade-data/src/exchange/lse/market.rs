@@ -1,4 +1,5 @@
 use crate::exchange::lse::error::LseError;
+use crate::subscription::candle::CandleInterval;
 use rustrade_instrument::{
     Underlying, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::market_data::kind::MarketDataInstrumentKind,
@@ -260,6 +261,51 @@ pub fn slug(symbol: &str) -> Result<LseSlug, LseError> {
     Ok(LseSlug(slug))
 }
 
+/// Returns the provider's spelling of `interval`, or `None` if it does not serve that resolution.
+///
+/// [`CandleInterval`] is the venue-agnostic union of every resolution any connector in this crate
+/// serves. This provider serves **14 of the 19**: it publishes no `2h`, `6h`, `8h`, `12h` or `3d`.
+///
+/// # ⚠️ The month spelling differs from the shared enum
+/// The provider spells one month **`1mo`**, where [`CandleInterval::as_str`] — which follows
+/// Binance's kline convention — spells it `1M`. Sending `1M` is not a silent mismatch (it is
+/// rejected with a `400`), but the two must not be assumed interchangeable.
+///
+/// The match is exhaustive rather than defaulting, so adding a [`CandleInterval`] variant forces a
+/// decision here instead of silently reporting it unsupported.
+#[must_use]
+pub fn candle_interval_str(interval: CandleInterval) -> Option<&'static str> {
+    match interval {
+        CandleInterval::Sec1 => Some("1s"),
+        CandleInterval::Sec5 => Some("5s"),
+        CandleInterval::Sec15 => Some("15s"),
+        CandleInterval::Sec30 => Some("30s"),
+        CandleInterval::Min1 => Some("1m"),
+        CandleInterval::Min3 => Some("3m"),
+        CandleInterval::Min5 => Some("5m"),
+        CandleInterval::Min15 => Some("15m"),
+        CandleInterval::Min30 => Some("30m"),
+        CandleInterval::Hour1 => Some("1h"),
+        CandleInterval::Hour4 => Some("4h"),
+        CandleInterval::Day1 => Some("1d"),
+        CandleInterval::Week1 => Some("1w"),
+        // Note the spelling: `1mo`, not the shared enum's `1M`.
+        CandleInterval::Month1 => Some("1mo"),
+        // Not published by this provider.
+        CandleInterval::Hour2
+        | CandleInterval::Hour6
+        | CandleInterval::Hour8
+        | CandleInterval::Hour12
+        | CandleInterval::Day3 => None,
+    }
+}
+
+/// Whether the provider serves candles at `interval`.
+#[must_use]
+pub fn supports_candle_interval(interval: CandleInterval) -> bool {
+    candle_interval_str(interval).is_some()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -449,6 +495,64 @@ mod tests {
                 LseDataset::from_catalog_str(reference).unwrap_err(),
                 LseError::UnknownDataset(_)
             ));
+        }
+    }
+
+    /// The resolutions the provider itself enumerates when it rejects an invalid `timeframe`:
+    ///
+    /// ```text
+    /// invalid timeframe '7q'; valid: 1s, 5s, 15s, 30s, 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1mo
+    /// ```
+    const PROVIDER_ADVERTISED_TIMEFRAMES: [&str; 14] = [
+        "1s", "5s", "15s", "30s", "1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1mo",
+    ];
+
+    #[test]
+    fn test_supported_intervals_match_the_providers_own_list() {
+        // Pins the mapping to the provider's advertised set in both directions, so neither a new
+        // `CandleInterval` variant nor a typo can drift it silently.
+        let mapped = CandleInterval::ALL
+            .into_iter()
+            .filter_map(candle_interval_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(mapped, PROVIDER_ADVERTISED_TIMEFRAMES);
+    }
+
+    #[test]
+    fn test_month_is_spelled_differently_from_the_shared_enum() {
+        // The shared enum follows Binance's kline convention (`1M`); this provider wants `1mo`.
+        assert_eq!(candle_interval_str(CandleInterval::Month1), Some("1mo"));
+        assert_eq!(CandleInterval::Month1.as_str(), "1M");
+    }
+
+    #[test]
+    fn test_unserved_resolutions_are_reported_unsupported() {
+        for interval in [
+            CandleInterval::Hour2,
+            CandleInterval::Hour6,
+            CandleInterval::Hour8,
+            CandleInterval::Hour12,
+            CandleInterval::Day3,
+        ] {
+            assert!(
+                !supports_candle_interval(interval),
+                "{interval} is not published by this provider"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sub_minute_resolutions_are_supported() {
+        // These have no Binance kline equivalent and exist in the shared enum largely for this
+        // provider, so a regression here would be quiet.
+        for interval in [
+            CandleInterval::Sec1,
+            CandleInterval::Sec5,
+            CandleInterval::Sec15,
+            CandleInterval::Sec30,
+        ] {
+            assert!(supports_candle_interval(interval), "{interval}");
         }
     }
 
