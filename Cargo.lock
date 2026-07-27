@@ -268,7 +268,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.12.1",
- "http 1.4.0",
+ "http 1.4.2",
  "once_cell",
  "openssl",
  "rand 0.8.5",
@@ -2197,7 +2197,7 @@ dependencies = [
  "fnv",
  "futures-core",
  "futures-sink",
- "http 1.4.0",
+ "http 1.4.2",
  "indexmap 2.14.0",
  "slab",
  "tokio",
@@ -2312,9 +2312,9 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "1.4.0"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a"
+checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
 dependencies = [
  "bytes",
  "itoa",
@@ -2338,7 +2338,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1efedce1fb8e6913f23e0c92de8e62cd5b772a67e7b3946df930a62566c93184"
 dependencies = [
  "bytes",
- "http 1.4.0",
+ "http 1.4.2",
 ]
 
 [[package]]
@@ -2349,7 +2349,7 @@ checksum = "b021d93e26becf5dc7e1b75b1bed1fd93124b374ceb73f43d4d4eafec896a64a"
 dependencies = [
  "bytes",
  "futures-core",
- "http 1.4.0",
+ "http 1.4.2",
  "http-body 1.0.1",
  "pin-project-lite",
 ]
@@ -2416,7 +2416,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "h2 0.4.13",
- "http 1.4.0",
+ "http 1.4.2",
  "http-body 1.0.1",
  "httparse",
  "httpdate",
@@ -2447,7 +2447,7 @@ version = "0.27.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3c93eb611681b207e1fe55d5a71ecf91572ec8a6705cdb6857f7d8d5242cf58"
 dependencies = [
- "http 1.4.0",
+ "http 1.4.2",
  "hyper 1.9.0",
  "hyper-util",
  "rustls 0.23.37",
@@ -2496,7 +2496,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.2",
  "http-body 1.0.1",
  "hyper 1.9.0",
  "ipnet",
@@ -4085,7 +4085,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h2 0.4.13",
- "http 1.4.0",
+ "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.9.0",
@@ -4125,7 +4125,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.9.0",
@@ -4164,7 +4164,7 @@ checksum = "562ceb5a604d3f7c885a792d42c199fd8af239d0a51b2fa6a78aafa092452b04"
 dependencies = [
  "anyhow",
  "async-trait",
- "http 1.4.0",
+ "http 1.4.2",
  "reqwest 0.12.28",
  "serde",
  "thiserror 1.0.69",
@@ -4498,7 +4498,7 @@ dependencies = [
  "fnv",
  "futures",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.2",
  "hyperliquid_rust_sdk",
  "ibapi",
  "itertools 0.15.0",
@@ -5608,9 +5608,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-stream"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
 dependencies = [
  "futures-core",
  "pin-project-lite",
@@ -5680,13 +5680,14 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.18"
+version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "slab",
  "tokio",
@@ -5787,7 +5788,7 @@ dependencies = [
  "bitflags 2.11.0",
  "bytes",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.2",
  "http-body 1.0.1",
  "iri-string",
  "pin-project-lite",
@@ -5927,7 +5928,7 @@ checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
 dependencies = [
  "bytes",
  "data-encoding",
- "http 1.4.0",
+ "http 1.4.2",
  "httparse",
  "log",
  "native-tls",
@@ -5945,7 +5946,7 @@ checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
 dependencies = [
  "bytes",
  "data-encoding",
- "http 1.4.0",
+ "http 1.4.2",
  "httparse",
  "log",
  "native-tls",
@@ -6659,7 +6660,7 @@ dependencies = [
  "base64 0.22.1",
  "deadpool",
  "futures",
- "http 1.4.0",
+ "http 1.4.2",
  "http-body-util",
  "hyper 1.9.0",
  "hyper-util",
