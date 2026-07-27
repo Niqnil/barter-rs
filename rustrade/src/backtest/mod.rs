@@ -45,9 +45,10 @@ use smol_str::SmolStr;
 use std::{
     fmt::Debug,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
 };
+use tracing::error;
 
 /// Defines the [`AuxEventSource`](aux_events::AuxEventSource) interface for interleaving non-market
 /// `EngineEvent`s (e.g. corporate actions, contract expiries) into a backtest in simulated-time
@@ -216,6 +217,12 @@ where
 /// This path hardcodes [`AuditMode::Disabled`], so the per-event `EngineOutput` audit stream is not
 /// observable here; the split *economics per event* are asserted at the `Engine::process_with_audit`
 /// seam (see the `test_corporate_action_*` tests). The terminal `engine_state` exposes the net effect.
+///
+/// # Market source failure
+/// A [`BacktestMarketData`] source that fails part-way through — a truncated file, a decode error, a
+/// failed page fetch — **aborts the run**: the engine is shut down and that error is returned in
+/// place of a result. No partial [`BacktestSummary`] is ever produced, because statistics computed
+/// over a prefix of the dataset are indistinguishable from statistics over all of it.
 pub async fn backtest<
     MarketData,
     SummaryInterval,
@@ -345,7 +352,10 @@ where
     // which the engine's feed accepts directly (`Event: From<MarketStream::Item>` is satisfied
     // reflexively), so it flows through `SystemBuild`'s existing single market-forwarding task and
     // `shutdown_after_backtest` needs no change.
-    let market_stream = merge_market_with_aux(raw_market, market_first, aux);
+    // Per-run, so concurrent `run_backtests` runs never observe each other's source failures.
+    let source_error = Arc::new(OnceLock::new());
+    let market_stream =
+        merge_market_with_aux(raw_market, market_first, aux, Arc::clone(&source_error));
 
     let system = SystemBuild::new(
         engine,
@@ -359,6 +369,13 @@ where
     .await?;
 
     let (engine, _shutdown_audit) = system.shutdown_after_backtest().await?;
+
+    // The market source failing mid-run is the one way this path can produce a complete-looking
+    // summary over an incomplete dataset, so it is checked before any statistic is generated. The
+    // merge has ended and its task has been awaited by this point, so the slot is settled.
+    if let Some(error) = source_error.get() {
+        return Err(error.clone());
+    }
 
     let trading_summary = engine
         .trading_summary_generator(args_dynamic.risk_free_return)
@@ -399,12 +416,19 @@ where
 ///   For an in-memory backtest no `Reconnecting` events occur, so the carry-forward is purely
 ///   defensive.
 ///
+/// # Market source failure
+/// An `Err` from the market stream **terminates the merge**: the error is recorded in the shared
+/// `source_error` slot and the stream ends, dropping any aux events still pending. The engine then
+/// shuts down normally and [`backtest`] reads the slot and returns the error rather than a summary.
+/// Continuing past the error would silently produce statistics over a truncated dataset. The slot
+/// is created per run, so concurrent [`run_backtests`] runs never observe each other's failures.
+///
 /// The yielded item is a bare [`EngineEvent`]; the engine reads simulated time itself (via the
 /// market event's exchange timestamp), so the ordering time is internal to this merge.
 #[pin_project::pin_project]
 struct TimedMergeStream<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 where
-    St: Stream<Item = MarketStreamEvent<InstrumentKey, MarketKind>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>,
 {
     #[pin]
     market: futures::stream::Peekable<St>,
@@ -412,12 +436,13 @@ where
         std::vec::IntoIter<Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>,
     >,
     last_market_time: DateTime<Utc>,
+    source_error: Arc<OnceLock<BarterError>>,
 }
 
 impl<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey> Stream
     for TimedMergeStream<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 where
-    St: Stream<Item = MarketStreamEvent<InstrumentKey, MarketKind>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>,
     EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>:
         From<MarketStreamEvent<InstrumentKey, MarketKind>>,
 {
@@ -428,18 +453,15 @@ where
 
         // No aux remaining: forward the market side verbatim (the O(1)-memory fast path).
         let Some(aux_time) = this.aux.peek().map(|timed| timed.time) else {
-            return this
-                .market
-                .as_mut()
-                .poll_next(cx)
-                .map(|opt| opt.map(|event| convert_market(event, this.last_market_time)));
+            let polled = this.market.as_mut().poll_next(cx);
+            return take_market(polled, this.last_market_time, this.source_error);
         };
 
         // Aux has an event: peek the market's next event to order them.
         match this.market.as_mut().poll_peek(cx) {
             // Can't decide ordering until the market's next event (or its end) is known.
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(market_next)) => {
+            Poll::Ready(Some(Ok(market_next))) => {
                 // Copy the Copy `DateTime` out so the peek borrow of `this.market` ends here,
                 // freeing `this.market` to be re-polled in the `else` arm below.
                 let market_time = match market_next {
@@ -450,14 +472,50 @@ where
                     // Aux leads or ties — emit it. `aux.peek()` was `Some`, so `next()` is `Some`.
                     Poll::Ready(this.aux.next().map(|timed| timed.value))
                 } else {
-                    this.market
-                        .as_mut()
-                        .poll_next(cx)
-                        .map(|opt| opt.map(|event| convert_market(event, this.last_market_time)))
+                    let polled = this.market.as_mut().poll_next(cx);
+                    take_market(polled, this.last_market_time, this.source_error)
                 }
+            }
+            // A failed source outranks any pending aux event: the run is over either way, and
+            // emitting further aux events would imply a timeline the data never reached. The
+            // peeked item is buffered, so re-polling returns it synchronously for `take_market`
+            // to record.
+            Poll::Ready(Some(Err(_))) => {
+                let polled = this.market.as_mut().poll_next(cx);
+                take_market(polled, this.last_market_time, this.source_error)
             }
             // Market exhausted — drain the remaining aux events in order.
             Poll::Ready(None) => Poll::Ready(this.aux.next().map(|timed| timed.value)),
+        }
+    }
+}
+
+/// Convert one polled market item into a merged output, recording a source failure.
+///
+/// An `Err` ends the merged stream (`Ready(None)`) after storing the error, so [`backtest`] can
+/// distinguish a failed run from a complete one. Only the first error is kept — it is the one that
+/// stopped the run, and any later error is a consequence of it.
+fn take_market<MarketKind, ExchangeKey, AssetKey, InstrumentKey>(
+    polled: Poll<Option<Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>>,
+    last_market_time: &mut DateTime<Utc>,
+    source_error: &Arc<OnceLock<BarterError>>,
+) -> Poll<Option<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>
+where
+    EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>:
+        From<MarketStreamEvent<InstrumentKey, MarketKind>>,
+{
+    match polled {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(None) => Poll::Ready(None),
+        Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(convert_market(event, last_market_time))),
+        Poll::Ready(Some(Err(error))) => {
+            error!(
+                %error,
+                "backtest market data source failed - aborting run rather than reporting a \
+                 summary over partial data"
+            );
+            let _ = source_error.set(error);
+            Poll::Ready(None)
         }
     }
 }
@@ -481,18 +539,21 @@ where
 
 /// Build a [`TimedMergeStream`]. `seed` is the fallback ordering time for a leading
 /// [`MarketStreamEvent::Reconnecting`]; `aux` MUST be sorted ascending by [`Timed::time`].
+/// `source_error` receives a market source failure, for the caller to check once the run ends.
 fn merge_market_with_aux<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>(
     market: St,
     seed: DateTime<Utc>,
     aux: Vec<Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>,
+    source_error: Arc<OnceLock<BarterError>>,
 ) -> TimedMergeStream<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 where
-    St: Stream<Item = MarketStreamEvent<InstrumentKey, MarketKind>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>,
 {
     TimedMergeStream {
         market: market.peekable(),
         aux: aux.into_iter().peekable(),
         last_market_time: seed,
+        source_error,
     }
 }
 
@@ -557,9 +618,27 @@ mod tests {
         seed: DateTime<Utc>,
         aux: Vec<Timed<EngineEvent<DataKind>>>,
     ) -> Vec<EngineEvent<DataKind>> {
-        merge_market_with_aux(stream::iter(market), seed, aux)
-            .collect::<Vec<_>>()
-            .await
+        let (merged, error) = merge_fallible(market.into_iter().map(Ok).collect(), seed, aux).await;
+        assert!(
+            error.is_none(),
+            "infallible fixture must not record an error"
+        );
+        merged
+    }
+
+    /// Merge a market script that may contain failures, returning the recorded source error.
+    async fn merge_fallible(
+        market: Vec<Result<MarketStreamEvent<InstrumentIndex, DataKind>, BarterError>>,
+        seed: DateTime<Utc>,
+        aux: Vec<Timed<EngineEvent<DataKind>>>,
+    ) -> (Vec<EngineEvent<DataKind>>, Option<BarterError>) {
+        let source_error = Arc::new(OnceLock::new());
+        let merged =
+            merge_market_with_aux(stream::iter(market), seed, aux, Arc::clone(&source_error))
+                .collect::<Vec<_>>()
+                .await;
+
+        (merged, source_error.get().cloned())
     }
 
     #[tokio::test]
@@ -650,5 +729,64 @@ mod tests {
             })
             .collect();
         assert_eq!(order, vec!["aux", "reconnecting"]);
+    }
+
+    fn source_failure() -> BarterError {
+        BarterError::BacktestMarketData("truncated source".to_string())
+    }
+
+    #[tokio::test]
+    async fn merge_records_source_error_and_stops_on_the_no_aux_fast_path() {
+        let market = vec![
+            Ok(trade_event(0, 10)),
+            Err(source_failure()),
+            Ok(trade_event(1, 30)),
+        ];
+        let (merged, error) = merge_fallible(market, at(0), vec![]).await;
+
+        // Events before the failure are emitted; nothing after it is.
+        assert_eq!(
+            merged.iter().map(market_id).collect::<Vec<_>>(),
+            vec![Some(0)]
+        );
+        assert_eq!(error, Some(source_failure()));
+    }
+
+    /// A failed source ends the run, so pending aux events must not be drained afterwards — doing
+    /// so would advance the timeline past data that was never read.
+    #[tokio::test]
+    async fn merge_source_error_drops_pending_aux_events() {
+        let market = vec![Ok(trade_event(0, 10)), Err(source_failure())];
+        let aux = vec![marker(100, 20), marker(101, 40)];
+        let (merged, error) = merge_fallible(market, at(0), aux).await;
+
+        assert_eq!(
+            merged.iter().map(market_id).collect::<Vec<_>>(),
+            vec![Some(0)]
+        );
+        assert_eq!(merged.iter().filter_map(expiry_id).count(), 0);
+        assert_eq!(error, Some(source_failure()));
+    }
+
+    /// Only the first error is retained — it is the one that stopped the run.
+    #[tokio::test]
+    async fn merge_keeps_the_first_source_error() {
+        let market = vec![
+            Err(source_failure()),
+            Err(BarterError::BacktestMarketData("second".to_string())),
+        ];
+        let (merged, error) = merge_fallible(market, at(0), vec![]).await;
+
+        assert!(merged.is_empty());
+        assert_eq!(error, Some(source_failure()));
+    }
+
+    #[tokio::test]
+    async fn merge_without_failure_records_no_error() {
+        let market = vec![Ok(trade_event(0, 10)), Ok(trade_event(1, 30))];
+        let (merged, error) = merge_fallible(market, at(0), vec![marker(100, 20)]).await;
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(error, None);
     }
 }

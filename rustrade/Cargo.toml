@@ -17,6 +17,13 @@ description = "Framework for building high-performance live-trading, paper-tradi
 # default — the engine itself needs no provider; the example falls back to a canned offline source.
 massive = ["rustrade-data/massive"]
 alpaca = ["rustrade-data/alpaca"]
+# Forwarded so the streaming-backtest example can build a market data factory from a real provider.
+# The engine itself is provider-agnostic; nothing under `src/` is gated on this.
+lse = ["rustrade-data/lse"]
+
+[[example]]
+name = "engine_backtest_with_lse_candles"
+required-features = ["lse"]
 
 [[bench]]
 name = "backtest"

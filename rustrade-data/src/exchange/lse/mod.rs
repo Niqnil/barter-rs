@@ -32,6 +32,9 @@
 //! - **Dataset slugs are not instrument identities** and do not uniquely identify a series; see
 //!   [`market::slug`].
 
+/// Replay historical candles for N instruments as one time-ordered market stream.
+pub mod backtest;
+
 /// Errors produced by the London Strategic Edge integration.
 pub mod error;
 

@@ -18,6 +18,14 @@ pub enum BarterError {
     #[error("market data: {0}")]
     MarketData(#[from] DataError),
 
+    /// A backtest market data source failed, or violated a
+    /// [`BacktestMarketData`](crate::backtest::market_data::BacktestMarketData) caller obligation.
+    ///
+    /// Reaching a caller as the result of a backtest means the run was **aborted** — any statistics
+    /// it would have produced would cover only the portion of the dataset that was read.
+    #[error("backtest market data: {0}")]
+    BacktestMarketData(String),
+
     #[error("execution: {0}")]
     Execution(#[from] ExecutionError),
 

@@ -84,6 +84,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **⚠️ Licensing:** as above — the retrieved data is **not redistributable**, whatever this crate's
   own licence says. See <https://londonstrategicedge.com/terms>.
 
+- **`MarketDataStreamed` — a lazily streamed `BacktestMarketData` source** (`rustrade`,
+  `backtest::market_data`). The counterpart to `MarketDataInMemory` for datasets that cannot be
+  resident: a multi-gigabyte export, a compressed tick archive, a paginated provider fetch. It is
+  parameterised over a caller-supplied stream **factory**, which is where every source-specific
+  concern lives — opening files, decoding, resolving instrument keys, merging sources — so the
+  engine crate stays ignorant of file formats, compression and providers, and no provider feature
+  leaks into it. The first event's timestamp is resolved once at construction and cached, satisfying
+  the trait's coherence obligation without letting `time_first_event` consume the cursor `stream`
+  needs. **Cost model, documented on the type:** the factory runs once per `stream()` call, so
+  `run_backtests` with N configurations performs 1 + N full source reads — the deliberate price of
+  O(1) memory, and the wrong trade against a metered network source.
+
+- **`merge_time_sorted` and `tag_events` — replay N historical sources as one feed**
+  (`rustrade-data`, `streams::merge`). Historical data arrives one instrument or one file at a time,
+  while a backtest harness exposes exactly one stream. These lazily k-way merge N time-sorted market
+  streams into one, holding at most one buffered event per input, so memory is O(N) in the number of
+  inputs and O(1) in the size of the dataset. Nothing is emitted until every input has either
+  buffered an event or ended — an input that has not yet produced might be about to yield something
+  earlier, and an out-of-order stream is undetectable downstream. Ties resolve to the earliest-listed
+  input, so a given input ordering replays identically every time. Provider-agnostic: usable for
+  Databento, Binance and any other historical source.
+
+- **London Strategic Edge multi-instrument candle replay** (`rustrade-data`, `lse` feature):
+  `replay_candles` and `LseCandleSource`. Turns N per-symbol vault fetches into one time-ordered
+  `MarketStreamEvent` stream, each event tagged with the caller's own `InstrumentIndex` and
+  `ExchangeId` — the bridge between the per-symbol historical API and an engine that consumes a
+  single feed. `time_exchange` is the candle's `close_time`, never its open, since a completed bar
+  entering the timeline at the instant its period began is lookahead. A failed fetch on any source
+  surfaces immediately rather than silently shortening the replay. Paired with `MarketDataStreamed`,
+  this is a runnable multi-instrument backtest over a range far larger than memory
+  (`engine_backtest_with_lse_candles`, `--features lse`).
+  **⚠️ Licensing:** as above — the retrieved data is **not redistributable**, whatever this crate's
+  own licence says. See <https://londonstrategicedge.com/terms>.
+
 - **`CandleInterval` gains the sub-minute resolutions `Sec5`, `Sec15` and `Sec30`**
   (`rustrade-data`, `subscription::candle`). `CandleInterval` is the venue-agnostic *union* of
   every resolution any connector serves, and providers exist that publish `5s`/`15s`/`30s` bars
@@ -254,6 +288,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ibkr_flex_corporate_actions`, `--features ibkr`) sketches the wrapper-side reconcile.
 
 ### Changed
+
+- **`DefaultInstrumentMarketData` now consumes `DataKind::Candle`** (`rustrade`). It previously
+  tracked only trades and L1 and ignored every other variant behind a catch-all `_ => {}`, so an
+  engine fed a candle-only feed was silently inert — `price()` returned `None`, no position could be
+  valued, and nothing reported a problem. Candle-first data sources therefore required a custom
+  `InstrumentDataState` that every user had to copy from an example.
+  **This changes behaviour for existing feeds**: an instrument receiving candles (or candles and
+  trades) with no L1 book now has a price where it previously had none, which moves
+  `pnl_unrealised` and anything derived from it. The precedence is explicit and documented: the L1
+  volume-weighted mid-price wins unconditionally, as before; otherwise the **more recent** of the
+  last candle (by `close_time`) and the last traded price wins, with a trade taking an exact tie
+  since `close_time` is the exclusive period end. Recency rather than a fixed "candle beats trade"
+  is deliberate — the latter would let a stale `1d` bar silently shadow every trade tick received
+  since it closed.
+  The struct gains a `candle: Option<Candle>` field, so its positional `new()` and its serialized
+  shape both change. `OrderBook` (L2), `Liquidation` and `OptionGreeks` remain excluded, now with a
+  stated reason each in place of the catch-all; `Liquidation` in particular is a forced fill at a
+  potentially dislocated price and must never reach `price()`.
+
+- **`BacktestMarketData::stream()` items are now `Result<_, BarterError>`, and a source failure
+  aborts the backtest** (`rustrade`). The item type was infallible, which was adequate only while
+  the sole implementation was fully in-memory. A source that reads incrementally — a file, a
+  decoder, a paginated fetch — can fail after the stream has opened, and with no error channel the
+  only options were to truncate the stream or panic. Truncating is the dangerous one: the run would
+  complete and return a perfectly normal-looking `BacktestSummary` computed over however much of the
+  dataset happened to be read, with nothing to distinguish it from a complete run.
+  `backtest` now returns that error instead of a result, and never produces a summary over a
+  partially-read dataset. `MarketDataInMemory` is unaffected behaviourally (it yields `Ok`) and its
+  constructor is unchanged, so callers that only *use* it need no edit; custom implementations of
+  the trait must wrap their items.
+
+- **`MockExchange` now supports `InstrumentKind::Cfd`** (`rustrade`). `generate_mock_exchange_instruments`
+  panicked on any non-`Spot` kind via a catch-all, so backtesting or paper-trading a CFD instrument
+  failed at execution-build time — making CFD-quoted datasets unusable despite being correctly
+  modelled. A CFD fill is the same price × quantity arithmetic as spot (the `contract_size`
+  multiplier is applied engine-side), so the mock now maps it through, re-resolving the CFD's
+  settlement asset to its exchange name. Other kinds still panic; that is a capability limit of the
+  mock, not a statement about which kinds are executable.
 
 - **`IndexedInstrumentsBuilder` now rejects duplicate `InstrumentNameInternal`s**
   (`rustrade-instrument`). `InstrumentStates` is keyed on `InstrumentNameInternal` but read

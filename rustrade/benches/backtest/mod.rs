@@ -489,7 +489,15 @@ async fn backtest_market_only(
     audit_mode: AuditMode,
 ) -> Result<BacktestSummary<Daily>, BarterError> {
     let market_first = args_constant.market_data.time_first_event().await?;
-    let raw_market = args_constant.market_data.stream().await?;
+    // `MarketDataInMemory` cannot fail mid-stream, so the fallible item is unwrapped here rather
+    // than routed through the abort path `backtest` implements. This baseline exists to measure the
+    // merge seam's overhead, and adding error handling the fixture can never exercise would put
+    // work in the measured path that the real path does not do.
+    let raw_market = args_constant
+        .market_data
+        .stream()
+        .await?
+        .filter_map(|event| std::future::ready(event.ok()));
     let clock = HistoricalClock::new(market_first);
 
     let ExecutionBuild {

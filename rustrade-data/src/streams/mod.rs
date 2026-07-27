@@ -13,6 +13,10 @@ pub mod builder;
 /// drive a re-connecting [`MarketStream`](super::MarketStream).
 pub mod consumer;
 
+/// Lazily merge N time-sorted market streams into one, for replaying multi-instrument historical
+/// data as a single time-ordered feed.
+pub mod merge;
+
 /// Defines a [`ReconnectingStream`](reconnect::stream::ReconnectingStream) and associated logic
 /// for generating an auto reconnecting `Stream`.
 pub mod reconnect;

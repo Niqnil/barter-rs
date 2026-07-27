@@ -36,6 +36,17 @@ pub enum DataError {
         message: String,
     },
 
+    /// A London Strategic Edge integration error, flattened into this crate's common error type.
+    ///
+    /// [`LseError`](crate::exchange::lse::error::LseError) carries a `reqwest::Error`, which is
+    /// neither `Clone` nor serialisable, so it cannot be nested here structurally. Callers wanting
+    /// to match on the cause should handle `LseError` at the call site; this variant exists so an
+    /// LSE-sourced stream can compose with the crate's generic stream helpers. Same flattening as
+    /// [`Socket`](Self::Socket) applies to `SocketError`.
+    #[cfg(feature = "lse")]
+    #[error("London Strategic Edge error: {0}")]
+    Lse(String),
+
     #[error("unsupported dynamic Subscription for exchange: {exchange}, kind: {sub_kind}")]
     Unsupported {
         exchange: ExchangeId,
@@ -76,6 +87,13 @@ impl DataError {
 impl From<SocketError> for DataError {
     fn from(value: SocketError) -> Self {
         Self::Socket(value.to_string())
+    }
+}
+
+#[cfg(feature = "lse")]
+impl From<crate::exchange::lse::error::LseError> for DataError {
+    fn from(value: crate::exchange::lse::error::LseError) -> Self {
+        Self::Lse(value.to_string())
     }
 }
 
