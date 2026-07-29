@@ -698,7 +698,7 @@ async fn test_cancel_produces_cancelled_not_expired() {
 }
 
 // ============================================================================
-// Stop and Trailing Stop Order Tests (TG13 Phase 1 & 2) — Tier 0: Paper Account Only (FREE)
+// Stop and Trailing Stop Order Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a Stop order.
@@ -1114,7 +1114,7 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
 }
 
 // ============================================================================
-// Bracket Order Tests (TG13 Phase 3) — Tier 0: Paper Account Only (FREE)
+// Bracket Order Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a bracket order with OCA linkage.
@@ -1343,7 +1343,7 @@ async fn test_bracket_order_oca_group_linkage() {
 }
 
 // ============================================================================
-// Extended Time-in-Force Tests (TG13 Phase 6) — Tier 0: Paper Account Only (FREE)
+// Extended Time-in-Force Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a Good-Till-Date (GTD) order.

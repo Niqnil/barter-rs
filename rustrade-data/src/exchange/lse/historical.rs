@@ -165,7 +165,9 @@ impl LseVaultClient {
     /// of the data. Pagination therefore continues until a page comes back **empty** or the cursor
     /// passes the requested range, which costs at most one extra request per fetch. Treating a
     /// short page as terminal would be faster and would silently truncate the result if the
-    /// provider ever lowered its cap below [`PAGE_LIMIT`].
+    /// provider ever lowered its cap below the 5,000 rows requested per page — the figure the
+    /// provider itself reports as
+    /// [`max_rows_per_request`](super::quota::QuotaStatus::max_rows_per_request).
     #[must_use = "fetch_candles returns a lazy Stream that does nothing unless polled"]
     pub fn fetch_candles<'a>(
         &'a self,

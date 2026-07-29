@@ -62,10 +62,10 @@ pub enum LseError {
     /// minute, reported by [`usage`](super::vault::LseVaultClient::usage).
     ///
     /// # Caveat
-    /// The provider's encoding of a *shared-allowance* rejection (as opposed to a plain rate
-    /// limit) is not yet characterised, so an exhausted byte or export allowance may currently
-    /// arrive here or as [`Api`](Self::Api) rather than under a dedicated variant. Both are
-    /// observable and terminal; neither is silently retried.
+    /// On the *export* endpoints an exhausted allowance is distinguished and reported as
+    /// [`QuotaExceeded`](Self::QuotaExceeded). On the candle path the provider offers no way to
+    /// tell a per-minute rate limit from an exhausted byte allowance, so both arrive here. Either
+    /// way it is observable and terminal, and never silently retried.
     #[error("rate limited{}", match .retry_after {
         Some(delay) => format!("; retry after {}s", delay.as_secs()),
         None => String::new(),
@@ -104,14 +104,136 @@ pub enum LseError {
     /// Carries the allowance state at the point of rejection so the caller can decide how to pace.
     /// Terminal — never retried internally.
     ///
-    /// # ⚠️ Not raised by the candle path
-    /// The bulk-export endpoints are where the provider reports allowance exhaustion, and they are
-    /// not part of this integration yet. A candle fetch that runs into a limit currently surfaces
-    /// as [`RateLimited`](Self::RateLimited) or [`Api`](Self::Api) instead. Matching on this
-    /// variant today is therefore dead code — poll
-    /// [`usage`](super::vault::LseVaultClient::usage) to observe the allowance.
+    /// # Raised by the export path only
+    /// The bulk-export endpoints report allowance exhaustion as a `429` carrying no `Retry-After`
+    /// and no rate-limit headers, which this integration distinguishes from a per-minute rate
+    /// limit and reports here, populating the position from
+    /// [`usage`](super::vault::LseVaultClient::usage). A *candle* fetch that runs into a limit
+    /// still surfaces as [`RateLimited`](Self::RateLimited) — the provider gives no way to tell
+    /// the two apart on that path.
     #[error("quota exceeded: {status:?}")]
     QuotaExceeded { status: QuotaStatus },
+
+    /// An export job reached a terminal state without producing an artifact.
+    ///
+    /// `expired` means the artifact was built and has since been reaped — roughly 48 hours after
+    /// it was created. Both are terminal; re-exporting costs another export.
+    #[error("export job {job_id} {status}{}", match .message.as_str() {
+        "" => String::new(),
+        message => format!(": {message}"),
+    })]
+    ExportFailed {
+        job_id: String,
+        status: String,
+        message: String,
+    },
+
+    /// An export job did not become ready within the caller's timeout.
+    ///
+    /// **The job is not cancelled and the identifier stays valid** — it keeps building, so polling
+    /// [`export_status`](super::vault::LseVaultClient::export_status) later picks it up without
+    /// spending another export. This is a timeout on waiting, not on the job.
+    #[error(
+        "export job {job_id} still {status} when the caller's timeout elapsed; it keeps building, so poll it again rather than re-exporting"
+    )]
+    ExportTimeout { job_id: String, status: String },
+
+    /// A downloaded artifact does not match the integrity metadata the job reported.
+    ///
+    /// The destination is left untouched rather than holding a corrupt artifact.
+    ///
+    /// `discarded` reports what happened to the partial file at `path`:
+    /// - `false` — it is **retained**, because this call fetched it and the bytes are a real prefix
+    ///   the next call can resume from with a `Range` request.
+    /// - `true` — it was **removed**. A pre-existing partial file already looked complete, so no
+    ///   transfer was attempted; failing verification then proves it is a leftover from a different
+    ///   job that used the same destination, not a prefix of this one. Retaining it would fail
+    ///   identically forever, so a re-call restarts instead.
+    #[error("integrity check failed for {}: expected {expected}, got {actual} ({})", .path.display(), match .discarded {
+        true => "unusable partial file discarded; re-call to restart",
+        false => "partial file kept for resume",
+    })]
+    IntegrityMismatch {
+        path: std::path::PathBuf,
+        expected: String,
+        actual: String,
+        discarded: bool,
+    },
+
+    /// A filesystem operation failed.
+    ///
+    /// `message` names the operation and the path; the underlying [`std::io::Error`] is retained as
+    /// the error [source](std::error::Error::source), so a caller can match on
+    /// [`std::io::ErrorKind`] rather than parse a string.
+    #[error("io error: {message}: {source}")]
+    Io {
+        message: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// An export artifact's columns match none of the layouts this integration decodes.
+    ///
+    /// The provider's tick schema **varies by dataset** — `fx` publishes `bid`/`ask`, `stocks`
+    /// publishes `price`/`volume`, and the synthetic classes publish `price`/`volume`/`ask` — so
+    /// the layout is resolved from the columns present. Reported rather than guessed at: a wrong
+    /// column guess yields plausible numbers in the wrong field.
+    #[error("unsupported export schema; columns were: {columns}")]
+    UnsupportedSchema { columns: String },
+
+    /// A row's `symbol` column does not match the symbol the export descriptor names.
+    ///
+    /// Every export is single-symbol, so this means the file and its descriptor disagree — the
+    /// artifact is not the one the caller thinks it is. Caught because attributing it to the
+    /// descriptor's instrument would be silent misattribution, and because `BP` and `BP.L` are
+    /// different instruments quoted in different currencies.
+    #[error("export symbol mismatch: descriptor says {expected:?} but a row carries {found:?}")]
+    SymbolMismatch { expected: String, found: String },
+
+    /// An artifact's timestamps go backwards.
+    ///
+    /// A backtest fed an unsorted stream produces a non-monotonic clock and wrong results in
+    /// release, with no failure point, so this is rejected at decode. Note ties are **permitted** —
+    /// the tape is non-decreasing rather than strictly ascending.
+    #[error("export timestamps are not ascending: {found} follows {previous}")]
+    NonMonotonicTimestamps {
+        previous: DateTime<Utc>,
+        found: DateTime<Utc>,
+    },
+
+    /// A row's timestamp is outside the representable [`DateTime<Utc>`] range.
+    #[error("export timestamp {micros}µs is not representable")]
+    TimestampNotRepresentable { micros: i64 },
+
+    /// A provider `f64` has no [`rust_decimal::Decimal`] representation.
+    ///
+    /// Surfaced rather than substituted: a zero or a clamp here would put a real-looking price
+    /// into fees, PnL and risk notional.
+    #[error("price {value} is not representable as a decimal: {message}")]
+    PriceNotRepresentable { value: f64, message: String },
+
+    /// No registered instrument on this exchange carries the requested display symbol.
+    ///
+    /// Raised when deriving an [`InstrumentIndex`] from the caller's registry rather than
+    /// accepting one. That derivation is what makes a fabricated index unrepresentable — the index
+    /// is a public, unbounded `usize` and engine state indexes positionally — and it is the only
+    /// check that catches a symbol typo, which would otherwise leave one instrument silently
+    /// receiving no data at all.
+    ///
+    /// [`InstrumentIndex`]: rustrade_instrument::instrument::InstrumentIndex
+    #[error(
+        "no instrument registered on {exchange} with exchange name {symbol:?}; registered there: [{registered}]"
+    )]
+    UnknownInstrument {
+        symbol: String,
+        exchange: rustrade_instrument::exchange::ExchangeId,
+        registered: String,
+    },
+
+    /// The Parquet artifact could not be read.
+    #[cfg(feature = "lse-parquet")]
+    #[error("parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
 }
 
 /// Maximum retained length of a provider diagnostic, in bytes.

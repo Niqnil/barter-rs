@@ -466,7 +466,7 @@ mod tests {
         assert!(l1.best_ask.is_none());
     }
 
-    // --- OHLCV / candle transforms (TG21) ---
+    // --- OHLCV / candle transforms ---
 
     /// Build an `OhlcvMsg` with the given open-instant (`ts_event`) and OHLCV
     /// values in DBN fixed-point (1e-9) / integer-volume units.

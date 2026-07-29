@@ -52,7 +52,7 @@ pub struct QuotaStatus {
     ///
     /// Note this is a **silent** cap: an over-large range returns exactly this many rows with a
     /// `200` and no truncation marker of any kind. See
-    /// [`fetch_candles`](super::historical::LseVaultClient::fetch_candles).
+    /// [`fetch_candles`](super::vault::LseVaultClient::fetch_candles).
     pub max_rows_per_request: u32,
     /// Maximum concurrent vault requests.
     pub vault_concurrency: u32,

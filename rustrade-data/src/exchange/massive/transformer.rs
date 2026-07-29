@@ -1279,7 +1279,7 @@ mod tests {
             Utc.timestamp_millis_opt(1704067260000).single().unwrap()
         );
 
-        // Contract lock (TG20): the venue-supplied `e` is the exclusive boundary
+        // Contract lock: the venue-supplied `e` is the exclusive boundary
         // and equals `s + interval` (here a 1-minute aggregate: s + 60_000 ms).
         // If a future wire change drifts `e` off `s + interval`, this fails.
         assert_eq!(candle.close_time, time);

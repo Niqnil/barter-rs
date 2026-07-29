@@ -36,6 +36,15 @@ const API_KEY_ENV: &str = "LSE_API_KEY";
 /// Per-request HTTP timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `User-Agent` sent on every vault request.
+///
+/// Set explicitly because the vault sits behind a CDN that rejects some agents outright —
+/// measured: `Python-urllib` receives a `403` with `error code: 1010`, never reaching the API.
+/// `reqwest` sends no `User-Agent` by default, which leaves that outcome to the CDN's discretion
+/// rather than to anything this crate controls. An edge rejection is also invisible to the
+/// provider's allowance accounting, so it fails in a way that looks nothing like an API error.
+const USER_AGENT: &str = concat!("rustrade-data/", env!("CARGO_PKG_VERSION"));
+
 /// Default delay between pages of a paged fetch.
 ///
 /// Derived from the provider's documented allowance of 200 calls per minute, which is one call per
@@ -87,6 +96,7 @@ impl LseVaultClient {
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .user_agent(USER_AGENT)
             .timeout(REQUEST_TIMEOUT)
             .build()?;
 
@@ -146,6 +156,23 @@ impl LseVaultClient {
     /// The configured inter-page delay.
     pub(crate) fn pace(&self) -> Duration {
         self.pace
+    }
+
+    /// The configured vault base URL.
+    ///
+    /// Endpoint families build their own URLs from this, preserving the invariant that this client
+    /// never follows a server-supplied URL.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The configured, authenticated HTTP client.
+    ///
+    /// For endpoint families that need a verb or a response handling this module's
+    /// [`get_json`](Self::get_json) does not cover — a `POST` that answers `202`, or a streamed
+    /// download with `Range` resume.
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
     }
 
     /// Fetch the current allowance position.

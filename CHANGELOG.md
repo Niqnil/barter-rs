@@ -35,6 +35,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replay streams. **Instrument indices are stable across releases only while variants are
   appended.**
 
+- **London Strategic Edge bulk export** (`rustrade-data`, `lse` feature): submit, poll and download
+  the provider's asynchronous export jobs. This is the **only** path to the raw tick tape — neither
+  REST nor WebSocket reaches it. Downloads resume via `Range`, verify the job's SHA-256, and rename
+  atomically; on a mismatch the destination is left absent and the partial file is kept, so a
+  repeated call resumes rather than restarting. The exception is a partial file that already looked
+  complete before anything was fetched: failing verification then proves it belongs to a *different*
+  job that used the same destination, so it is discarded and a repeated call restarts — keeping it
+  would fail identically forever. `LseError::IntegrityMismatch` reports which happened.
+  **⚠️ The export allowance is five per hour and a *rejected* submit still consumes one**, so an
+  export request validates everything checkable before anything is sent: unknown resolutions,
+  candle resolutions against the provider's tick-only dataset classes, blank symbols, and inverted
+  ranges are all rejected client-side. In particular `symbol: "all"` is **not** a request for every
+  symbol — it is a literal that matches nothing, and an export naming it returns a valid but
+  **empty** Parquet artifact with no error, so it is rejected outright. Measured on both the candle
+  and the tick path, and omitting the symbol is a hard error, so **every artifact this provider
+  produces is single-symbol**: combining instruments means merging several files. (The rejection is
+  case-sensitive — `ALL` is Allstate's real ticker.) An exhausted allowance is
+  reported as `LseError::QuotaExceeded` carrying the allowance position, distinct from the
+  per-minute `RateLimited`. Range `end` is **exclusive**, and the range is date-granular by type.
+  **⚠️ Exported data is not redistributable** — see <https://londonstrategicedge.com/terms>.
+
+- **London Strategic Edge export decoder** (`rustrade-data`, new `lse-parquet` feature, off by
+  default): decode a downloaded export artifact into an iterator of `MarketEvent`s. The Parquet
+  dependency is behind its own feature, so consumers who only want files on disk pay nothing for
+  it. **The event type is decided by the columns present, not by the caller**, because the
+  provider's tick schema varies by dataset: `bid`+`ask` and `price`+`ask` both decode to
+  `OrderBookL1` (`price` *is* the bid — the provider's own price endpoint returns `price == bid`
+  exactly, on every symbol tested), while `price`+`volume` with no ask decodes to a trade. An
+  unrecognised schema is a typed error rather than a mis-decode. A candle's `time_exchange` is its
+  derived exclusive `close_time`, not the artifact's open-time `ts`, matching the candle replay
+  path — stamping the open would let a strategy act on a completed bar at the instant its period
+  began. Ascending timestamps are enforced by the decoder, since the streaming backtest source
+  delegates that obligation rather than checking it; the comparison permits ties, which are the
+  common case on an equity tape. `instrument_index_for` derives the `InstrumentIndex` from the
+  registry the engine was built with, so a fabricated or typo'd index is unrepresentable, and every
+  row's symbol is checked against the descriptor. The iterator **ends at its first error**: the
+  symbol and ordering checks are verdicts on the whole file rather than per-row conditions, so
+  continuing would hand a caller who discards errors a silently truncated view of an artifact
+  already proven corrupt.
+  **⚠️ Known properties of the data, not of this decoder, that will silently mislead:** FX candles
+  are **bid** candles — reconciled against the tick tape, OHLC matched the bid series on 1421 of
+  1421 minutes and the mid or ask on none, so a backtest filling at the candle close fills at the
+  bid, favourable by a full spread on every buy. Candle `volume` is **not dependable**: a majority
+  of sampled one-minute equity bars report `0` in minutes the tick tape shows real trades, and a
+  daily series carried a contiguous band roughly 2,000× too large; a literal `0` is passed through
+  faithfully as `Some(0)` rather than rewritten to `None`, which would be inventing a fact.
+  Non-trading days are emitted as **flat** `o == h == l == c` bars rather than omitted, so daily
+  series are not sparse and a backtest sees a tradeable price on a closed market. And a decoded
+  trade may not be a print — that layout carries no ask, so a quote is not constructible, but the
+  price is likely a bid-side observation.
+  **⚠️ Decoded data is not redistributable** — see <https://londonstrategicedge.com/terms>.
+
 - **London Strategic Edge symbology** (`rustrade-data`, new `lse` feature, off by default):
   dataset → `(ExchangeId, MarketDataInstrumentKind)` mapping, display-symbol → `(base, quote)`
   resolution, and a fallible dataset-slug helper. **⚠️ London (`.L`) listings are quoted in pence**,
@@ -289,6 +341,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`load_trades_from_dbn` / `load_quotes_from_dbn` now document a caller obligation**
+  (`rustrade-data`, `databento` feature; documentation only, no behaviour change). Both tag every
+  record with the caller-supplied instrument key and never read the per-record `instrument_id` from
+  the DBN header — which the live path *does* resolve, via `PitSymbolMap`. A multi-instrument file
+  therefore decodes silently with every event attributed to one instrument. The rustdoc now states
+  that these are correct only for single-instrument files.
+
 - **`DefaultInstrumentMarketData` now consumes `DataKind::Candle`** (`rustrade`). It previously
   tracked only trades and L1 and ignored every other variant behind a catch-all `_ => {}`, so an
   engine fed a candle-only feed was silently inert — `price()` returned `None`, no position could be
@@ -522,6 +581,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **`cargo doc` failed for `rustrade-data`, so the crate would have published no documentation**
+  (`rustrade-data`). The crate denies `rustdoc::private_intra_doc_links`, and two public items
+  linked to private ones (`fetch_candles` → `PAGE_LIMIT`, `slug` → `AMBIGUOUS_SLUG_STEMS`), which
+  is a hard error rather than a warning. Both now state the fact inline, or link the public item
+  the private one mirrors. Fixed alongside every remaining broken intra-doc link in the crate: a
+  module that carried **both** an outer `///` on its `pub mod` declaration and its own `//!`
+  documentation had the file's links resolved in the *parent's* scope, so each one rendered as dead
+  text instead of a hyperlink. The redundant outer doc is removed wherever the module documents
+  itself, and the convention is stated at the declaration site. `cargo doc` is now clean — no
+  errors and no warnings — under `--features lse`, `--features lse-parquet` and `--all-features`.
 
 - **`InstrumentNameInternal`'s two constructors produced different names for the same instrument**
   (`rustrade-instrument`). `new_from_exchange_underlying` interpolated the `ExchangeId` directly,

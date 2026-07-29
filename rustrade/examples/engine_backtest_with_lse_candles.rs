@@ -49,6 +49,23 @@
 //! These are the provider's own series, not an execution venue's book, and the engine is filling
 //! against `MockExchange`. That is sound for research; before risking capital, note that deciding
 //! on one venue's prices while filling on another's is a basis mismatch you are opting into.
+//!
+//! # ⚠️ This backtest fills at the BID on FX, which flatters every buy
+//!
+//! The provider's FX candles are **bid** candles: reconciled against the tick tape for the same
+//! day, open/high/low/close matched the bid series on 1421 of 1421 minutes and matched the mid or
+//! the ask on none. Filling at the candle close — which is what this example does — therefore buys
+//! at the bid, systematically favourable by a full spread (roughly 0.8 pip on `EUR/USD`) on every
+//! buy. Nothing in the library can correct that without inventing a spread, so a strategy whose
+//! edge is near spread-sized will look profitable here and lose live. Model the spread yourself
+//! before believing a result. Equity candles track the trade tape instead, so the bias is
+//! FX-specific.
+//!
+//! Two related properties of the same data: candle `volume` is unreliable where it is published at
+//! all (a majority of sampled one-minute equity bars report zero in minutes that demonstrably had
+//! trades), and non-trading days arrive as **flat** `o == h == l == c` bars rather than being
+//! omitted, so a daily backtest sees a tradeable price on a closed market. See the
+//! `rustrade_data::exchange::lse` module documentation.
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;

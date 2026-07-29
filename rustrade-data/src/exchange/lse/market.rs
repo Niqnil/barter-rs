@@ -86,6 +86,29 @@ impl LseDataset {
         }
     }
 
+    /// Whether this dataset can be exported at a candle resolution.
+    ///
+    /// The provider splits its price datasets into candle classes and *synthetic* classes. The
+    /// synthetic ones serve candles over REST but are **tick-only on the export path** — measured:
+    /// `{dataset: volatility, timeframe: 1d}` is rejected with `no candle data for 'volatility';
+    /// it is tick-only`, and identically for `interest_rates`.
+    ///
+    /// # ⚠️ The catalog's `access` map does not answer this
+    /// It lists `["candles", "export"]` for the synthetic classes too, so it says only that both
+    /// capabilities exist — not that they compose.
+    pub fn is_candle_class(&self) -> bool {
+        match self {
+            Self::Stocks
+            | Self::Etf
+            | Self::Crypto
+            | Self::Fx
+            | Self::Index
+            | Self::Commodity
+            | Self::Futures => true,
+            Self::InterestRates | Self::CurrencyIndex | Self::Volatility => false,
+        }
+    }
+
     /// Returns the [`MarketDataInstrumentKind`] this dataset serves.
     ///
     /// # Note
@@ -240,7 +263,11 @@ pub fn underlying(symbol: &str) -> Underlying<AssetNameExchange> {
 /// Returns [`LseError::AmbiguousSlug`] when more than one distinct series resolves to the derived
 /// slug. This is the case the signature exists for: the dataset-info endpoint answers `200` for an
 /// ambiguous slug, silently serving whichever series it prefers, so a plain string transformation
-/// would return the wrong dataset with no error. See [`AMBIGUOUS_SLUG_STEMS`].
+/// would return the wrong dataset with no error. Thirteen stems are ambiguous: eleven Eurex
+/// futures that publish **both** a bare and a `.F` series holding different data, which collapse
+/// onto one slug; plus `ES.F` and `SI.F`, whose stripped symbols collide with unrelated equity
+/// tickers. Both spellings of each are rejected — whichever the caller asked for, the slug
+/// identifies the other series just as plausibly.
 ///
 /// # Caller obligation
 /// A derived slug is not verified to exist. The `.F` rule is measured; the behaviour of other

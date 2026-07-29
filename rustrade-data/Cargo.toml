@@ -28,7 +28,19 @@ databento = ["dep:databento"]
 #
 # ⚠️ The data this integration retrieves is NOT redistributable, whatever this crate's own licence
 # says. See `exchange::lse` and https://londonstrategicedge.com/terms
-lse = []
+#
+# `sha2`/`hex` verify the SHA-256 the vault reports for a bulk export artifact; both are already in
+# the workspace tree via `rustrade-integration`, so this adds no new supply-chain surface.
+# `reqwest/stream` + `tokio/fs` stream a multi-gigabyte export to disk with `Range` resume rather
+# than buffering it in memory.
+lse = ["dep:sha2", "dep:hex", "reqwest/stream", "tokio/fs", "tokio/io-util"]
+# Decodes downloaded export artifacts into market events. Separate from `lse` so a consumer who
+# only wants files on disk pays no Parquet dependency cost.
+#
+# ⚠️ `parquet` MUST stay `default-features = false`: its defaults pull the whole `arrow` stack.
+# The row/record API this uses needs none of it. Tier-2 reviewed — see
+# `.github/tier2-dependencies.txt`.
+lse-parquet = ["lse", "dep:parquet"]
 massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
 
 [dev-dependencies]
@@ -40,6 +52,9 @@ serial_test = { workspace = true }  # For Massive WebSocket tests (1 connection 
 wiremock = { workspace = true }  # For Massive/Alpaca REST pagination tests (mock next_url/page_token chains) and http.rs unit tests
 http = { workspace = true }  # Builds synthetic `reqwest::Response`s (via reqwest's `From<http::Response<_>>`) for socket-free transport tests; already in the tree via reqwest
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }  # `test-util` = paused-clock poll-timing tests
+tempfile = "3"  # Scratch directories for LSE export download/resume tests; already in the tree
+sha2 = { workspace = true }  # Computes the digest in synthetic LSE export job fixtures
+hex = { workspace = true }  # Encodes that digest as the provider does
 
 [dependencies]
 # Rustrade Ecosystem
@@ -58,6 +73,16 @@ futures-util = { workspace = true }
 # Used by the always-on Binance historical klines REST client (and the optional
 # Massive client). Plain dep — not feature-gated. Note for tier-2 review.
 async-stream = { workspace = true }
+
+# Integrity verification of London Strategic Edge bulk-export artifacts (the job record carries a
+# SHA-256). Optional, enabled by `lse`; already present in the workspace tree.
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
+# Decodes London Strategic Edge bulk-export artifacts. `default-features = false` is load-bearing:
+# it keeps the entire `arrow` stack out of the tree, leaving only zstd (already present) and three
+# net-new crates. The exports are flat primitives in one row group, so the row/record API suffices.
+parquet = { version = "59.1.0", default-features = false, features = ["zstd"], optional = true }
 
 # Protocol
 url = { workspace = true }
@@ -125,6 +150,10 @@ required-features = ["hyperliquid"]
 [[example]]
 name = "lse_candles"
 required-features = ["lse"]
+
+[[example]]
+name = "lse_export"
+required-features = ["lse-parquet"]
 
 [[example]]
 name = "ibkr_historical"
