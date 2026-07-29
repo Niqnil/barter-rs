@@ -440,16 +440,29 @@ mod tests {
 
     #[test]
     fn test_slug_rejects_ambiguous_symbols() {
+        // Written out independently of the constant rather than iterated from it: a test that reads
+        // the list it is checking would still pass if a stem were accidentally deleted, which is the
+        // one regression that matters here -- a dropped stem silently re-admits a symbol whose slug
+        // resolves to the wrong series.
+        let expected = [
+            "fbtp", "fdax", "fdxm", "fesx", "fgbl", "fgbm", "fgbs", "fmeu", "fmwo", "foat", "fsmi",
+            "es", "si",
+        ];
+        assert_eq!(
+            AMBIGUOUS_SLUG_STEMS, expected,
+            "the ambiguous-stem list changed; confirm the new set against the provider's catalog"
+        );
+
         // Both spellings must be rejected: the bare and `.F` series are different data, and the
         // endpoint answers 200 for the slug regardless of which one the caller meant.
-        for symbol in [
-            "FBTP", "FBTP.F", "FDAX", "FDAX.F", "ES", "ES.F", "SI", "SI.F",
-        ] {
-            let error = slug(symbol).unwrap_err();
-            assert!(
-                matches!(error, LseError::AmbiguousSlug { .. }),
-                "{symbol} should be ambiguous, got {error:?}"
-            );
+        for stem in expected {
+            for symbol in [stem.to_uppercase(), format!("{}.F", stem.to_uppercase())] {
+                let error = slug(&symbol).unwrap_err();
+                assert!(
+                    matches!(error, LseError::AmbiguousSlug { .. }),
+                    "{symbol} should be ambiguous, got {error:?}"
+                );
+            }
         }
     }
 

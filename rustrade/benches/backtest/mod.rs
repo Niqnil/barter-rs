@@ -474,10 +474,18 @@ fn bench_audit_seam(c: &mut Criterion) {
 /// Pre-corporate-action ("pre-seam") backtest baseline: mirrors [`backtest::backtest`] exactly except
 /// it feeds the raw market stream straight to the engine, bypassing the `TimedMergeStream` aux merge.
 ///
-/// This is a faithful copy of the pre-seam `backtest()` body (git `6824b47^`), rebuilt here purely
-/// from the public API so the A/B needs no library changes. `EngineEvent: From<MarketStreamEvent>` is
+/// This is a copy of the pre-seam `backtest()` body (git `6824b47^`), rebuilt here purely from the
+/// public API so the A/B needs no library changes. `EngineEvent: From<MarketStreamEvent>` is
 /// derived, so `SystemBuild` accepts the raw `MarketStreamEvent` stream via its
 /// `Event: From<MarketStream::Item>` bound.
+///
+/// # ⚠️ One deliberate divergence, and what it costs the numbers
+/// Since the market stream became fallible, this baseline unwraps the `Result` with a `filter_map`
+/// combinator where production does it in an inline `match` inside `poll_next` (see the comment at
+/// the call site). The A/B **delta** this benchmark exists to measure stays valid — both arms of
+/// every comparison here carry the same combinator — but **absolute** figures are no longer
+/// comparable against `--save-baseline` snapshots taken before that change. Re-baseline rather than
+/// comparing across it.
 ///
 /// `audit_mode` parameterises this baseline for two A/Bs: the aux-seam group always passes
 /// [`AuditMode::Disabled`], while [`bench_audit_seam`] runs it at both modes so the throughput delta

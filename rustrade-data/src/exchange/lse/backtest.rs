@@ -75,6 +75,12 @@ impl LseCandleSource {
 /// across instruments resolve to the earlier entry in `sources`, so a given `sources` ordering
 /// replays identically every time.
 ///
+/// That per-source ordering is the vault's observed behaviour rather than something
+/// [`fetch_candles`](LseVaultClient::fetch_candles) enforces: it filters each page to the requested
+/// range but never reorders one. A provider that answered a page out of order would therefore
+/// breach [`merge_time_sorted`]'s caller obligation and put a non-monotonic clock in front of a
+/// backtest — silently, because a merge cannot recover ordering its inputs do not have.
+///
 /// # Cost
 /// One paged fetch per source, all in flight concurrently as the merge polls them. Against the
 /// provider's shared allowance (`calls_per_minute`, `vault_concurrency`, both reported by

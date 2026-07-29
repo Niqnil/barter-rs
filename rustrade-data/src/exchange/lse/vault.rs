@@ -110,11 +110,23 @@ impl LseVaultClient {
     /// Create a client from the `LSE_API_KEY` environment variable.
     ///
     /// # Errors
-    /// Returns [`LseError::EnvVar`] if the variable is unset, plus anything [`new`](Self::new)
-    /// returns.
+    /// Returns [`LseError::EnvVar`] if the variable is unset or does not hold valid UTF-8, plus
+    /// anything [`new`](Self::new) returns. Neither message ever contains the variable's value.
     pub fn from_env() -> Result<Self, LseError> {
-        let api_key = env::var(API_KEY_ENV)
-            .map_err(|error| LseError::EnvVar(format!("{API_KEY_ENV}: {error}")))?;
+        // `VarError`'s own `Display` is NOT safe to interpolate here: its `NotUnicode` arm is
+        // "environment variable was not valid unicode: {:?}" and embeds the raw `OsString`, so a
+        // key with one stray non-UTF-8 byte (a mis-encoded paste, a wrong-encoding `.env`) would
+        // put essentially the whole key into an error string that callers routinely log. That
+        // would defeat the redaction this type does everywhere else. Both arms are therefore
+        // reported by a fixed message that names the variable and nothing more.
+        let api_key = env::var(API_KEY_ENV).map_err(|error| {
+            LseError::EnvVar(match error {
+                env::VarError::NotPresent => format!("{API_KEY_ENV} is not set"),
+                env::VarError::NotUnicode(_) => {
+                    format!("{API_KEY_ENV} is set but is not valid UTF-8")
+                }
+            })
+        })?;
 
         Self::new(&api_key)
     }
@@ -284,6 +296,32 @@ mod tests {
 
             assert!(matches!(error, LseError::EnvVar(_)));
             assert!(error.to_string().contains(API_KEY_ENV));
+        });
+    }
+
+    /// `VarError::NotUnicode`'s own `Display` embeds the raw `OsString`, so interpolating it would
+    /// put a mis-encoded key straight into an error string that callers routinely log. Unix-only:
+    /// the invalid value has to be built from raw bytes.
+    #[cfg(unix)]
+    #[test]
+    fn from_env_never_reports_a_non_unicode_key() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        // A plausible mis-encoded paste: a real-looking key carrying one stray non-UTF-8 byte.
+        let mut raw = b"lse-live-super-secret-".to_vec();
+        raw.push(0xff);
+        raw.extend_from_slice(b"-tail");
+
+        temp_env::with_var(API_KEY_ENV, Some(OsString::from_vec(raw)), || {
+            let error = LseVaultClient::from_env().unwrap_err();
+            let message = error.to_string();
+
+            assert!(matches!(error, LseError::EnvVar(_)));
+            assert!(message.contains(API_KEY_ENV));
+            assert!(
+                !message.contains("super-secret"),
+                "the key must never reach the error message: {message}"
+            );
         });
     }
 

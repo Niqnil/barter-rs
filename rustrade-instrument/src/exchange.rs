@@ -177,17 +177,17 @@ impl ExchangeId {
             ExchangeId::HyperliquidSpot => "hyperliquid_spot",
             ExchangeId::Ibkr => "ibkr",
             ExchangeId::Kraken => "kraken",
-            ExchangeId::LseCfd => "lse_cfd",
-            ExchangeId::LseCrypto => "lse_crypto",
-            ExchangeId::LseEquities => "lse_equities",
-            ExchangeId::LseFutures => "lse_futures",
-            ExchangeId::LseFx => "lse_fx",
             ExchangeId::Kucoin => "kucoin",
             ExchangeId::Liquid => "liquid",
             ExchangeId::Massive => "massive",
             ExchangeId::Mexc => "mexc",
             ExchangeId::Okx => "okx",
             ExchangeId::Poloniex => "poloniex",
+            ExchangeId::LseFx => "lse_fx",
+            ExchangeId::LseCrypto => "lse_crypto",
+            ExchangeId::LseEquities => "lse_equities",
+            ExchangeId::LseFutures => "lse_futures",
+            ExchangeId::LseCfd => "lse_cfd",
         }
     }
 }

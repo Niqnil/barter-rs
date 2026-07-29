@@ -70,6 +70,19 @@ fn ready_body(job_id: &str, payload: &[u8]) -> String {
     )
 }
 
+/// A `ready` job reporting neither `bytes` nor `sha256`.
+///
+/// Both fields are independent `Option`s, and every measured `ready` job carried both — but the
+/// provider makes no guarantee, and the download path deliberately accepts an artifact it cannot
+/// fully verify rather than refusing one the provider calls ready. These are the tests for what
+/// that concession costs.
+fn job_without_integrity_metadata(job_id: &str) -> LseExportJobStatus {
+    serde_json::from_str(&format!(
+        r#"{{"id":"{job_id}","status":"ready","symbol":"EUR/USD","format":"parquet"}}"#
+    ))
+    .unwrap()
+}
+
 #[tokio::test]
 async fn submit_accepts_the_202_the_provider_actually_returns() {
     let server = MockServer::start().await;
@@ -386,7 +399,11 @@ async fn an_interrupted_download_resumes_from_the_partial_file() {
     Mock::given(method("GET"))
         .and(path("/vault/export/job1/download"))
         .and(header("range", "bytes=10-"))
-        .respond_with(ResponseTemplate::new(206).set_body_bytes(payload[10..].to_vec()))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 10-15/16")
+                .set_body_bytes(payload[10..].to_vec()),
+        )
         .mount(&server)
         .await;
 
@@ -403,6 +420,231 @@ async fn an_interrupted_download_resumes_from_the_partial_file() {
         .unwrap();
 
     assert_eq!(std::fs::read(&destination).unwrap(), payload);
+}
+
+#[tokio::test]
+async fn a_server_that_ignores_range_restarts_the_download_instead_of_appending() {
+    // A server is entitled to answer a `Range` request with `200` and the whole artifact. Appending
+    // that to the existing prefix would double it, so the transfer must restart from zero -- hasher
+    // included, or the digest would cover the duplicated bytes and reject a correct download.
+    let payload = b"0123456789abcdef";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .and(header("range", "bytes=10-"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.to_vec()))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("out.parquet");
+    let mut part = destination.clone().into_os_string();
+    part.push(".part");
+    std::fs::write(&part, &payload[..10]).unwrap();
+
+    let job = serde_json::from_str(&ready_body("job1", payload)).unwrap();
+    client(&server)
+        .download_export(&job, &destination, &tick_request())
+        .await
+        .unwrap();
+
+    // Exactly the artifact -- not the prefix twice over.
+    assert_eq!(std::fs::read(&destination).unwrap(), payload);
+    assert!(!PathBuf::from(&part).exists());
+}
+
+#[tokio::test]
+async fn a_206_resuming_from_the_wrong_offset_is_rejected_before_it_reaches_the_file() {
+    // The `bytes`/`sha256` checks would catch this eventually, but both are optional on the job, so
+    // a `ready` job reporting neither would rename a corrupt file into place. The `Content-Range`
+    // says what actually went wrong, at the point it went wrong.
+    let payload = b"0123456789abcdef";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .and(header("range", "bytes=10-"))
+        .respond_with(
+            // Asked for byte 10, answered from byte 4.
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 4-15/16")
+                .set_body_bytes(payload[4..].to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("out.parquet");
+    let mut part = destination.clone().into_os_string();
+    part.push(".part");
+    std::fs::write(&part, &payload[..10]).unwrap();
+
+    let error = client(&server)
+        .download_export(
+            &job_without_integrity_metadata("job1"),
+            &destination,
+            &tick_request(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LseError::Api { status: 206, .. }));
+    assert!(!destination.exists());
+    // The prefix is untouched, so a later correct `206` still resumes from it.
+    assert_eq!(std::fs::read(&part).unwrap(), &payload[..10]);
+}
+
+#[tokio::test]
+async fn a_206_with_no_usable_content_range_is_rejected_rather_than_assumed_to_resume() {
+    // The other two arms of the same seam check. RFC 9110 §15.3.7 requires `Content-Range` on a
+    // `206`, so absent or unparseable is a protocol violation -- and treating either as benign would
+    // append bytes at an offset the server never claimed, which on a job reporting neither `bytes`
+    // nor `sha256` nothing downstream would catch.
+    let payload = b"0123456789abcdef";
+
+    for content_range in [None, Some("bytes abc-15/16")] {
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(206).set_body_bytes(payload[10..].to_vec());
+        if let Some(value) = content_range {
+            response = response.insert_header("content-range", value);
+        }
+        Mock::given(method("GET"))
+            .and(path("/vault/export/job1/download"))
+            .and(header("range", "bytes=10-"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("out.parquet");
+        let mut part = destination.clone().into_os_string();
+        part.push(".part");
+        std::fs::write(&part, &payload[..10]).unwrap();
+
+        let error = client(&server)
+            .download_export(
+                &job_without_integrity_metadata("job1"),
+                &destination,
+                &tick_request(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, LseError::Api { status: 206, .. }),
+            "Content-Range {content_range:?} should be rejected, got {error:?}"
+        );
+        assert!(!destination.exists());
+        // Kept, not discarded: this call appended nothing, but the prefix is still a real one that a
+        // correct `206` can resume from -- unlike the `416` case, where the file is provably not
+        // this job's.
+        assert_eq!(std::fs::read(&part).unwrap(), &payload[..10]);
+    }
+}
+
+#[tokio::test]
+async fn a_416_on_an_already_complete_part_file_converges_instead_of_failing_forever() {
+    // A run interrupted between the final write and the rename leaves a `.part` holding the whole
+    // artifact. Without `bytes` on the job there is no way to know that up front, so the resume is
+    // attempted and earns a spec-compliant `416`. Treating that as an error would make every retry
+    // fail identically, contradicting the documented "re-calling resumes".
+    let payload = b"0123456789abcdef";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .and(header("range", "bytes=16-"))
+        .respond_with(ResponseTemplate::new(416))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("out.parquet");
+    let mut part = destination.clone().into_os_string();
+    part.push(".part");
+    std::fs::write(&part, payload).unwrap();
+
+    let export = client(&server)
+        .download_export(
+            &job_without_integrity_metadata("job1"),
+            &destination,
+            &tick_request(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(export.path(), destination);
+    assert_eq!(std::fs::read(&destination).unwrap(), payload);
+    assert!(!PathBuf::from(&part).exists());
+}
+
+#[tokio::test]
+async fn a_416_on_a_part_file_that_fails_verification_discards_it_and_converges() {
+    // The other half of the `416` story. A `.part` left by a DIFFERENT job can sit at or past this
+    // artifact's length, so the resume earns a `416` — but those bytes are not this job's. Unlike
+    // the stale-oversized case, a request *was* sent and answered here, and the file still has to
+    // go: keeping it would earn the same `416` and fail the same hash on every retry.
+    //
+    // Reaching this needs `sha256` without `bytes`. With `bytes` present the length check would
+    // have declared the file complete before any request, taking the no-transfer path instead — so
+    // this combination is the only door to a discard decision made *after* talking to the server.
+    let payload = b"0123456789abcdef";
+    // Same length as the artifact, so the resume offset lands exactly on its end and earns a `416`.
+    let stale = b"leftovers-from-a";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .and(header("range", "bytes=16-"))
+        .respond_with(ResponseTemplate::new(416))
+        .mount(&server)
+        .await;
+    // The retry after the discard starts from scratch, so it carries no `Range` and falls through
+    // to this one.
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.to_vec()))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("out.parquet");
+    let mut part = destination.clone().into_os_string();
+    part.push(".part");
+    std::fs::write(&part, stale).unwrap();
+
+    let job: LseExportJobStatus = serde_json::from_str(&format!(
+        r#"{{"id":"job1","status":"ready","symbol":"EUR/USD","format":"parquet",
+            "sha256":"{}"}}"#,
+        hex::encode(Sha256::digest(payload))
+    ))
+    .unwrap();
+    let client = client(&server);
+
+    let error = client
+        .download_export(&job, &destination, &tick_request())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        LseError::IntegrityMismatch {
+            discarded: true,
+            ..
+        }
+    ));
+    assert!(!destination.exists());
+    // Discarded, not kept: that is what lets the retry below make progress.
+    assert!(!PathBuf::from(&part).exists());
+    // Unlike the stale-oversized discard, this one did reach the server — which is why the warning
+    // it logs must not claim the file went unfetched.
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    // The same call now succeeds instead of failing identically forever.
+    client
+        .download_export(&job, &destination, &tick_request())
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&destination).unwrap(), payload);
+    assert!(!PathBuf::from(&part).exists());
 }
 
 #[tokio::test]

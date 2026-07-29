@@ -245,10 +245,17 @@ impl LseVaultClient {
                     // that fell outside the contract rather than re-requesting them forever.
                     max_open = Some(max_open.map_or(open, |seen| seen.max(open)));
 
-                    // Rows arrive ascending, so the first bar past the upper bound ends the fetch.
+                    // A bar past the upper bound ends the fetch — but only after the rest of this
+                    // page has been examined. Ascending order is how the vault answers today, not
+                    // something it guarantees, and breaking here would silently drop any in-range
+                    // bar sitting behind an out-of-range one: the stream would end `Ok` on a
+                    // truncated series, which a caller cannot tell apart from a genuinely short
+                    // range. Continuing costs one pass over a page already in memory and changes
+                    // nothing else — `max_open` below already scans every row, so the cursor
+                    // arithmetic never depended on the order in the first place.
                     if close_time > end {
                         reached_end = true;
-                        break;
+                        continue;
                     }
 
                     // Below the lower bound only for the widened first page.

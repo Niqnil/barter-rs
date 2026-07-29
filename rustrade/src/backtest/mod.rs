@@ -102,10 +102,47 @@ pub struct BacktestArgsDynamic<Strategy, Risk> {
     /// Risk management rules.
     pub risk: Risk,
 }
+/// Aborts a [`System`](crate::system::System)'s task tree if the run holding it is dropped before
+/// its graceful shutdown completes.
+///
+/// # Why a guard rather than relying on drop
+/// Dropping a [`JoinHandle`](tokio::task::JoinHandle) **detaches** its task; it does not cancel it.
+/// So dropping a `backtest` future — which is precisely what [`run_backtests`] does to every
+/// sibling the moment one resolves `Err` — leaves that run's tasks running with no handle left to
+/// observe or stop them. Two of them cannot even finish on their own: the engine ends only on the
+/// explicit `Shutdown` that `System::shutdown_after_backtest` sends, and `account_to_engine` only on
+/// the explicit abort it performs, both of which are skipped by the drop. What survives is a
+/// permanently parked engine and execution task group still holding its `EngineState`, plus a market
+/// source that keeps fetching — and, on a metered provider, keeps spending — for a result no one
+/// will read. Each cancelled run adds another set, so a long-lived process accumulates them.
+///
+/// # Why aborting mid-run is sound here
+/// An abort lands at an arbitrary await point and can leave engine state half-updated. That is
+/// harmless in this position because the guard only ever fires on a run whose result is being
+/// discarded: [`run_backtests`] retains no per-run terminal `EngineState` even when it succeeds.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        // Aborting an already-finished task is a no-op, so the normal path needs no disarming.
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 /// Run multiple backtests concurrently, each with different strategy parameters.
 ///
 /// Takes the shared constants and an iterator of different strategy configurations,
 /// then executes all backtests in parallel, collecting the results.
+///
+/// # A failing run cancels its siblings
+/// The first run to fail short-circuits the batch: the others are cancelled rather than allowed to
+/// finish, and their task trees are torn down with them (see `AbortOnDrop`). Nothing partial is
+/// returned for a cancelled run, and no summary is produced for it — a sweep either yields one
+/// [`BacktestSummary`] per configuration or fails as a whole. A cancelled run's market source stops
+/// being read at its next await point, which for a metered provider bounds what a doomed sweep
+/// spends.
 pub async fn run_backtests<
     MarketData,
     SummaryInterval,
@@ -367,6 +404,15 @@ where
     )
     .init()
     .await?;
+
+    // Armed as soon as there is a task tree to abort — `init` returns the first handles this run
+    // owns — and held to the end of the run. The earlier awaits need no guard: the only tasks `init`
+    // spawns before its last fallible await are the `MockExchange` runners, and each ends on its own
+    // once the dropped future releases the last request sender. Every other task is spawned after
+    // that await, so a drop cannot strand one mid-init. See `AbortOnDrop`: without it, this run being
+    // cancelled — which is exactly what `run_backtests` does to every sibling when one fails — parks
+    // its task group forever.
+    let _abort_on_drop = AbortOnDrop(system.abort_handles());
 
     let (engine, _shutdown_audit) = system.shutdown_after_backtest().await?;
 

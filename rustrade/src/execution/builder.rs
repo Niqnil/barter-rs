@@ -38,7 +38,7 @@ use rustrade_integration::channel::{Channel, UnboundedTx, mpsc_unbounded};
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc},
-    task::{JoinError, JoinHandle},
+    task::{AbortHandle, JoinError, JoinHandle},
 };
 
 type ExecutionInitFuture =
@@ -369,6 +369,20 @@ impl AsyncShutdown for ExecutionHandles {
 
         try_join_all(handles).await?;
         Ok(())
+    }
+}
+
+impl ExecutionHandles {
+    /// [`AbortHandle`]s for every execution task, without consuming the handles.
+    ///
+    /// Enumerates the same task set as [`IntoIterator`] — a task added to this struct must be added
+    /// to both.
+    pub(crate) fn abort_handles(&self) -> impl Iterator<Item = AbortHandle> + '_ {
+        self.mock_exchanges
+            .iter()
+            .chain(&self.managers)
+            .chain(&self.account_to_engines)
+            .map(JoinHandle::abort_handle)
     }
 }
 

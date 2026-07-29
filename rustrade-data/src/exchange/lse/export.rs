@@ -620,7 +620,10 @@ impl LseVaultClient {
     ///
     /// # Resume and integrity
     /// Downloads into `destination` + `.part`, resuming an interrupted transfer with a `Range`
-    /// request (the provider advertises `Accept-Ranges: bytes` and answers `206`). On completion
+    /// request (the provider advertises `Accept-Ranges: bytes` and answers `206`). A `206` is
+    /// accepted only if its `Content-Range` starts at the byte that was asked for; a `416` is
+    /// treated as "the `.part` already holds the whole artifact" rather than as a failure, so a
+    /// transfer interrupted between the final write and the rename still converges. On completion
     /// the artifact is verified against the job's `sha256` and `bytes`, then atomically renamed
     /// into place. **On a mismatch an error is returned and the destination is left untouched**,
     /// so it never contains a corrupt file.
@@ -639,10 +642,11 @@ impl LseVaultClient {
     /// spuriously. Serialise them, or give each its own destination.
     ///
     /// The `.part` is normally **kept**, so re-calling resumes rather than restarting. The one
-    /// exception is a pre-existing `.part` that already looked complete and then failed
-    /// verification: no transfer was attempted, which proves it belongs to a *different* job that
-    /// used this destination, so it is removed and a re-call restarts. Keeping it would fail
-    /// identically forever. [`LseError::IntegrityMismatch`] reports which happened via `discarded`.
+    /// exception is a `.part` that failed verification after this call appended nothing to it —
+    /// either it already looked complete from the job's byte count, or the server rejected the
+    /// resume `Range` as unsatisfiable. Either way it belongs to a *different* job that used this
+    /// destination, so it is removed and a re-call restarts. Keeping it would fail identically
+    /// forever. [`LseError::IntegrityMismatch`] reports which happened via `discarded`.
     ///
     /// The URL is built from the client's base URL and the job id rather than from the job's
     /// `download_url`, preserving this client's invariant that it only ever requests URLs it
@@ -697,87 +701,112 @@ impl LseVaultClient {
         // `downloaded > 0` guard keeps a job reporting `bytes: 0` from satisfying this vacuously
         // when no `.part` exists at all, which would skip the fetch and then rename a file that was
         // never created.
-        let complete = downloaded > 0 && job.bytes.is_some_and(|total| downloaded >= total);
+        let mut complete = downloaded > 0 && job.bytes.is_some_and(|total| downloaded >= total);
 
         if !complete {
-            let url = format!("{}/export/{}/download", self.base_url(), job.id);
-            let mut builder = self.http().get(&url);
-            if downloaded > 0 {
-                builder = builder.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
-            }
+            'download: {
+                let url = format!("{}/export/{}/download", self.base_url(), job.id);
+                let mut builder = self.http().get(&url);
+                if downloaded > 0 {
+                    builder =
+                        builder.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
+                }
 
-            let response = builder.send().await?;
-            let status = response.status();
+                let response = builder.send().await?;
+                let status = response.status();
 
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(self.quota_exceeded().await);
-            }
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(self.quota_exceeded().await);
+                }
 
-            if !status.is_success() {
-                let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
-                return Err(LseError::Api {
-                    status: status.as_u16(),
-                    message: extract_detail(&body),
-                });
-            }
+                // A `416` answers a `Range` starting at or past the artifact's length: the `.part`
+                // already holds everything the server has. That is precisely the case the `complete`
+                // check above cannot decide for itself, because it needs `job.bytes` and the job is
+                // entitled to report `None` — verification tolerates that absence (see below), so
+                // resuming must too. Failing here instead would make the documented "re-calling
+                // resumes" never converge: every retry would re-request the same unsatisfiable range.
+                // Whether those bytes are actually *this* job's artifact is still decided below.
+                if downloaded > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                    warn!(
+                        job_id = job.id,
+                        downloaded,
+                        "range request rejected as unsatisfiable; the existing part file already holds \
+                     the whole artifact"
+                    );
+                    complete = true;
+                    break 'download;
+                }
 
-            // The server is entitled to ignore `Range` and answer `200` with the whole artifact.
-            // Restarting is then the only correct response — appending would duplicate the prefix.
-            let resuming = downloaded > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
-            if downloaded > 0 && !resuming {
-                warn!(
-                    job_id = job.id,
-                    downloaded, "range request answered in full; restarting the download"
-                );
-                hasher = Sha256::new();
-                downloaded = 0;
-            }
+                if !status.is_success() {
+                    let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
+                    return Err(LseError::Api {
+                        status: status.as_u16(),
+                        message: extract_detail(&body),
+                    });
+                }
 
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(!resuming)
-                .append(resuming)
-                .open(&part)
-                .await
-                .map_err(|source| LseError::Io {
-                    message: format!("opening {}", part.display()),
-                    source,
-                })?;
+                // The server is entitled to ignore `Range` and answer `200` with the whole artifact.
+                // Restarting is then the only correct response — appending would duplicate the prefix.
+                let resuming = downloaded > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+                if resuming {
+                    verify_resume_offset(&response, downloaded)?;
+                }
+                if downloaded > 0 && !resuming {
+                    warn!(
+                        job_id = job.id,
+                        downloaded, "range request answered in full; restarting the download"
+                    );
+                    hasher = Sha256::new();
+                    downloaded = 0;
+                }
 
-            // Buffered because `tokio::fs` dispatches each write to the blocking pool: writing every
-            // HTTP chunk straight through costs one round trip per chunk, and artifacts run to
-            // gigabytes. An interrupted transfer loses at most one buffer of resume progress — the
-            // next call re-reads the `.part`'s real on-disk length, so it resumes correctly from
-            // whatever landed, just slightly further back.
-            let mut file = tokio::io::BufWriter::with_capacity(DOWNLOAD_BUFFER_BYTES, file);
-
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                hasher.update(&chunk);
-                downloaded += chunk.len() as u64;
-                file.write_all(&chunk)
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(!resuming)
+                    .append(resuming)
+                    .open(&part)
                     .await
                     .map_err(|source| LseError::Io {
-                        message: format!("writing {}", part.display()),
+                        message: format!("opening {}", part.display()),
                         source,
                     })?;
-            }
 
-            file.flush().await.map_err(|source| LseError::Io {
-                message: format!("flushing {}", part.display()),
-                source,
-            })?;
+                // Buffered because `tokio::fs` dispatches each write to the blocking pool: writing every
+                // HTTP chunk straight through costs one round trip per chunk, and artifacts run to
+                // gigabytes. An interrupted transfer loses at most one buffer of resume progress — the
+                // next call re-reads the `.part`'s real on-disk length, so it resumes correctly from
+                // whatever landed, just slightly further back.
+                let mut file = tokio::io::BufWriter::with_capacity(DOWNLOAD_BUFFER_BYTES, file);
+
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    hasher.update(&chunk);
+                    downloaded += chunk.len() as u64;
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|source| LseError::Io {
+                            message: format!("writing {}", part.display()),
+                            source,
+                        })?;
+                }
+
+                file.flush().await.map_err(|source| LseError::Io {
+                    message: format!("flushing {}", part.display()),
+                    source,
+                })?;
+            }
         }
 
         let digest = hex::encode(hasher.finalize());
 
-        // Retaining the `.part` is only useful when this call actually fetched something: the bytes
-        // are then a real prefix that a `Range` request can continue. When the transfer was skipped
-        // because a pre-existing `.part` already looked complete, a failed check proves that file is
-        // NOT this job's artifact — it is a leftover from a different job that used the same
-        // destination. Keeping it would fail identically on every retry, so the documented
+        // Retaining the `.part` is only useful when this call appended something: those bytes are
+        // then a real prefix that a `Range` request can continue. `complete` means it appended
+        // nothing — either the transfer was skipped because a pre-existing `.part` already looked
+        // complete, or the server answered the resume `Range` with a 416. A failed check then proves
+        // that file is NOT this job's artifact — it is a leftover from a different job that used the
+        // same destination. Keeping it would fail identically on every retry, so the documented
         // "re-calling resumes" would never converge. Discarding is loud, and only ever removes a
         // file this integration is the sole writer of.
         let discard = complete;
@@ -880,9 +909,10 @@ impl LseVaultClient {
     /// Build a [`LseError::IntegrityMismatch`], discarding the partial file when it cannot be
     /// resumed from.
     ///
-    /// `discard` is set when no transfer was attempted, i.e. a pre-existing `.part` already looked
-    /// complete and turned out not to be this job's artifact. A removal failure is logged rather
-    /// than replacing the integrity error, which is the more useful diagnostic of the two.
+    /// `discard` is set when this call appended no bytes to the `.part` — it already looked
+    /// complete, or the resume `Range` came back `416` — so the file cannot be a partial download of
+    /// this job and no retry can advance it. A removal failure is logged rather than replacing the
+    /// integrity error, which is the more useful diagnostic of the two.
     async fn integrity_mismatch(
         &self,
         part: &Path,
@@ -895,8 +925,9 @@ impl LseVaultClient {
                 path = %part.display(),
                 %expected,
                 %actual,
-                "a pre-existing partial file failed verification without being fetched, so it \
-                 cannot be a partial download of this job; discarding it so a re-call restarts"
+                "a pre-existing partial file failed verification and this call appended no bytes to \
+                 it, so it cannot be a partial download of this job; discarding it so a re-call \
+                 restarts"
             );
 
             if let Err(error) = tokio::fs::remove_file(part).await {
@@ -950,6 +981,52 @@ fn part_path(destination: &Path) -> PathBuf {
     let mut name = destination.as_os_str().to_owned();
     name.push(".part");
     PathBuf::from(name)
+}
+
+/// Confirm a `206` resumes from exactly the offset that was requested.
+///
+/// A `206` starting anywhere else gets appended to the `.part` as though it continued it, leaving a
+/// file that is neither the artifact nor a resumable prefix of it. The `bytes` and `sha256` checks
+/// would normally catch that — but both are `Option` on the job, so a `ready` job reporting neither
+/// would rename the corrupt result into place. Checking the header closes that gap where the
+/// mistake is made, and says what actually went wrong instead of "digest mismatch".
+///
+/// A `206` carrying no parseable `Content-Range` is itself a protocol violation (RFC 9110 §15.3.7
+/// requires the header), so it is surfaced rather than assumed benign.
+fn verify_resume_offset(response: &reqwest::Response, expected_start: u64) -> Result<(), LseError> {
+    let status = reqwest::StatusCode::PARTIAL_CONTENT.as_u16();
+
+    let header = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| LseError::Api {
+            status,
+            message: "partial-content response carries no usable Content-Range header".to_owned(),
+        })?;
+
+    // `bytes <first>-<last>/<complete-length|*>`. Only `<first>` decides where these bytes belong.
+    let first = header
+        .trim()
+        .strip_prefix("bytes ")
+        .and_then(|range| range.split('-').next())
+        .and_then(|first| first.trim().parse::<u64>().ok())
+        .ok_or_else(|| LseError::Api {
+            status,
+            message: format!("unparseable Content-Range on a partial-content response: {header}"),
+        })?;
+
+    if first != expected_start {
+        return Err(LseError::Api {
+            status,
+            message: format!(
+                "partial-content response resumes at byte {first}, not the requested \
+                 {expected_start}"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Read an existing `.part` back into a hasher, returning it and the byte count.

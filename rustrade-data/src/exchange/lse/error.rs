@@ -32,7 +32,11 @@ pub enum LseError {
     #[error("unknown dataset {0:?}")]
     UnknownDataset(String),
 
-    /// A required environment variable is not set (see [`LseVaultClient::from_env`]).
+    /// A required environment variable is not set, or does not hold valid UTF-8 (see
+    /// [`LseVaultClient::from_env`]).
+    ///
+    /// The message names the variable and never its value, so a mis-encoded key cannot reach a log
+    /// line through this error.
     ///
     /// [`LseVaultClient::from_env`]: super::vault::LseVaultClient::from_env
     #[error("environment variable error: {0}")]
@@ -46,10 +50,14 @@ pub enum LseError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// The API returned a non-success status.
+    /// The API returned a non-success status, or a success response this integration cannot use.
     ///
     /// `message` is the provider's own diagnostic, unwrapped from its response envelope and
-    /// truncated to a bounded length.
+    /// truncated to a bounded length — or, where `status` is a success code, this integration's own
+    /// diagnostic for a response that violated the contract that status implies. A `206` whose
+    /// `Content-Range` is missing, unparseable, or does not resume where the `Range` asked, and a
+    /// `200` page that repeats the cursor it was given, all arrive here: the status is the one the
+    /// provider sent, so it stays reportable, but the fault is one only the client can see.
     #[error("API error ({status}): {message}")]
     Api { status: u16, message: String },
 
@@ -145,10 +153,11 @@ pub enum LseError {
     /// `discarded` reports what happened to the partial file at `path`:
     /// - `false` — it is **retained**, because this call fetched it and the bytes are a real prefix
     ///   the next call can resume from with a `Range` request.
-    /// - `true` — it was **removed**. A pre-existing partial file already looked complete, so no
-    ///   transfer was attempted; failing verification then proves it is a leftover from a different
-    ///   job that used the same destination, not a prefix of this one. Retaining it would fail
-    ///   identically forever, so a re-call restarts instead.
+    /// - `true` — it was **removed**. This call appended no bytes to it: either it already looked
+    ///   complete from the job's byte count, or the resume `Range` came back `416`. Failing
+    ///   verification then proves it is a leftover from a different job that used the same
+    ///   destination, not a prefix of this one. Retaining it would fail identically forever, so a
+    ///   re-call restarts instead.
     #[error("integrity check failed for {}: expected {expected}, got {actual} ({})", .path.display(), match .discarded {
         true => "unusable partial file discarded; re-call to restart",
         false => "partial file kept for resume",

@@ -92,7 +92,11 @@ fn ts(raw: &str) -> DateTime<Utc> {
 
 /// A candle `MarketEvent` for BTCUSDT (instrument index 0), stamped at its `close_time`.
 fn candle(close_time: &str, close: Decimal) -> ScriptItem {
-    let close_time = ts(close_time);
+    candle_at(ts(close_time), close)
+}
+
+/// [`candle`] for a timestamp that is computed rather than written out.
+fn candle_at(close_time: DateTime<Utc>, close: Decimal) -> ScriptItem {
     Ok(MarketStreamEvent::Item(MarketEvent {
         time_exchange: close_time,
         time_received: close_time,
@@ -127,6 +131,32 @@ fn factory(
     move || {
         calls.fetch_add(1, Ordering::SeqCst);
         std::future::ready(Ok(futures::stream::iter(script.clone())))
+    }
+}
+
+/// A factory whose stream yields one item per `pace`, counting items as they leave it.
+///
+/// Stands in for a source that is genuinely mid-fetch — a paginated provider call between pages —
+/// which is the only state in which cancelling a run is observable at all. `futures::stream::iter`
+/// is ready on every poll, so a run backed by it can finish before a sibling has even failed.
+fn paced_factory(
+    script: Script,
+    pace: std::time::Duration,
+    yielded: Arc<AtomicUsize>,
+) -> impl Fn() -> std::future::Ready<Result<futures::stream::BoxStream<'static, ScriptItem>, BarterError>>
+{
+    move || {
+        let yielded = Arc::clone(&yielded);
+        let stream = futures::StreamExt::then(futures::stream::iter(script.clone()), move |item| {
+            let yielded = Arc::clone(&yielded);
+            async move {
+                tokio::time::sleep(pace).await;
+                yielded.fetch_add(1, Ordering::SeqCst);
+                item
+            }
+        });
+
+        std::future::ready(Ok(futures::StreamExt::boxed(stream)))
     }
 }
 
@@ -266,6 +296,97 @@ async fn mid_stream_source_failure_aborts_a_run_backtests_sweep() {
     .expect_err("a failing source must fail the whole sweep");
 
     assert_eq!(error, source_failure());
+}
+
+/// A run cancelled because a sibling failed must take its whole task tree with it.
+///
+/// `run_backtests` short-circuits on the first `Err`, dropping the other runs' futures. Dropping a
+/// `JoinHandle` detaches its task rather than cancelling it, so without the abort guard in
+/// `backtest` the cancelled run's engine, execution-manager, mock-exchange and account-forwarding
+/// tasks survive — and cannot finish on their own, because the `Shutdown` that ends the engine and
+/// the abort that ends `account_to_engine` are both sent by the graceful path the drop skipped.
+/// They then park forever holding their `EngineState`, and every failing sweep adds another set.
+///
+/// This drives `try_join_all` directly rather than `run_backtests`, because `run_backtests` takes
+/// one `BacktestArgsConstant` for the whole batch and so cannot give two runs different sources.
+/// The combinator is the entirety of what `run_backtests` adds over `backtest`, so exercising it
+/// with two independent runs is the same code path — and it is the only way to have one run fail
+/// while another is provably still mid-stream. The existing sweep test above gives both runs the
+/// same failing script, so both fail at once and neither is ever cancelled mid-flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_cancelled_by_a_failing_sibling_does_not_leak_its_tasks() {
+    const VICTIM_EVENTS: usize = 200;
+
+    // Fails on its second item, near-instantly: nothing paces this one.
+    let trigger = MarketDataStreamed::<_, DataKind>::new(factory(
+        vec![
+            candle("2025-03-24T22:00:00Z", dec!(60_000)),
+            Err(source_failure()),
+        ],
+        Arc::new(AtomicUsize::new(0)),
+    ))
+    .await
+    .unwrap();
+
+    // Long and slow, so it is unambiguously still reading when the trigger fails.
+    let yielded = Arc::new(AtomicUsize::new(0));
+    let first_close = ts("2025-03-24T22:00:00Z");
+    let victim = MarketDataStreamed::<_, DataKind>::new(paced_factory(
+        (0..VICTIM_EVENTS)
+            .map(|index| {
+                candle_at(
+                    first_close + chrono::TimeDelta::minutes(index as i64),
+                    dec!(60_000),
+                )
+            })
+            .collect(),
+        std::time::Duration::from_millis(20),
+        Arc::clone(&yielded),
+    ))
+    .await
+    .unwrap();
+
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let baseline = metrics.num_alive_tasks();
+
+    let trigger_args = args_constant(trigger).await;
+    let victim_args = args_constant(victim).await;
+    let consumed_before = yielded.load(Ordering::SeqCst);
+
+    let error = futures::future::try_join_all([
+        futures::future::Either::Left(backtest(trigger_args, args_dynamic("trigger"))),
+        futures::future::Either::Right(backtest(victim_args, args_dynamic("victim"))),
+    ])
+    .await
+    .expect_err("the failing run must fail the join");
+    assert_eq!(error, source_failure());
+
+    // Aborts land asynchronously, and a multi-threaded runtime's task count is not instantaneously
+    // consistent, so settle rather than sample once. Under a leak this never converges: the parked
+    // tasks are waiting on channels that can no longer be closed by anyone.
+    //
+    // The deadline bounds only that leaking case — a healthy run converges within a poll or two of
+    // the abort, and pays none of it. It is therefore set for headroom on a contended CI runner
+    // (many test binaries, each with its own multi-threaded runtime) rather than tuned to how long
+    // the teardown actually takes: a tight ceiling here buys nothing and turns scheduler latency
+    // into a flake.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while metrics.num_alive_tasks() > baseline && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        metrics.num_alive_tasks(),
+        baseline,
+        "the cancelled run left tasks alive"
+    );
+
+    // The point of cancelling rather than letting siblings finish: a metered source stops being
+    // read. Without that, this reaches the full script.
+    let consumed = yielded.load(Ordering::SeqCst) - consumed_before;
+    assert!(
+        consumed < VICTIM_EVENTS,
+        "the cancelled run consumed its whole source ({consumed} of {VICTIM_EVENTS} events)"
+    );
 }
 
 /// The documented 1 + N cost model, measured through the real `backtest` path rather than by

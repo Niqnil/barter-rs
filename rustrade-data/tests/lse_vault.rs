@@ -11,7 +11,7 @@
 #![cfg(feature = "lse")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal_macros::dec;
 use rustrade_data::exchange::lse::error::LseError;
 use rustrade_data::exchange::lse::vault::LseVaultClient;
@@ -446,4 +446,89 @@ async fn a_malformed_timestamp_surfaces_rather_than_being_skipped() {
         .unwrap_err();
 
     assert!(matches!(error, LseError::Deserialize { .. }));
+}
+
+#[tokio::test]
+async fn an_out_of_order_page_does_not_truncate_the_series() {
+    let server = MockServer::start().await;
+
+    // Ascending rows are what the vault serves, not what it promises. A bar past the upper bound
+    // listed BEFORE an in-range one must not end the page early: dropping the in-range bar would
+    // return a short series with an `Ok` result, which a caller cannot tell apart from a range that
+    // genuinely held one fewer bar.
+    mount_page(
+        &server,
+        "2024-01-03 00:00:00",
+        &[
+            equity_row("2024-01-04 00:00:00.000000", "13.0"), // closes 01-05, past `end`
+            equity_row("2024-01-03 00:00:00.000000", "12.0"), // closes 01-04, in range
+        ],
+    )
+    .await;
+
+    let candles = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-04T00:00:00Z"),
+            utc("2024-01-04T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(candles.len(), 1, "the in-range bar must survive the page");
+    assert_eq!(candles[0].close_time, utc("2024-01-04T00:00:00Z"));
+    assert_eq!(candles[0].close, dec!(12.0));
+}
+
+#[tokio::test]
+async fn a_full_page_at_the_row_cap_seams_onto_the_next_without_gap_or_duplicate() {
+    let server = MockServer::start().await;
+
+    // The row cap is applied silently, so the page boundary it creates is the one seam pagination
+    // never sees coming. Every other test here pages at one or two rows; this one pages at the real
+    // 5,000-row cap, where an off-by-one in the cursor step drops or repeats exactly one bar --
+    // invisible at small page sizes, and a whole minute of data at this one.
+    const CAP: i64 = 5000;
+    let first_open = utc("2024-01-01T00:00:00Z");
+    let minute_row =
+        |open: DateTime<Utc>| equity_row(&open.format("%Y-%m-%d %H:%M:%S%.6f").to_string(), "10.0");
+
+    let full_page: Vec<String> = (0..CAP)
+        .map(|index| minute_row(first_open + TimeDelta::minutes(index)))
+        .collect();
+    mount_page(&server, "2024-01-01 00:00:00", &full_page).await;
+
+    // The cursor resumes one second past the last bar's OPEN, so page two must begin at the very
+    // next minute. Anything else shows up in the sequence check below as a gap or a repeat.
+    let last_open_page_one = first_open + TimeDelta::minutes(CAP - 1);
+    let next_open = last_open_page_one + TimeDelta::minutes(1);
+    mount_page(
+        &server,
+        &(last_open_page_one + TimeDelta::seconds(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+        &[minute_row(next_open)],
+    )
+    .await;
+
+    let candles = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Min1,
+            first_open + TimeDelta::minutes(1), // close of the first bar
+            next_open + TimeDelta::minutes(1),  // close of the last bar
+        )
+        .await
+        .unwrap();
+
+    // No third request: the cursor lands exactly on the exclusive upper bound after page two.
+    assert_eq!(candles.len(), CAP as usize + 1);
+    for (index, candle) in candles.iter().enumerate() {
+        assert_eq!(
+            candle.close_time,
+            first_open + TimeDelta::minutes(index as i64 + 1),
+            "bar {index} breaks the one-minute sequence across the cap boundary"
+        );
+    }
 }

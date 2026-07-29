@@ -39,10 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the provider's asynchronous export jobs. This is the **only** path to the raw tick tape — neither
   REST nor WebSocket reaches it. Downloads resume via `Range`, verify the job's SHA-256, and rename
   atomically; on a mismatch the destination is left absent and the partial file is kept, so a
-  repeated call resumes rather than restarting. The exception is a partial file that already looked
-  complete before anything was fetched: failing verification then proves it belongs to a *different*
-  job that used the same destination, so it is discarded and a repeated call restarts — keeping it
-  would fail identically forever. `LseError::IntegrityMismatch` reports which happened.
+  repeated call resumes rather than restarting. The exception is a partial file that this call
+  appended nothing to — it already looked complete, or the resume `Range` came back `416`: failing
+  verification then proves it belongs to a *different* job that used the same destination, so it is
+  discarded and a repeated call restarts — keeping it would fail identically forever.
+  `LseError::IntegrityMismatch` reports which happened. A resumed
+  transfer is checked at the seam: a `206` is accepted only when its `Content-Range` begins at the
+  requested byte (the job's `bytes`/`sha256` are both optional, so they cannot be relied on to catch
+  a mis-ranged response), and a `416` is read as "the partial file already holds the whole artifact"
+  rather than as a failure, so a run interrupted between the final write and the rename converges
+  instead of re-requesting an unsatisfiable range forever.
   **⚠️ The export allowance is five per hour and a *rejected* submit still consumes one**, so an
   export request validates everything checkable before anything is sent: unknown resolutions,
   candle resolutions against the provider's tick-only dataset classes, blank symbols, and inverted
@@ -102,7 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data available to third parties in any form. See <https://londonstrategicedge.com/terms>.
 
 - **London Strategic Edge historical candles** (`rustrade-data`, `lse` feature): an authenticated
-  vault REST client (`LseVaultClient`, `x-api-key`, or `from_env` on `LSE_API_KEY`) with a paged
+  vault REST client (`LseVaultClient`, `x-api-key`, or `from_env` on `LSE_API_KEY`, whose errors
+  name the variable and never its value, so a mis-encoded key cannot reach a log line) with a paged
   `fetch_candles` stream and a `collect_candles` convenience. Candles are keyed on the **display
   symbol** (`EUR/USD`, `AAPL`, `ES.F`), not a dataset slug. The provider serves 14 of
   `CandleInterval`'s variants — it publishes no `2h`/`6h`/`8h`/`12h`/`3d`, and spells one month
@@ -117,7 +124,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolution with a `200`); the reported timestamp is the bar's open, so `close_time` is derived
   through the shared boundary helper rather than passed through; and the 5,000-row cap is applied
   with no envelope, cursor or marker, so pagination continues to an empty page rather than treating
-  a short page as terminal. Zero-activity periods are **absent rather than gap-filled**, unlike
+  a short page as terminal. Each page is scanned in full rather than stopping at the first bar past
+  the upper bound — ascending rows are what the vault serves, not what it guarantees, and stopping
+  early would drop any in-range bar sitting behind an out-of-range one, ending the stream `Ok` on a
+  silently truncated series. Zero-activity periods are **absent rather than gap-filled**, unlike
   Binance's REST klines. FX candles report `volume: None` — the vault omits the field, and a
   synthetic zero would aggregate into a legitimate-looking total at every derived resolution;
   `trade_count` is `None` for every dataset, as the vault reports none.
@@ -418,7 +428,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   klines/REST and Hyperliquid carry real values (`Some`, including a venue-reported `Some(0)` on a
   gap-filled bar); Databento OHLCV has no trade-count field, now `trade_count: None` (was `0`); IBKR
   maps its `-1` "not available" sentinel on volume/count to `None` (was a clamped `0`); Massive now
-  passes its already-optional trade count through unchanged (was `unwrap_or(0)`). `aggregate_candles`
+  passes its already-optional trade count through unchanged (was `unwrap_or(0)`); the two London
+  Strategic Edge producers report `volume` only where the dataset carries it (the FX quote tape
+  reports neither field) and never synthesise a count. `aggregate_candles`
   propagates absence: any `None` constituent makes the aggregated bucket's `volume`/`trade_count`
   `None` (an unknown component makes the sum unknown, never a silent under-count). `Candle` also now
   derives `Eq` and `Hash` (all fields qualify), so it can be embedded in `Eq`/`Hash` engine state.
@@ -581,6 +593,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **A failing run in `run_backtests` leaked every cancelled sibling's task tree** (`rustrade`).
+  `run_backtests` short-circuits on the first `Err`, dropping the other runs' futures — and dropping
+  a `JoinHandle` *detaches* its task rather than cancelling it. The cancelled run's engine,
+  execution-manager, mock-exchange and account-forwarding tasks therefore survived the drop, and
+  could not finish on their own: the engine ends only on the explicit `Shutdown` that the graceful
+  shutdown sends, and the account-forwarding task only on the explicit abort it performs, both of
+  which the drop skips. What was left was a permanently parked task group per cancelled run, still
+  holding its `EngineState`, plus a market source that kept fetching — and, on a metered provider,
+  kept spending — for a result no caller could ever read. Each failing sweep in a long-lived process
+  added another set. `backtest` now holds an abort guard over its `System`'s task tree for the
+  duration of the run, so a cancelled run is torn down where it stands. Reachable only since the
+  market stream became fallible: with an in-memory source a run could not fail mid-stream, so the
+  short-circuit was unreachable.
 
 - **`cargo doc` failed for `rustrade-data`, so the crate would have published no documentation**
   (`rustrade-data`). The crate denies `rustdoc::private_intra_doc_links`, and two public items
