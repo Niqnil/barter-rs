@@ -26,8 +26,11 @@
 //! # What this demonstrates
 //!
 //! 1. **[`MarketDataStreamed`] over a provider factory.** The dataset is never resident: candles
-//!    are fetched, merged and consumed on demand, so memory is O(1) in the length of the range.
-//!    Compare `engine_backtest_with_candle_market_data.rs`, which holds everything in a `Vec`.
+//!    are fetched, merged and consumed on demand. Read-ahead is bounded here because each page is
+//!    awaited — a *blocking* source needs
+//!    [`stream_blocking_iter`](rustrade_data::streams::blocking::stream_blocking_iter) to get the
+//!    same property. Compare `engine_backtest_with_candle_market_data.rs`, which holds everything in
+//!    a `Vec`.
 //! 2. **Multi-instrument replay through one stream.** [`BacktestMarketData`] exposes exactly one
 //!    stream, so N per-symbol fetches are k-way merged into a single time-ordered feed with each
 //!    event tagged with its own `InstrumentIndex`. That merge lives in the factory — the engine

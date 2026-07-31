@@ -1,19 +1,26 @@
 //! Paged historical candles from the London Strategic Edge vault.
 //!
-//! ```ignore
-//! use rustrade_data::exchange::lse::vault::LseVaultClient;
-//! use rustrade_data::subscription::candle::CandleInterval;
-//! use chrono::{Duration, Utc};
-//! use futures::StreamExt;
-//!
+//! ```no_run
+//! # use chrono::{Duration, Utc};
+//! # use futures::StreamExt;
+//! # use rustrade_data::exchange::lse::error::LseError;
+//! # use rustrade_data::exchange::lse::vault::LseVaultClient;
+//! # use rustrade_data::subscription::candle::CandleInterval;
+//! # async fn example() -> Result<(), LseError> {
 //! let client = LseVaultClient::from_env()?;
 //! let end = Utc::now();
 //! let start = end - Duration::days(7);
 //!
-//! let mut stream = client.fetch_candles("EUR/USD", CandleInterval::Day1, start, end);
+//! let stream = client.fetch_candles("EUR/USD", CandleInterval::Day1, start, end);
+//! // The returned stream is a generator holding borrows across await points, so it is `!Unpin`
+//! // and has to be pinned before `StreamExt::next` will accept it.
+//! futures::pin_mut!(stream);
+//!
 //! while let Some(candle) = stream.next().await {
 //!     println!("{:?}", candle?);
 //! }
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # ⚠️ Licensing
@@ -137,10 +144,16 @@ impl LseVaultClient {
     /// (`open_time + interval`) via the shared boundary helper; the provider reports only the open
     /// instant.
     ///
-    /// # Zero-trade periods are absent, not gap-filled
-    /// The vault omits periods with no activity entirely, so consecutive candles are **not**
-    /// guaranteed to be one interval apart. This is the opposite of Binance's REST klines, which
-    /// server-side gap-fill. Consumers that need a dense grid must fill it themselves.
+    /// # Sparseness differs by resolution — and a closed market is not the same as no bar
+    /// **Intraday**: periods with no activity are omitted entirely, so consecutive candles are
+    /// **not** guaranteed to be one interval apart. This is the opposite of Binance's REST klines,
+    /// which server-side gap-fill. Consumers needing a dense grid must fill it themselves.
+    ///
+    /// **Daily**: the series is **not** sparse. Non-trading days are emitted as *flat* bars —
+    /// `open == high == low == close` — for every sampled Saturday and for the US Independence Day
+    /// observance; only Sundays are absent. So a backtest sees a tradeable price on a closed market,
+    /// and the flat OHLC is the only signal. Do not infer "no bar means the market was closed": see
+    /// the [module's data characteristics](super#data-characteristics).
     ///
     /// # Volume
     /// FX candles carry **no volume**: the vault omits the field, which surfaces as
@@ -209,11 +222,10 @@ impl LseVaultClient {
             let mut page = 0usize;
 
             loop {
-                // Proactive courtesy between pages only; never on the first request.
-                if page > 0 && !self.pace().is_zero() {
-                    tokio::time::sleep(self.pace()).await;
-                }
-
+                // No sleep here: pacing is applied inside `get_json`, against a gate shared by
+                // every clone of this client. Spacing pages from inside this loop would only ever
+                // pace *this* fetch, so N concurrent fetches would issue N requests per interval —
+                // see `LseVaultClient::with_pace`.
                 let query = [
                     ("symbol", symbol.to_owned()),
                     // ⚠️ `timeframe`, NOT `resolution`. An unknown parameter is ignored silently

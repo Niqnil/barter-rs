@@ -119,8 +119,17 @@ pub enum LseError {
     /// [`usage`](super::vault::LseVaultClient::usage). A *candle* fetch that runs into a limit
     /// still surfaces as [`RateLimited`](Self::RateLimited) — the provider gives no way to tell
     /// the two apart on that path.
-    #[error("quota exceeded: {status:?}")]
-    QuotaExceeded { status: QuotaStatus },
+    /// `status` is `None` when the follow-up [`usage`](super::vault::LseVaultClient::usage) call
+    /// itself failed. The allowance is still known to be exhausted — that is what the `429` said —
+    /// but this integration will not fabricate a [`QuotaStatus`] to fill the field. One variant
+    /// meaning "allowance gone, position unknown" is what lets a caller pace itself by matching a
+    /// single variant; reporting the second case as a generic
+    /// [`Api`](Self::Api)`{ status: 429 }` instead would make it silently miss half the cases.
+    #[error("quota exceeded{}", match .status {
+        Some(status) => format!(": {status:?}"),
+        None => " (allowance position could not be retrieved)".to_owned(),
+    })]
+    QuotaExceeded { status: Option<QuotaStatus> },
 
     /// An export job reached a terminal state without producing an artifact.
     ///
@@ -151,13 +160,12 @@ pub enum LseError {
     /// The destination is left untouched rather than holding a corrupt artifact.
     ///
     /// `discarded` reports what happened to the partial file at `path`:
-    /// - `false` — it is **retained**, because this call fetched it and the bytes are a real prefix
-    ///   the next call can resume from with a `Range` request.
-    /// - `true` — it was **removed**. This call appended no bytes to it: either it already looked
-    ///   complete from the job's byte count, or the resume `Range` came back `416`. Failing
-    ///   verification then proves it is a leftover from a different job that used the same
-    ///   destination, not a prefix of this one. Retaining it would fail identically forever, so a
-    ///   re-call restarts instead.
+    /// - `false` — it is **retained**, because it is *incomplete* rather than wrong: shorter than the
+    ///   artifact, so the bytes are a real prefix the next call resumes from with a `Range` request.
+    ///   For a multi-gigabyte artifact that is the difference between finishing and starting over.
+    /// - `true` — it was **removed**, because it is *corrupt*: longer than the artifact, or the right
+    ///   length at the wrong digest with nothing left to fetch. Retaining it would fail identically
+    ///   forever, so a re-call restarts instead.
     #[error("integrity check failed for {}: expected {expected}, got {actual} ({})", .path.display(), match .discarded {
         true => "unusable partial file discarded; re-call to restart",
         false => "partial file kept for resume",
@@ -167,6 +175,26 @@ pub enum LseError {
         expected: String,
         actual: String,
         discarded: bool,
+    },
+
+    /// A `ready` export job does not describe the request it is being downloaded for.
+    ///
+    /// The provider **silently substitutes defaults for parameters it does not recognise**, so a
+    /// request it partly ignored still yields a `ready` job — covering something other than what was
+    /// asked for. The job record echoes `dataset`, `symbol`, `timeframe`, `start` and `end`, and that
+    /// echo is the only client-side evidence of what the artifact actually contains. Downloading it
+    /// anyway would attribute one instrument's or one range's data to another, silently.
+    ///
+    /// Not recoverable by re-downloading: the artifact is what it is. The request has to be corrected
+    /// and re-exported, which costs one of the five hourly exports.
+    #[error(
+        "export job {job_id} does not describe this request: {field} is {reported:?}, requested {requested:?}"
+    )]
+    ExportJobMismatch {
+        job_id: String,
+        field: String,
+        requested: String,
+        reported: String,
     },
 
     /// A filesystem operation failed.
@@ -187,8 +215,47 @@ pub enum LseError {
     /// publishes `price`/`volume`, and the synthetic classes publish `price`/`volume`/`ask` — so
     /// the layout is resolved from the columns present. Reported rather than guessed at: a wrong
     /// column guess yields plausible numbers in the wrong field.
+    ///
+    /// Also raised for a schema that is not **flat**. Columns are read by leaf index, which equals a
+    /// top-level field's position only when every field is a primitive: one nested group contributes
+    /// several leaves and shifts every index after it. Every measured artifact is flat, so rather
+    /// than support a nesting the provider has never emitted, it is rejected — the alternative is a
+    /// decoder whose column mapping is silently wrong on a file it accepted, which for a `bid`/`ask`
+    /// pair means reading one as the other.
     #[error("unsupported export schema; columns were: {columns}")]
     UnsupportedSchema { columns: String },
+
+    /// A recognised export column does not have the type this integration decodes it as.
+    ///
+    /// Distinct from [`UnsupportedSchema`](Self::UnsupportedSchema), which reports columns whose
+    /// *names* match no known layout. Here the layout is recognised and one of its columns is the
+    /// wrong type, so naming the column and both types is the whole diagnostic — reported up front
+    /// rather than as an opaque decode failure on the first row.
+    ///
+    /// # Why a `ts` column that is not UTC-adjusted lands here
+    /// `Timestamp { unit: MICROS, is_adjusted_to_utc: false }` is *physically identical* to the
+    /// UTC-adjusted form — same `INT64`, same legacy `TIMESTAMP_MICROS` converted type — and differs
+    /// only in the origin its values are measured against. Read as epoch microseconds, a local-time
+    /// column shifts every event by the venue's UTC offset with nothing downstream able to notice:
+    /// the timeline is still monotonic and the prices are still right, so a backtest simply trades
+    /// on data it could not have had. This check is the only place that difference is visible.
+    #[error("export column {column:?} is {found}, but this integration requires {required}")]
+    UnsupportedColumnType {
+        column: String,
+        required: &'static str,
+        found: String,
+    },
+
+    /// A column the resolved layout has no substitute for is null on some row.
+    ///
+    /// `ts`, `symbol` and the layout's price columns are `REQUIRED` on every measured artifact, but a
+    /// writer change would make them nullable without altering anything else the decoder keys on, so
+    /// the schema check accepts `OPTIONAL` and this reports a value that is actually missing. None of
+    /// them is substitutable: a null timestamp has no place on a timeline, a null symbol cannot be
+    /// checked against the descriptor — the check that catches a mis-described file — and a null
+    /// price would have to be invented.
+    #[error("export column {column:?} is null on a row that has no substitute for it")]
+    NullValue { column: &'static str },
 
     /// A row's `symbol` column does not match the symbol the export descriptor names.
     ///

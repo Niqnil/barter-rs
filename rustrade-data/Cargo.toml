@@ -38,7 +38,7 @@ lse = ["dep:sha2", "dep:hex", "reqwest/stream", "tokio/fs", "tokio/io-util"]
 # only wants files on disk pays no Parquet dependency cost.
 #
 # ⚠️ `parquet` MUST stay `default-features = false`: its defaults pull the whole `arrow` stack.
-# The row/record API this uses needs none of it. Tier-2 reviewed — see
+# The column-reader API this uses needs none of it. Tier-2 reviewed — see
 # `.github/tier2-dependencies.txt`.
 lse-parquet = ["lse", "dep:parquet"]
 massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
@@ -81,7 +81,17 @@ hex = { workspace = true, optional = true }
 
 # Decodes London Strategic Edge bulk-export artifacts. `default-features = false` is load-bearing:
 # it keeps the entire `arrow` stack out of the tree, leaving only zstd (already present) and three
-# net-new crates. The exports are flat primitives in one row group, so the row/record API suffices.
+# net-new crates.
+#
+# Measured artifact profile (the provider writes with ClickHouse 26.6.1): one row group, a flat
+# schema of primitives, PLAIN and RLE_DICTIONARY encodings, ZSTD compression, row-group statistics.
+# `zstd` is therefore the only codec feature enabled.
+#
+# ⚠️ If the provider ever switches its writer's codec, decoding fails with `LseError::Parquet`
+# carrying parquet's own "Disabled feature at compile time: <codec>" — observable and self-naming,
+# which is why the other codecs are not enabled pre-emptively. Adding e.g. `snap` here is a
+# one-line fix if that day comes; carrying the dependency for a switch that has not happened is
+# supply-chain surface a public library should not spend up front.
 parquet = { version = "59.1.0", default-features = false, features = ["zstd"], optional = true }
 
 # Protocol

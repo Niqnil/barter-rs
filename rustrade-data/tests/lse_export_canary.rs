@@ -41,7 +41,10 @@
 //!
 //! # Skip vs. fail contract
 //!
-//! - `LSE_API_KEY` unset → **SKIP** (logged, test passes), so CI without secrets stays green.
+//! - `LSE_API_KEY` **unset** → **SKIP** (logged, test passes), so CI without secrets stays green.
+//! - `LSE_API_KEY` set but unusable → **FAIL**. A skip here would be indistinguishable from "no
+//!   secrets configured", so a mistyped key would report green forever — and this canary would
+//!   never once reach the provider it exists to check.
 //! - Key present but the assertion fails → **FAIL** (the real signal).
 //!
 //! # Running
@@ -56,7 +59,7 @@
 #![cfg(feature = "lse-parquet")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Datelike, Duration as ChronoDuration, Utc, Weekday};
 use rustrade_data::event::DataKind;
 use rustrade_data::exchange::lse::export::{
     LseExportRange, LseExportRequest, LseExportStatus, LseExportTimeframe,
@@ -77,22 +80,41 @@ const SYMBOL: &str = "EUR/USD";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const POLL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Build a client, or `None` when the key is absent (skip rather than fail).
+/// Build a client, or `None` when the key is **absent** (skip rather than fail).
+///
+/// Only an unset variable skips. A key that is *set but unusable* — a stray newline from a `.env`
+/// edit, a mis-encoded paste — is a misconfiguration, and reporting it as a skip would let this
+/// canary pass green while never once reaching the provider. The error is safe to print:
+/// [`LseError`] redacts the key from every message.
+///
+/// [`LseError`]: rustrade_data::exchange::lse::error::LseError
 fn client() -> Option<LseVaultClient> {
-    match LseVaultClient::from_env() {
-        Ok(client) => Some(client),
-        Err(error) => {
-            println!("CANARY_SKIP: no usable {KEY_ENV} ({error}) - skipping");
-            None
-        }
+    if std::env::var_os(KEY_ENV).is_none() {
+        println!("CANARY_SKIP: {KEY_ENV} is not set - skipping");
+        return None;
     }
+
+    Some(
+        LseVaultClient::from_env()
+            .unwrap_or_else(|error| panic!("{KEY_ENV} is set but unusable: {error}")),
+    )
 }
 
-/// A single recent day, well clear of today so the range is settled.
+/// A single recent **weekday**, well clear of today so the range is settled.
 ///
 /// `end` is **exclusive**, so this is exactly one day of tape.
-fn one_settled_day() -> LseExportRange {
-    let start = (Utc::now() - ChronoDuration::days(4)).date_naive();
+///
+/// The weekday walk-back is not cosmetic. Spot FX trades Sunday 22:00 UTC to Friday 22:00 UTC, so a
+/// Saturday — which is what "four days ago" is on any Wednesday run — has no tape at all. The
+/// provider reports that as a *successful* zero-row export, so the `rows > 0` assertion below would
+/// fail on two days in seven, after spending one of the five hourly exports on nothing. Walking
+/// back costs at most two extra days of settling time and nothing else.
+fn one_settled_weekday() -> LseExportRange {
+    let mut start = (Utc::now() - ChronoDuration::days(4)).date_naive();
+    while matches!(start.weekday(), Weekday::Sat | Weekday::Sun) {
+        start -= ChronoDuration::days(1);
+    }
+
     LseExportRange::new(start, start + ChronoDuration::days(1)).expect("a one-day range")
 }
 
@@ -105,7 +127,7 @@ async fn an_fx_tick_export_round_trips_and_decodes_to_two_sided_quotes() {
         LseDataset::Fx,
         SYMBOL,
         LseExportTimeframe::Tick,
-        one_settled_day(),
+        one_settled_weekday(),
     )
     .expect("a valid export request");
 

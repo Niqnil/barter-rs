@@ -74,10 +74,26 @@ pub type BinanceWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, T
 /// sub-minute kline is `1s`, and it serves no `5s`/`15s`/`30s` stream (nor the
 /// matching REST `interval`, which 400s).
 ///
-/// This is the pre-flight gate — [`BinanceChannel::spot_candle`](channel::BinanceChannel::spot_candle)
-/// and [`futures_candle`](channel::BinanceChannel::futures_candle) are infallible by
-/// the [`Identifier`](crate::Identifier) contract, so without checking here an
-/// unsupported interval is only rejected once Binance answers the SUBSCRIBE.
+/// # Where this is applied
+///
+/// Only the **dynamic** builder gates on this:
+/// [`exchange_supports_instrument_kind_sub_kind`](crate::subscription::exchange_supports_instrument_kind_sub_kind)
+/// consults it for [`SubKind::Candles`](crate::subscription::SubKind::Candles), so an unsupported
+/// interval is rejected before a socket is opened.
+///
+/// The **typed** builder does not. Its validation goes through
+/// [`exchange_supports_instrument_kind`](crate::subscription::exchange_supports_instrument_kind),
+/// which never inspects the resolution, and
+/// [`BinanceChannel::spot_candle`](channel::BinanceChannel::spot_candle) /
+/// [`futures_candle`](channel::BinanceChannel::futures_candle) are infallible by the
+/// [`Identifier`](crate::Identifier) contract — so a typed `5s` subscription builds a well-formed
+/// `@kline_5s` channel name for a stream Binance does not publish, and is rejected only once
+/// Binance answers the SUBSCRIBE (surfaced by
+/// [`BinanceSubResponse`]'s
+/// [`Validator`](rustrade_integration::Validator)).
+///
+/// The failure is observable either way; call this yourself before a typed subscription if you
+/// want it before the socket rather than after.
 #[must_use]
 pub fn supports_candle_interval(interval: CandleInterval) -> bool {
     match interval {

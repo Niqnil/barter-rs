@@ -106,15 +106,20 @@ impl IndexedInstrumentsBuilder {
         // input, already collapsed to one -- do not trip it.
         let mut names = HashMap::with_capacity(self.instruments.len());
         for instrument in &self.instruments {
-            if let Some(previous) =
-                names.insert(&instrument.name_internal, &instrument.name_exchange)
-            {
+            if let Some(previous) = names.insert(&instrument.name_internal, instrument) {
+                // The whole `Instrument` is retained, not just its `name_exchange`, because the two
+                // colliding instruments frequently share that name: a spot and a CFD on one symbol
+                // is the collision this check most plausibly catches, and reporting it as
+                // "AAPL and AAPL" asserts they are distinct while printing nothing that
+                // distinguishes them. `kind` is what does.
                 return Err(IndexError::DuplicateInstrumentNameInternal(format!(
-                    "{} is shared by the distinct instruments {} and {} on {} - \
+                    "{} is shared by the distinct instruments {} ({:?}) and {} ({:?}) on {} - \
                      every Instrument requires a unique name_internal",
                     instrument.name_internal,
-                    previous,
+                    previous.name_exchange,
+                    previous.kind,
                     instrument.name_exchange,
+                    instrument.kind,
                     // `as_str`, not `Display`: the canonical snake_case spelling users write in
                     // configs, rather than the bare variant name.
                     instrument.exchange.as_str(),
@@ -183,7 +188,7 @@ mod tests {
     use crate::{
         Underlying,
         instrument::{
-            kind::InstrumentKind,
+            kind::{InstrumentKind, cfd::CfdContract},
             name::{InstrumentNameExchange, InstrumentNameInternal},
             quote::InstrumentQuoteAsset,
             spec::{
@@ -192,6 +197,7 @@ mod tests {
         },
         test_utils::{exchange_asset, instrument},
     };
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     #[test]
@@ -289,6 +295,49 @@ mod tests {
         assert!(message.contains("BTCUSDT"), "{message}");
         assert!(message.contains("BTC-USDT"), "{message}");
         assert!(message.contains("binance_spot"), "{message}");
+    }
+
+    #[test]
+    fn test_duplicate_name_internal_message_distinguishes_instruments_sharing_a_name_exchange() {
+        // The collision this guard most plausibly catches: a spot and a CFD on one symbol, which is
+        // the reason `Cfd` is a distinct kind at all. Both carry the same `name_exchange`, so a
+        // message built from names alone reads "AAPL and AAPL on ibkr" -- asserting the two are
+        // distinct while printing nothing that says how.
+        let shared_name = "ibkr-aapl";
+
+        let build = |kind| {
+            Instrument::new(
+                ExchangeId::Ibkr,
+                shared_name,
+                "AAPL",
+                Underlying::new(
+                    Asset::new_from_exchange("aapl"),
+                    Asset::new_from_exchange("usd"),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                kind,
+                None,
+            )
+        };
+
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(build(InstrumentKind::Spot))
+            .add_instrument(build(InstrumentKind::Cfd(CfdContract {
+                contract_size: Decimal::ONE,
+                settlement_asset: Asset::new_from_exchange("usd"),
+            })))
+            .try_build()
+            .expect_err("duplicate name_internal must be rejected");
+
+        let IndexError::DuplicateInstrumentNameInternal(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+
+        assert!(message.contains(shared_name), "{message}");
+        // `kind` is the only field that differs, so it is the only thing that makes the message
+        // actionable.
+        assert!(message.contains("Spot"), "{message}");
+        assert!(message.contains("Cfd"), "{message}");
     }
 
     #[test]

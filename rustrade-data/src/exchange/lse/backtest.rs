@@ -81,12 +81,20 @@ impl LseCandleSource {
 /// breach [`merge_time_sorted`]'s caller obligation and put a non-monotonic clock in front of a
 /// backtest — silently, because a merge cannot recover ordering its inputs do not have.
 ///
-/// # Cost
-/// One paged fetch per source, all in flight concurrently as the merge polls them. Against the
-/// provider's shared allowance (`calls_per_minute`, `vault_concurrency`, both reported by
-/// [`usage`](LseVaultClient::usage)) an N-instrument replay costs N concurrent paged fetches — and
-/// re-running it re-fetches everything. For repeated runs over the same range, fetch once to local
-/// storage and replay from that.
+/// # Cost, and how the provider's allowance is respected
+/// One paged fetch per source. The merge polls every source on every `poll_next` and cannot emit
+/// until all have buffered, so N fetches making progress at once is guaranteed rather than
+/// incidental — and re-running the replay re-fetches everything. For repeated runs over the same
+/// range, fetch once to local storage and replay from that.
+///
+/// The provider's allowance (`calls_per_minute`, `vault_concurrency`, both reported by
+/// [`usage`](LseVaultClient::usage)) is **not** multiplied by N here: every fetch shares `client`,
+/// and therefore its
+/// [request gate](LseVaultClient#request-rationing-is-per-client-not-per-call) — requests in flight
+/// stay under [`with_concurrency`](LseVaultClient::with_concurrency) and their starts stay
+/// [`with_pace`](LseVaultClient::with_pace) apart no matter how many sources are passed. A large N
+/// therefore makes the replay *slower*, not louder. Pass a client built by `new`, not one per
+/// source: two independently-built clients ration independently.
 ///
 /// # Errors
 /// A failed fetch on any source is forwarded immediately, ahead of buffered events from the others:
@@ -149,6 +157,7 @@ fn owned_candles(
 mod tests {
     use super::*;
     use crate::event::MarketEvent;
+    use std::time::Duration;
 
     /// `(instrument index, time_exchange)` of each replayed candle.
     fn observed(
@@ -218,7 +227,10 @@ mod tests {
         let client = Arc::new(
             LseVaultClient::new("key")
                 .unwrap()
-                .with_base_url(format!("{}/vault", server.uri())),
+                .with_base_url(format!("{}/vault", server.uri()))
+                // Pacing is exercised in `vault`'s own tests; disabling it here keeps this suite
+                // from sleeping the default interval between every page of every source.
+                .with_pace(Duration::ZERO),
         );
 
         let events = replay_candles(
@@ -278,7 +290,10 @@ mod tests {
         let client = Arc::new(
             LseVaultClient::new("key")
                 .unwrap()
-                .with_base_url(format!("{}/vault", server.uri())),
+                .with_base_url(format!("{}/vault", server.uri()))
+                // Pacing is exercised in `vault`'s own tests; disabling it here keeps this suite
+                // from sleeping the default interval between every page of every source.
+                .with_pace(Duration::ZERO),
         );
 
         let events = replay_candles(

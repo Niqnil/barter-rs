@@ -33,8 +33,12 @@
 //! - `close_time` is the **exclusive period-end** boundary (`open + interval`), computed
 //!   library-side; the vault reports only the bar's open instant.
 //! - Candles are keyed on the **display symbol** (`EUR/USD`, `AAPL`, `BP.L`, `ES.F`), not a slug.
-//! - Periods with no activity are **absent, not gap-filled**, so consecutive candles are not
-//!   guaranteed to be one interval apart.
+//! - **Sparseness differs by resolution.** *Intraday*, periods with no activity are absent rather
+//!   than gap-filled, so consecutive candles are not guaranteed to be one interval apart. *Daily*
+//!   is not sparse: non-trading days arrive as **flat** bars (`open == high == low == close`) for
+//!   sampled Saturdays and the US Independence Day observance, with only Sundays absent — so a
+//!   backtest sees a tradeable price on a closed market, and the flat OHLC is the only signal.
+//!   Do not infer "no bar means the market was closed".
 //! - **London (`.L`) listings are quoted in pence**, not pounds — `BP.L` prints ~548 where BP
 //!   trades around £5.48. This integration quotes them in GBX, an asset distinct from GBP, and
 //!   passes prices through unscaled.

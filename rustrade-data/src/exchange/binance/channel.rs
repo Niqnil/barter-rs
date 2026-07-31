@@ -66,7 +66,8 @@ impl BinanceChannel {
             // `@kline_<interval>` convention (keeping the drift-guard invariant total)
             // but name streams Binance does not publish, so a SUBSCRIBE using one is
             // rejected by the exchange and surfaced by `BinanceSubResponse::validate`.
-            // `supports_candle_interval` is the pre-flight gate.
+            // `supports_candle_interval` reports which those are, but only the dynamic builder
+            // consults it — see that function's docs for which path gates and which does not.
             CandleInterval::Sec5 => Self("@kline_5s"),
             CandleInterval::Sec15 => Self("@kline_15s"),
             CandleInterval::Sec30 => Self("@kline_30s"),

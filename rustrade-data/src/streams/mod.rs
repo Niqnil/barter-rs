@@ -5,6 +5,10 @@ use futures::Stream;
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::channel::UnboundedRx;
 
+/// Bridges a blocking source — a Parquet artifact, a compressed archive — into a bounded,
+/// back-pressured `Stream`, off the async runtime's workers.
+pub mod blocking;
+
 /// Defines the [`StreamBuilder`] and [`MultiStreamBuilder`] APIs for ergonomically initialising
 /// [`MarketStream`](super::MarketStream) [`Streams`].
 pub mod builder;

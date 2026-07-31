@@ -246,8 +246,8 @@ async fn test_historical_daily_bars() {
         first.close
     );
     assert!(
-        first.volume.is_none_or(|v| !v.is_sign_negative()),
-        "Volume {:?} should be non-negative when present",
+        first.volume.is_some_and(|v| !v.is_sign_negative()),
+        "Volume {:?} is absent or negative; a Trades bar always reports one",
         first.volume
     );
 }

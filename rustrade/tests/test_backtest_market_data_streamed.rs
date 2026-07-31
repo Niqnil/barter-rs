@@ -139,22 +139,60 @@ fn factory(
 /// Stands in for a source that is genuinely mid-fetch — a paginated provider call between pages —
 /// which is the only state in which cancelling a run is observable at all. `futures::stream::iter`
 /// is ready on every poll, so a run backed by it can finish before a sibling has even failed.
+/// `mid_stream` fires once this stream has yielded `signal_after` items, which is what lets a
+/// sibling fail at a point where this run is provably mid-read rather than not yet started.
 fn paced_factory(
     script: Script,
     pace: std::time::Duration,
     yielded: Arc<AtomicUsize>,
+    mid_stream: Arc<tokio::sync::Notify>,
+    signal_after: usize,
 ) -> impl Fn() -> std::future::Ready<Result<futures::stream::BoxStream<'static, ScriptItem>, BarterError>>
 {
     move || {
         let yielded = Arc::clone(&yielded);
+        let mid_stream = Arc::clone(&mid_stream);
+        // Per-stream, not shared: the factory is called once at construction (which reads a single
+        // item and stops) and again per run, and only a run's own progress means "mid-read".
+        let this_stream = Arc::new(AtomicUsize::new(0));
+
         let stream = futures::StreamExt::then(futures::stream::iter(script.clone()), move |item| {
             let yielded = Arc::clone(&yielded);
+            let mid_stream = Arc::clone(&mid_stream);
+            let this_stream = Arc::clone(&this_stream);
             async move {
                 tokio::time::sleep(pace).await;
                 yielded.fetch_add(1, Ordering::SeqCst);
+                if this_stream.fetch_add(1, Ordering::SeqCst) + 1 == signal_after {
+                    mid_stream.notify_one();
+                }
                 item
             }
         });
+
+        std::future::ready(Ok(futures::StreamExt::boxed(stream)))
+    }
+}
+
+/// A factory whose stream replays `script` and then blocks on `mid_stream` before failing.
+///
+/// The handshake is what makes "cancelled mid-stream" a fact rather than a race: without it this
+/// source fails within a poll or two, long before a paced sibling has read anything, and the run
+/// under test is cancelled before it ever started.
+fn gated_failure_factory(
+    script: Script,
+    mid_stream: Arc<tokio::sync::Notify>,
+) -> impl Fn() -> std::future::Ready<Result<futures::stream::BoxStream<'static, ScriptItem>, BarterError>>
+{
+    move || {
+        let mid_stream = Arc::clone(&mid_stream);
+        let stream = futures::StreamExt::chain(
+            futures::stream::iter(script.clone()),
+            futures::stream::once(async move {
+                mid_stream.notified().await;
+                Err(source_failure())
+            }),
+        );
 
         std::future::ready(Ok(futures::StreamExt::boxed(stream)))
     }
@@ -316,14 +354,17 @@ async fn mid_stream_source_failure_aborts_a_run_backtests_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_cancelled_by_a_failing_sibling_does_not_leak_its_tasks() {
     const VICTIM_EVENTS: usize = 200;
+    /// How far into its source the victim must be before the trigger is allowed to fail.
+    ///
+    /// Small next to `VICTIM_EVENTS`, so the run is unambiguously *mid*-stream in both directions:
+    /// it has provably started, and 195 events remain for the cancellation to cut short.
+    const VICTIM_READS_BEFORE_FAILURE: usize = 5;
 
-    // Fails on its second item, near-instantly: nothing paces this one.
-    let trigger = MarketDataStreamed::<_, DataKind>::new(factory(
-        vec![
-            candle("2025-03-24T22:00:00Z", dec!(60_000)),
-            Err(source_failure()),
-        ],
-        Arc::new(AtomicUsize::new(0)),
+    // Fails only once the victim signals it is mid-read; see `gated_failure_factory`.
+    let mid_stream = Arc::new(tokio::sync::Notify::new());
+    let trigger = MarketDataStreamed::<_, DataKind>::new(gated_failure_factory(
+        vec![candle("2025-03-24T22:00:00Z", dec!(60_000))],
+        Arc::clone(&mid_stream),
     ))
     .await
     .unwrap();
@@ -342,6 +383,8 @@ async fn a_run_cancelled_by_a_failing_sibling_does_not_leak_its_tasks() {
             .collect(),
         std::time::Duration::from_millis(20),
         Arc::clone(&yielded),
+        Arc::clone(&mid_stream),
+        VICTIM_READS_BEFORE_FAILURE,
     ))
     .await
     .unwrap();
@@ -386,6 +429,15 @@ async fn a_run_cancelled_by_a_failing_sibling_does_not_leak_its_tasks() {
     assert!(
         consumed < VICTIM_EVENTS,
         "the cancelled run consumed its whole source ({consumed} of {VICTIM_EVENTS} events)"
+    );
+    // Both bounds, because `consumed < VICTIM_EVENTS` alone is also satisfied by `consumed == 0` --
+    // a victim whose stream never started at all, which would make this test pass while proving
+    // nothing about cancellation *mid-stream*, the only interesting case. The handshake guarantees
+    // the lower bound rather than leaving it to scheduling.
+    assert!(
+        consumed >= VICTIM_READS_BEFORE_FAILURE,
+        "the cancelled run had read {consumed} events, fewer than the {VICTIM_READS_BEFORE_FAILURE} \
+         it signalled at, so this proves nothing about mid-stream cancellation"
     );
 }
 

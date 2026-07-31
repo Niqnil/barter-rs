@@ -26,10 +26,32 @@ impl std::fmt::Display for ExchangeIndex {
 ///
 /// For example, BinanceSpot and BinanceFuturesUsd have distinct APIs, and are therefore
 /// represented as unique variants.
+///
+/// # Index stability
+/// **New variants must be appended at the end of the enum, never inserted mid-list.**
+///
+/// `ExchangeId` derives [`Ord`] from declaration order, and
+/// [`IndexedInstrumentsBuilder::build`](crate::index::builder::IndexedInstrumentsBuilder::build)
+/// sorts exchanges and instruments by it — [`Instrument`](crate::instrument::Instrument)'s own
+/// `Ord` leads with `exchange`. Inserting a variant mid-enum therefore renumbers
+/// [`ExchangeIndex`] and [`InstrumentIndex`](crate::instrument::InstrumentIndex) for every
+/// existing configuration containing an exchange that sorts after the insertion point.
+///
+/// Those indices are serialized into engine state, the audit replica and backtest replay streams,
+/// and are read **positionally**. A renumbering therefore does not fail — it attaches one
+/// instrument's positions, PnL and orders to another. Appending renumbers nothing.
 #[derive(
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
 )]
 #[serde(rename = "execution", rename_all = "snake_case")]
+// `Display` delegates to `as_str`, and must keep doing so. Without this attribute `derive_more`
+// renders the bare variant name -- `format!("{}", BinanceSpot)` is `"BinanceSpot"` while
+// `as_str()`, `serde` and every configuration file say `"binance_spot"`. Two spellings for one
+// identity is a defect rather than a formatting preference: it is what made
+// `InstrumentNameInternal::new_from_exchange_underlying` mint `binancespot-btc_usdt` for an
+// instrument that resolves as `binance_spot-btc_usdt` everywhere else, and it leaks into
+// user-facing diagnostics that name an exchange matching nothing the user wrote.
+#[display("{}", self.as_str())]
 pub enum ExchangeId {
     Other,
     Simulated,
@@ -101,16 +123,6 @@ pub enum ExchangeId {
     Mexc,
     Okx,
     Poloniex,
-    // ---------------------------------------------------------------------------------------
-    // NOTE: append new variants HERE, at the end.
-    //
-    // `ExchangeId` derives `Ord` from declaration order, and `IndexedInstrumentsBuilder::build`
-    // sorts exchanges and instruments by it -- `Instrument`'s own `Ord` leads with `exchange`.
-    // Inserting a variant mid-enum therefore renumbers `ExchangeIndex` and `InstrumentIndex` for
-    // every existing configuration containing an exchange that sorts after the insertion point,
-    // and those indices are serialized into engine state, the audit replica and backtest replay
-    // streams. Appending renumbers nothing.
-    // ---------------------------------------------------------------------------------------
     /// London Strategic Edge FX (spot currency pairs)
     LseFx,
     /// London Strategic Edge crypto (aggregated spot tape; no venue, funding or liquidations)
@@ -121,6 +133,9 @@ pub enum ExchangeId {
     LseFutures,
     /// London Strategic Edge CFDs (index, commodity, interest rates, currency index, volatility)
     LseCfd,
+    // ---------------------------------------------------------------------------------------
+    // NOTE: append new variants HERE, at the end. See `# Index stability` on this enum.
+    // ---------------------------------------------------------------------------------------
 }
 
 impl ExchangeId {
@@ -239,16 +254,25 @@ mod tests {
         // `ExchangeIndex`/`InstrumentIndex` assignment in `IndexedInstrumentsBuilder::build`.
         // Appending renumbers nothing for existing configurations; inserting mid-enum silently
         // renumbers indices that are serialized into engine state and replay streams.
-        for exchange in [
+        //
+        // Asserted as a full chain rather than "each is > Poloniex": the weaker form passes even
+        // if a later variant is inserted *between* two of these, or if the block as a whole stops
+        // being last. Pinning the exact tail is what makes the "append HERE" note enforceable.
+        let tail = [
+            ExchangeId::Poloniex,
             ExchangeId::LseFx,
             ExchangeId::LseCrypto,
             ExchangeId::LseEquities,
             ExchangeId::LseFutures,
             ExchangeId::LseCfd,
-        ] {
+        ];
+
+        for pair in tail.windows(2) {
             assert!(
-                exchange > ExchangeId::Poloniex,
-                "{exchange:?} must sort after every pre-existing variant"
+                pair[0] < pair[1],
+                "{:?} must sort immediately before {:?}",
+                pair[0],
+                pair[1]
             );
         }
     }

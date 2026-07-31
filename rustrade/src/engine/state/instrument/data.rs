@@ -79,43 +79,79 @@ pub struct DefaultInstrumentMarketData {
     pub last_traded_price: Option<Timed<Decimal>>,
     /// Most recent [`Candle`], ordered on its
     /// [`close_time`](rustrade_data::subscription::candle::Candle::close_time).
+    ///
+    /// Only candles that have actually closed by the event's own `time_exchange` are retained; a
+    /// candle closing after it is dropped as lookahead (see the [`Processor`] impl).
     pub candle: Option<Candle>,
 }
 
 impl InstrumentDataState for DefaultInstrumentMarketData {
     type MarketEventKind = DataKind;
 
-    /// Latest price, resolved by an explicit precedence rule.
+    /// Latest price: the **most recent** of the three inputs this state holds, with a fixed source
+    /// order breaking an exact tie.
     ///
-    /// 1. The [`OrderBookL1`] volume-weighted mid-price, whenever one is available. L1 is the
-    ///    finest-grained view of the current market this state holds, and it wins
-    ///    **unconditionally** — not by recency. This preserves the behaviour that predates candle
-    ///    support.
-    /// 2. Otherwise the **more recent** of the last [`Candle`] (by `close_time`) and the last
-    ///    traded price (by its [`Timed::time`]). A trade wins an exact tie: `close_time` is the
-    ///    *exclusive* period end, so a trade stamped at that instant belongs to the next period and
-    ///    is therefore the fresher observation.
-    /// 3. `None` if the instrument has received no price input at all.
+    /// Each candidate is stamped with the instant it describes — the L1 book's `last_update_time`,
+    /// a candle's `close_time`, a trade's [`Timed::time`] — and the newest wins. `None` if the
+    /// instrument has received no price input at all.
     ///
-    /// Recency — rather than a fixed "candle beats trade" — is what stops a coarse bar from
-    /// shadowing fresher data on a mixed feed: a `1d` candle stamped this morning would otherwise
-    /// silently outrank every trade tick received since. On a feed carrying candles *or* trades for
-    /// a given instrument (the common case) the rule is inert.
+    /// # Why recency, for all three
+    /// A stale input must never outrank a fresh one. On a mixed feed — which one provider alone can
+    /// produce, e.g. a session of quote ticks followed by a year of daily bars — a fixed precedence
+    /// means whichever kind sits at the top wins forever: an L1 book that stopped updating a year
+    /// ago would mark every position after it, `pnl_unrealised` would stop moving, and the tear
+    /// sheet would look entirely normal. Ties go to the finer-grained source — L1 book, then trade,
+    /// then candle — so a feed carrying only one kind behaves exactly as it did before the other two
+    /// were considered, and on the common single-kind feed the comparison is inert.
+    ///
+    /// # The L1 contribution
+    /// The volume-weighted mid-price where the book publishes sizes, else the plain mid.
+    /// A **one-sided** book contributes nothing: half a book has no mid, and
+    /// marking a position at whichever side happens to be quoted is a judgement this state does not
+    /// make on the caller's behalf.
     fn price(&self) -> Option<Decimal> {
-        if let Some(l1_price) = self.l1.volume_weighed_mid_price() {
-            return Some(l1_price);
-        }
+        [
+            self.l1_price()
+                .map(|price| (self.l1.last_update_time, PriceSource::L1, price)),
+            self.last_traded_price
+                .map(|trade| (trade.time, PriceSource::Trade, trade.value)),
+            self.candle
+                .map(|candle| (candle.close_time, PriceSource::Candle, candle.close)),
+        ]
+        .into_iter()
+        .flatten()
+        // No two candidates share a key, since each carries a distinct `PriceSource`, so the
+        // winner does not depend on iteration order.
+        .max_by_key(|(time, source, _)| (*time, *source))
+        .map(|(_, _, price)| price)
+    }
+}
 
-        match (&self.candle, &self.last_traded_price) {
-            (Some(candle), Some(trade)) => Some(if candle.close_time > trade.time {
-                candle.close
-            } else {
-                trade.value
-            }),
-            (Some(candle), None) => Some(candle.close),
-            (None, Some(trade)) => Some(trade.value),
-            (None, None) => None,
-        }
+/// Tie-break order for [`DefaultInstrumentMarketData::price`], coarsest first.
+///
+/// Only consulted when two inputs describe the **same instant**; recency decides otherwise. The
+/// order is by granularity: an L1 book is the finest view of the current market, and a trade beats a
+/// candle because `close_time` is the *exclusive* period end — a trade stamped at that instant
+/// belongs to the next period and is therefore the fresher observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PriceSource {
+    Candle,
+    Trade,
+    L1,
+}
+
+impl DefaultInstrumentMarketData {
+    /// The [`OrderBookL1`]'s price contribution, or `None` if it has none to make.
+    ///
+    /// The volume-weighted mid-price, falling back to the plain mid when **both** best levels carry
+    /// a zero amount. That is not a degenerate book: a feed publishing prices without sizes — a
+    /// bulk export, an FX quote tape — produces it on every row, and the weighting is undefined
+    /// there while the mid is perfectly well defined. Without the fallback such a feed would mark no
+    /// position at all.
+    fn l1_price(&self) -> Option<Decimal> {
+        self.l1
+            .volume_weighed_mid_price()
+            .or_else(|| self.l1.mid_price())
     }
 }
 
@@ -125,6 +161,11 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
     type Audit = ();
 
     /// Apply a market event, ignoring any that is older than what is already held.
+    ///
+    /// A candle whose `close_time` is **ahead of its own `time_exchange`** is dropped with a
+    /// warning rather than applied: it would mark positions with the outcome of a period the
+    /// engine's clock says is still open. See the `DataKind::Candle` arm for why that input is
+    /// reachable at all.
     ///
     /// The match is **exhaustive on purpose**: a catch-all is how `DataKind::Candle` went unhandled
     /// here for as long as it did — silently, with no compile error to prompt the edit. Each
@@ -142,8 +183,12 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
                         .replace(Timed::new(trade.price, event.time_exchange));
                 }
             }
+            // Ordered on the payload's `last_update_time`, not `event.time_exchange`, for the same
+            // reason as the candle below: `price()`'s recency comparison reads that field, so
+            // keying the guard on anything else would let the two disagree. Every in-tree producer
+            // stamps it from the venue's own book instant.
             DataKind::OrderBookL1(l1) => {
-                if self.l1.last_update_time < event.time_exchange {
+                if self.l1.last_update_time < l1.last_update_time {
                     self.l1 = l1.clone()
                 }
             }
@@ -151,8 +196,34 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
             // `price()`'s precedence rule key on the same instant. A well-formed producer sets
             // `time_exchange` to `close_time` anyway (see `Candle`'s docs); keying on the payload
             // means a producer that does not cannot desynchronise the two.
+            //
+            // But that same freedom is a lookahead hole, and the reason for the first guard below.
+            // The merge and the engine clock key on `time_exchange`, while everything here keys on
+            // `close_time`, so a producer stamping `time_exchange` with the bar's OPEN — an easy
+            // and plausible mistake, since that is the timestamp most venues put in the bar record
+            // — hands the engine a close price for a period that, by the engine's own clock, has
+            // not finished. A strategy would then trade the whole bar on its own outcome. Unlike
+            // the L1 arm above, this is not physically impossible input: `close_time` is a computed
+            // boundary, not an observed instant, so nothing about the wire format prevents it.
+            //
+            // Dropped rather than clamped or accepted: there is no correct price to salvage, and a
+            // clamp would silently paper over a mis-stamped feed. `process` has no error channel
+            // (`Audit = ()`), so the warning is what makes it observable.
             DataKind::Candle(candle) => {
-                if self
+                if candle.close_time > event.time_exchange {
+                    // No instrument field: `InstrumentKey` is unbounded here, and narrowing this
+                    // impl to `Debug` keys to name it in a log would be a breaking change for a
+                    // downstream key type. The exchange and the two instants identify the
+                    // mis-stamped producer, which is what the reader needs to act on.
+                    tracing::warn!(
+                        exchange = %event.exchange,
+                        close_time = %candle.close_time,
+                        time_exchange = %event.time_exchange,
+                        "dropping candle closing after its own time_exchange: the producer is \
+                         stamping the event before the period it describes has ended, which would \
+                         inject lookahead"
+                    );
+                } else if self
                     .candle
                     .is_none_or(|current| current.close_time < candle.close_time)
                 {
@@ -241,11 +312,24 @@ mod tests {
     }
 
     /// An L1 with a symmetric book, so the volume-weighted mid-price is exactly `price`.
-    fn l1(price: Decimal) -> DataKind {
+    ///
+    /// `last_update_time` is passed explicitly because it — not the wrapping event's
+    /// `time_exchange` — is what both the staleness guard and `price()` order on.
+    fn l1(last_update_time: DateTime<Utc>, price: Decimal) -> DataKind {
         DataKind::OrderBookL1(OrderBookL1 {
-            last_update_time: at(0),
+            last_update_time,
             best_bid: Some(Level::new(price, dec!(1))),
             best_ask: Some(Level::new(price, dec!(1))),
+        })
+    }
+
+    /// A two-sided book carrying prices but **no sizes** — what a bulk export or an FX quote tape
+    /// publishes. The volume-weighted mid is undefined; the plain mid is `(bid + ask) / 2`.
+    fn l1_without_sizes(last_update_time: DateTime<Utc>, bid: Decimal, ask: Decimal) -> DataKind {
+        DataKind::OrderBookL1(OrderBookL1 {
+            last_update_time,
+            best_bid: Some(Level::new(bid, Decimal::ZERO)),
+            best_ask: Some(Level::new(ask, Decimal::ZERO)),
         })
     }
 
@@ -255,13 +339,77 @@ mod tests {
     }
 
     #[test]
-    fn l1_wins_unconditionally_over_newer_candle_and_trade() {
+    fn newest_l1_beats_older_candle_and_trade() {
         let mut data = DefaultInstrumentMarketData::default();
-        data.process(&event(at(10), l1(dec!(100))));
-        data.process(&event(at(20), trade(dec!(200))));
-        data.process(&event(at(30), candle(at(30), dec!(300))));
+        data.process(&event(at(10), trade(dec!(200))));
+        data.process(&event(at(20), candle(at(20), dec!(300))));
+        data.process(&event(at(30), l1(at(30), dec!(100))));
 
         assert_eq!(data.price(), Some(dec!(100)));
+    }
+
+    /// The failure this rule exists to prevent, applied to L1: on a mixed feed — a session of quote
+    /// ticks, then a long run of bars, which one provider alone can produce — a book that stopped
+    /// updating must not mark every position that follows it.
+    #[test]
+    fn stale_l1_does_not_shadow_fresh_candle() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(100), l1(at(100), dec!(100))));
+        data.process(&event(at(86_500), candle(at(86_500), dec!(300))));
+
+        assert_eq!(data.price(), Some(dec!(300)));
+    }
+
+    /// At equal recency L1 still wins, which is what keeps an L1-only feed behaving exactly as it
+    /// did before the other two inputs were considered.
+    #[test]
+    fn l1_wins_exact_tie_with_candle_and_trade() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(20), candle(at(20), dec!(300))));
+        data.process(&event(at(20), trade(dec!(200))));
+        data.process(&event(at(20), l1(at(20), dec!(100))));
+
+        assert_eq!(data.price(), Some(dec!(100)));
+    }
+
+    /// A prices-only book must produce a price rather than a panic: `Decimal` division by the zero
+    /// total size panics, and this book is what an export-driven backtest feeds in on every row.
+    #[test]
+    fn two_sided_l1_without_sizes_falls_back_to_plain_mid() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(
+            at(10),
+            l1_without_sizes(at(10), dec!(100), dec!(200)),
+        ));
+
+        assert_eq!(data.price(), Some(dec!(150)));
+    }
+
+    /// Half a book has no mid, so it contributes nothing and the other inputs stand.
+    #[test]
+    fn one_sided_l1_contributes_no_price() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(10), trade(dec!(200))));
+        data.process(&event(
+            at(20),
+            DataKind::OrderBookL1(OrderBookL1 {
+                last_update_time: at(20),
+                best_bid: Some(Level::new(dec!(100), Decimal::ZERO)),
+                best_ask: None,
+            }),
+        ));
+
+        assert_eq!(data.price(), Some(dec!(200)));
+    }
+
+    #[test]
+    fn stale_l1_does_not_replace_newer_stored_l1() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(30), l1(at(30), dec!(300))));
+        data.process(&event(at(20), l1(at(20), dec!(999))));
+
+        assert_eq!(data.l1.last_update_time, at(30));
+        assert_eq!(data.price(), Some(dec!(300)));
     }
 
     #[test]
@@ -303,6 +451,42 @@ mod tests {
         data.process(&event(at(20), trade(dec!(200))));
 
         assert_eq!(data.price(), Some(dec!(200)));
+    }
+
+    /// A producer stamping `time_exchange` with the bar's **open** — the timestamp most venues put
+    /// in the bar record — offers the close of a period the engine's clock says is still running.
+    /// Applying it would let a strategy trade the whole bar on its own outcome.
+    #[test]
+    fn candle_closing_after_its_own_time_exchange_is_dropped_as_lookahead() {
+        let mut data = DefaultInstrumentMarketData::default();
+        // Stamped at the bar open (t=20) but describing the period ending at t=80.
+        data.process(&event(at(20), candle(at(80), dec!(300))));
+
+        assert_eq!(data.candle, None, "the lookahead candle must not be stored");
+        assert_eq!(data.price(), None);
+    }
+
+    /// The guard rejects only what is genuinely ahead. A live feed stamps `time_exchange` at
+    /// receipt, which is strictly *after* the close it delivers, and that candle must still apply.
+    #[test]
+    fn candle_closing_before_its_time_exchange_is_retained() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(85), candle(at(80), dec!(300))));
+
+        assert_eq!(data.candle.unwrap().close_time, at(80));
+        assert_eq!(data.price(), Some(dec!(300)));
+    }
+
+    /// A dropped lookahead candle must not shadow the state that was already there — the drop is a
+    /// no-op on everything else, not a reset.
+    #[test]
+    fn a_dropped_lookahead_candle_leaves_the_stored_candle_intact() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(30), candle(at(30), dec!(300))));
+        data.process(&event(at(40), candle(at(90), dec!(999))));
+
+        assert_eq!(data.candle.unwrap().close_time, at(30));
+        assert_eq!(data.price(), Some(dec!(300)));
     }
 
     #[test]

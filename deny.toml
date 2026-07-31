@@ -78,6 +78,25 @@ multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
 
+# The `arrow` stack must never enter the graph.
+#
+# `rustrade-data`'s optional `parquet` dependency is `default-features = false` precisely because
+# its defaults pull `arrow-array`/`buffer`/`data`/`schema`/`select`/`ipc` plus `base64`, `brotli`,
+# `flate2`, `lz4`, `snap` and `simdutf8`. The LSE export decoder reads Parquet through the column
+# API and needs none of it, and that exclusion is the whole supply-chain case for accepting
+# `parquet` at all (see `.github/tier2-dependencies.txt`).
+#
+# Until now that invariant lived only in comments, which nothing checks. Cargo unifies features
+# workspace-wide, so *any* future dependency pulling `parquet` with defaults re-admits the lot
+# silently. These entries make `cargo deny` fail the moment it happens. If arrow ever becomes a
+# deliberate dependency, that is a tier-2 review, and removing these lines is how it is recorded.
+deny = [
+    { name = "arrow" },
+    { name = "arrow-array" },
+    { name = "arrow-buffer" },
+    { name = "arrow-schema" },
+]
+
 # Sources - only allow crates.io
 [sources]
 unknown-registry = "deny"

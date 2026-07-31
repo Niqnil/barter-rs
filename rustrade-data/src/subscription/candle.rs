@@ -959,6 +959,48 @@ mod tests {
         let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(1)).unwrap();
         assert_eq!(out, bars.to_vec());
     }
+
+    /// Pins the serde contract documented on [`Candle::volume`].
+    ///
+    /// The absent-key case is the one worth a test: making the field optional turned a `missing
+    /// field` rejection into a silent `None`, and nothing else in the codebase would notice if a
+    /// `#[serde(default)]`-style change or a rename reintroduced the old behaviour.
+    #[test]
+    fn an_absent_volume_or_trade_count_deserialises_as_unknown_and_a_zero_stays_a_zero() {
+        let without = serde_json::json!({
+            "close_time": "2024-01-15T12:00:00Z",
+            "open": "10", "high": "12", "low": "9", "close": "11",
+        });
+        let candle: Candle = serde_json::from_value(without).unwrap();
+        assert_eq!(candle.volume, None);
+        assert_eq!(candle.trade_count, None);
+
+        // A record written before the migration: the fabricated zero survives verbatim, so this
+        // type cannot recover the distinction it now expresses.
+        let pre_migration = serde_json::json!({
+            "close_time": "2024-01-15T12:00:00Z",
+            "open": "10", "high": "12", "low": "9", "close": "11",
+            "volume": "0", "trade_count": 0,
+        });
+        let candle: Candle = serde_json::from_value(pre_migration).unwrap();
+        assert_eq!(candle.volume, Some(Decimal::ZERO));
+        assert_eq!(candle.trade_count, Some(0));
+
+        // `None` round-trips as an explicit null rather than degrading to the absent-key case.
+        let unknown = Candle {
+            close_time: dt("2024-01-15T12:00:00Z"),
+            open: dec!(10),
+            high: dec!(12),
+            low: dec!(9),
+            close: dec!(11),
+            volume: None,
+            trade_count: None,
+        };
+        let encoded = serde_json::to_value(unknown).unwrap();
+        assert_eq!(encoded["volume"], serde_json::Value::Null);
+        assert_eq!(encoded["trade_count"], serde_json::Value::Null);
+        assert_eq!(serde_json::from_value::<Candle>(encoded).unwrap(), unknown);
+    }
 }
 
 /// Normalised Barter OHLCV [`Candle`] model.
@@ -1026,12 +1068,32 @@ pub struct Candle {
     /// feature would read a real, quiet zero rather than an explicit unknown.
     /// [`aggregate_candles`] propagates the absence: any `None` constituent makes
     /// the whole aggregated bucket `None`.
+    ///
+    /// # Serde contract
+    ///
+    /// Plain `Option` semantics, with two consequences worth stating because they
+    /// changed when this field became optional:
+    ///
+    /// - An **absent** `volume` key now deserialises to `None`. It was previously a
+    ///   hard `missing field` error, so a truncated or hand-written record that used
+    ///   to be rejected is now accepted as "volume unknown". Reject it explicitly if
+    ///   a producer of yours must always report one.
+    /// - A record persisted **before** the migration carries the fabricated
+    ///   `"volume": 0` verbatim, and reads back as `Some(0)` — indistinguishable
+    ///   from a genuine zero-volume bar. This type cannot recover the distinction;
+    ///   re-fetch, or track the affected range out-of-band.
+    ///
+    /// `None` serialises as `"volume": null` (the key is written, not skipped), so a
+    /// round trip through JSON preserves absence rather than degrading it into the
+    /// missing-key case above.
     pub volume: Option<Decimal>,
     /// Number of trades in the candle period, or `None` when the producer does
     /// not report a trade count.
     ///
-    /// Same contract as [`volume`](Self::volume): `None` means "unknown", never
-    /// zero, and any `None` constituent makes an aggregated bucket `None`.
+    /// Same contract as [`volume`](Self::volume) throughout, including serde:
+    /// `None` means "unknown", never zero; any `None` constituent makes an
+    /// aggregated bucket `None`; an absent key deserialises to `None`; and a
+    /// pre-migration `"trade_count": 0` still reads back as `Some(0)`.
     pub trade_count: Option<u64>,
 }
 

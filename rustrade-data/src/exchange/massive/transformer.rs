@@ -117,6 +117,52 @@ pub struct AggregateBar {
     pub trade_count: Option<u64>,
 }
 
+/// What a Massive aggregate's `v` field actually counts, which is **market-dependent**.
+///
+/// Massive documents `v` identically across asset classes ("the trading volume of the symbol in
+/// the given time period"), but forex aggregates are not built from a trade tape: spot FX has no
+/// consolidated one, so Massive derives its forex bars from quoted bid/ask updates. `v` there
+/// counts *quote activity*, and a quote is not a trade — nobody transacted that "volume".
+///
+/// Carrying it into [`Candle::volume`] anyway would be exactly the silent lie
+/// [that field's contract](Candle::volume) exists to prevent: a volume-derived feature, a VWAP, or
+/// a liquidity filter would read a real number where the venue reports nothing about size at all.
+/// Spot FX is the motivating example named in `Candle::volume`'s own docs.
+///
+/// Refs: <https://massive.com/docs/rest/forex/aggregates/custom-bars> (forex aggregates are
+/// "generated from quoted bid/ask prices rather than executed trades").
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum AggregateVolume {
+    /// `v` is a real traded volume — stocks, options and crypto, which all have a trade tape.
+    Traded,
+    /// `v` counts quote updates rather than trades, so the candle reports `volume: None`.
+    QuoteTicks,
+}
+
+impl AggregateVolume {
+    /// Classify a Massive REST ticker by its asset-class prefix.
+    ///
+    /// `C:` is forex (`C:EURUSD`); everything else — `X:` crypto, `O:` options, bare stock
+    /// symbols — has a trade tape. A ticker whose class Massive adds later defaults to
+    /// [`Traded`](Self::Traded), matching the pre-existing behaviour for anything unrecognised.
+    #[must_use]
+    pub fn for_ticker(ticker: &str) -> Self {
+        if ticker.starts_with("C:") {
+            Self::QuoteTicks
+        } else {
+            Self::Traded
+        }
+    }
+
+    /// Apply these semantics to a wire `v`.
+    fn apply(self, volume: Decimal) -> Option<Decimal> {
+        match self {
+            Self::Traded => Some(volume),
+            Self::QuoteTicks => None,
+        }
+    }
+}
+
 impl AggregateBar {
     /// Convert to rustrade [`Candle`], mapping `(multiplier, timespan)` to the
     /// shared [`IntervalStep`].
@@ -125,11 +171,19 @@ impl AggregateBar {
     /// computed per-bar via [`close_time_from_open`] — calendar intervals
     /// (`month`/`quarter`/`year`) therefore use leap-year-correct month
     /// arithmetic, not an approximate fixed `Duration`.
+    ///
+    /// `volume` says what this market's `v` means — see [`AggregateVolume`], and
+    /// [`AggregateVolume::for_ticker`] to derive it from the ticker you requested.
     // Public convenience API; the internal REST stream uses `into_candle_with_step`
     // (pre-computes the step once per stream), so this is unused in-crate.
     #[allow(dead_code)]
-    pub fn into_candle(self, multiplier: u32, timespan: &str) -> Result<Candle, MassiveError> {
-        self.into_candle_with_step(timespan_to_step(multiplier, timespan))
+    pub fn into_candle(
+        self,
+        multiplier: u32,
+        timespan: &str,
+        volume: AggregateVolume,
+    ) -> Result<Candle, MassiveError> {
+        self.into_candle_with_step(timespan_to_step(multiplier, timespan), volume)
     }
 
     /// Convert to rustrade [`Candle`] with a pre-computed [`IntervalStep`].
@@ -140,6 +194,8 @@ impl AggregateBar {
     /// are variable-length — a single pre-computed `Duration` for the whole
     /// stream would be wrong for `month`/`quarter`/`year`.
     ///
+    /// `volume` says what this market's `v` means — see [`AggregateVolume`].
+    ///
     /// # Errors
     ///
     /// Returns [`MassiveError::InvalidInput`] if the computed `close_time`
@@ -147,7 +203,11 @@ impl AggregateBar {
     /// *input* `timestamp` is, by contrast, tolerated with a warning and
     /// `UNIX_EPOCH` (preserving prior behaviour) — only a computed *boundary*
     /// overflow is a hard error.
-    pub fn into_candle_with_step(self, step: IntervalStep) -> Result<Candle, MassiveError> {
+    pub fn into_candle_with_step(
+        self,
+        step: IntervalStep,
+        volume: AggregateVolume,
+    ) -> Result<Candle, MassiveError> {
         let start_time = Utc
             .timestamp_millis_opt(self.timestamp)
             .single()
@@ -169,9 +229,15 @@ impl AggregateBar {
             high: self.high,
             low: self.low,
             close: self.close,
-            volume: Some(self.volume),
+            // Not unconditionally `Some`: on the forex tape `v` counts quote updates rather than
+            // trades, and reporting that as a traded volume would be indistinguishable from a real
+            // one downstream. See `AggregateVolume`.
+            volume: volume.apply(self.volume),
             // Massive already models an absent trade count; carry the `None`
             // through as "unknown" rather than the old lossy `unwrap_or(0)`.
+            // REST is the surface that genuinely has one: `n` is documented as "the number of
+            // transactions in the aggregate window". (The WS aggregate's `z` is not — see
+            // `WsAggregateMsg::average_trade_size`.)
             trade_count: self.trade_count,
         })
     }
@@ -653,9 +719,26 @@ pub(crate) struct WsAggregateMsg {
     #[serde(rename = "e")]
     pub end_timestamp: i64,
 
-    /// Number of trades (optional)
-    #[serde(rename = "z", default)]
-    pub trade_count: Option<u64>,
+    /// **Average trade size** for this aggregate window — *not* a trade count.
+    ///
+    /// Massive documents `z` verbatim as "The average trade size for this aggregate window". It is
+    /// deliberately **not** mapped onto [`Candle::trade_count`]: the two differ by a factor of the
+    /// mean fill size, so a strategy filtering on "at least N trades in the bar" would have been
+    /// reading a completely unrelated quantity — silently, and plausibly, since both are small
+    /// positive numbers. The REST aggregate's `n` is the real count; this stream carries none, so
+    /// [`into_candle`](Self::into_candle) reports `trade_count: None`.
+    ///
+    /// `Decimal`, not `u64`: an average is routinely fractional, and the previous `Option<u64>`
+    /// could not parse one — the whole message failed to deserialize and was dropped by
+    /// [`parse_ws_message`] as an unknown event type.
+    ///
+    /// Absent on the forex aggregate variants, which document no `z` at all.
+    ///
+    /// Ref: <https://massive.com/docs/websocket/stocks/aggregates-per-minute>
+    #[serde(rename = "z", with = "rust_decimal::serde::float_option", default)]
+    #[allow(dead_code)]
+    // Retained for API schema completeness; deliberately not a `trade_count`.
+    pub average_trade_size: Option<Decimal>,
 }
 
 impl WsAggregateMsg {
@@ -672,7 +755,11 @@ impl WsAggregateMsg {
     /// can't silently drift this off the contract. (If a Massive WS aggregate ever
     /// carried a coarser-than-minute interval, this trust assumption must be
     /// revisited.)
-    pub fn into_candle(self) -> (DateTime<Utc>, Candle) {
+    ///
+    /// `volume` says what this market's `v` means — see [`AggregateVolume`]. The `trade_count` is
+    /// always `None`: this stream carries no trade count at all (see
+    /// [`average_trade_size`](Self::average_trade_size)).
+    pub fn into_candle(self, volume: AggregateVolume) -> (DateTime<Utc>, Candle) {
         let time = millis_to_datetime(self.end_timestamp);
 
         let candle = Candle {
@@ -681,10 +768,12 @@ impl WsAggregateMsg {
             high: self.high,
             low: self.low,
             close: self.close,
-            volume: Some(self.volume),
-            // Massive already models an absent trade count; carry the `None`
-            // through as "unknown" rather than the old lossy `unwrap_or(0)`.
-            trade_count: self.trade_count,
+            // See `AggregateVolume`: the forex aggregate's `v` counts quote updates, not trades.
+            volume: volume.apply(self.volume),
+            // The WS aggregate carries NO trade count. `z`, the field previously read as one, is
+            // the average trade *size*. An explicit unknown is the only honest answer here; the
+            // REST aggregate's `n` is where a real count comes from.
+            trade_count: None,
         };
 
         (time, candle)
@@ -856,7 +945,9 @@ mod tests {
             trade_count: Some(150),
         };
 
-        let candle = bar.into_candle(1, "minute").unwrap();
+        let candle = bar
+            .into_candle(1, "minute", AggregateVolume::Traded)
+            .unwrap();
 
         assert_eq!(candle.open, dec!(65000.0));
         assert_eq!(candle.close, dec!(65100.0));
@@ -887,7 +978,7 @@ mod tests {
         // Month: Jan 1 -> Feb 1 (not 1704067200000 + 30d = 2024-01-31).
         assert_eq!(
             bar_at()
-                .into_candle(1, "month")
+                .into_candle(1, "month", AggregateVolume::Traded)
                 .unwrap()
                 .close_time
                 .timestamp_millis(),
@@ -896,7 +987,7 @@ mod tests {
         // Quarter: Jan 1 -> Apr 1.
         assert_eq!(
             bar_at()
-                .into_candle(1, "quarter")
+                .into_candle(1, "quarter", AggregateVolume::Traded)
                 .unwrap()
                 .close_time
                 .timestamp_millis(),
@@ -905,7 +996,7 @@ mod tests {
         // Year: Jan 1 -> next Jan 1.
         assert_eq!(
             bar_at()
-                .into_candle(1, "year")
+                .into_candle(1, "year", AggregateVolume::Traded)
                 .unwrap()
                 .close_time
                 .timestamp_millis(),
@@ -1167,7 +1258,7 @@ mod tests {
                 assert_eq!(agg.low, dec!(45180.0));
                 assert_eq!(agg.close, dec!(45230.0));
                 assert_eq!(agg.volume, dec!(10.5));
-                assert_eq!(agg.trade_count, Some(150));
+                assert_eq!(agg.average_trade_size, Some(dec!(150)));
             }
             _ => panic!("Expected crypto aggregate message"),
         }
@@ -1262,18 +1353,19 @@ mod tests {
             volume: dec!(10.5),
             start_timestamp: 1704067200000,
             end_timestamp: 1704067260000,
-            trade_count: Some(150),
+            average_trade_size: Some(dec!(150)),
         };
 
         let start_ms = agg.start_timestamp;
-        let (time, candle) = agg.into_candle();
+        let (time, candle) = agg.into_candle(AggregateVolume::Traded);
 
         assert_eq!(candle.open, dec!(45200.0));
         assert_eq!(candle.high, dec!(45250.0));
         assert_eq!(candle.low, dec!(45180.0));
         assert_eq!(candle.close, dec!(45230.0));
         assert_eq!(candle.volume, Some(dec!(10.5)));
-        assert_eq!(candle.trade_count, Some(150));
+        // `z` is the average trade SIZE, not a count, so this stream reports no count at all.
+        assert_eq!(candle.trade_count, None);
         assert_eq!(
             time,
             Utc.timestamp_millis_opt(1704067260000).single().unwrap()
@@ -1288,6 +1380,103 @@ mod tests {
             start_ms + 60_000,
             "WS aggregate close_time must equal start (s) + 1 minute"
         );
+    }
+
+    /// Spot FX has no consolidated trade tape: Massive builds its forex bars from quoted bid/ask,
+    /// so `v` counts quote updates. Reporting that as a traded volume is the silent lie
+    /// `Candle::volume`'s `Option` exists to prevent.
+    #[test]
+    fn a_forex_aggregate_reports_no_volume_because_its_v_counts_quotes() {
+        let agg = || WsAggregateMsg {
+            symbol: "EUR-USD".to_string(),
+            open: dec!(1.1),
+            high: dec!(1.2),
+            low: dec!(1.0),
+            close: dec!(1.15),
+            volume: dec!(4321),
+            start_timestamp: 1704067200000,
+            end_timestamp: 1704067260000,
+            average_trade_size: None,
+        };
+
+        let (_, forex) = agg().into_candle(AggregateVolume::QuoteTicks);
+        assert_eq!(forex.volume, None);
+        assert_eq!(forex.trade_count, None);
+
+        // Same wire shape on a market that does have a tape still reports the volume, so this is
+        // a per-market decision rather than a blanket drop.
+        let (_, traded) = agg().into_candle(AggregateVolume::Traded);
+        assert_eq!(traded.volume, Some(dec!(4321)));
+    }
+
+    /// The REST path derives the same distinction from the ticker's asset-class prefix.
+    #[test]
+    fn a_forex_rest_bar_reports_no_volume_but_keeps_its_real_trade_count() {
+        let bar = || AggregateBar {
+            open: dec!(1.1),
+            high: dec!(1.2),
+            low: dec!(1.0),
+            close: dec!(1.15),
+            volume: dec!(4321),
+            vwap: None,
+            timestamp: 1_704_067_200_000,
+            trade_count: Some(150),
+        };
+
+        let forex = bar()
+            .into_candle(1, "minute", AggregateVolume::for_ticker("C:EURUSD"))
+            .unwrap();
+        assert_eq!(forex.volume, None);
+        // `n` IS documented as a transaction count on every market, so it survives.
+        assert_eq!(forex.trade_count, Some(150));
+
+        let crypto = bar()
+            .into_candle(1, "minute", AggregateVolume::for_ticker("X:BTCUSD"))
+            .unwrap();
+        assert_eq!(crypto.volume, Some(dec!(4321)));
+    }
+
+    #[test]
+    fn aggregate_volume_classifies_only_the_forex_prefix_as_quote_ticks() {
+        assert_eq!(
+            AggregateVolume::for_ticker("C:EURUSD"),
+            AggregateVolume::QuoteTicks
+        );
+        for traded in ["X:BTCUSD", "AAPL", "O:SPY251219C00650000", "I:SPX"] {
+            assert_eq!(
+                AggregateVolume::for_ticker(traded),
+                AggregateVolume::Traded,
+                "{traded}"
+            );
+        }
+    }
+
+    /// `z` is routinely fractional (it is a mean), and the previous `Option<u64>` could not parse
+    /// one — `parse_ws_message` dropped the entire aggregate as an unknown event type.
+    #[test]
+    fn an_aggregate_with_a_fractional_average_trade_size_still_parses() {
+        let json = r#"[{
+            "ev": "AM",
+            "sym": "AAPL",
+            "o": 150.10,
+            "h": 150.50,
+            "l": 150.05,
+            "c": 150.25,
+            "v": 1000,
+            "s": 1704067200000,
+            "e": 1704067260000,
+            "z": 78.5
+        }]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 1, "the frame must not be silently dropped");
+
+        match &messages[0] {
+            WsMessage::AggMinuteStocks(agg) => {
+                assert_eq!(agg.average_trade_size, Some(dec!(78.5)));
+            }
+            other => panic!("expected a stocks aggregate, got {other:?}"),
+        }
     }
 
     #[test]

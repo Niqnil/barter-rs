@@ -26,7 +26,7 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
-    instrument::{Instrument, name::InstrumentNameExchange},
+    instrument::{Instrument, kind::InstrumentKind, name::InstrumentNameExchange},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::ToSmolStr;
@@ -38,6 +38,32 @@ use tracing::{error, info};
 pub mod account;
 pub mod request;
 
+/// Simulated exchange: fills every market order immediately and keeps its own balance ledger.
+///
+/// # Which [`InstrumentKind`]s it accounts for
+/// [`Spot`](InstrumentKind::Spot) and [`Cfd`](InstrumentKind::Cfd). A spot fill exchanges the two
+/// underlying assets; a CFD fill is cash-settled against the quote asset in both directions, since
+/// there is nothing to deliver and a short is a margin position rather than a stock loan. Both carry
+/// the instrument's `contract_size` into the notional and the fee, so this ledger and the engine's
+/// position accounting cannot disagree by that multiplier.
+///
+/// # ⚠️ Caller obligations and known limitations
+/// - **Fund the quote asset of every instrument traded.** Every debit is quote-denominated except a
+///   spot sell, which debits base. A missing balance is a **panic**, not an error: the balances are
+///   this mock's own fixture, so an absent one is a mis-specified test rather than a runtime
+///   condition. A CFD settling in an account currency that is not the quote asset still needs the
+///   **quote** asset funded — see below.
+/// - **`CfdContract::settlement_asset` is not settled in.** A CFD routinely cash-settles in an
+///   account currency that is not the quote asset (a GBP account trading a USD-quoted index), which
+///   requires a quote→settlement conversion rate. This mock has no rate source and will not invent
+///   one, so it debits and credits the quote asset and leaves the currency dimension unmodelled. The
+///   field is carried on the instrument so its description stays faithful, and the engine's own
+///   `InstrumentKind` — not this copy — drives PnL. A backtest whose result depends on the
+///   settlement currency needs a real execution client.
+/// - **The ledger debits the paying asset and does not credit the received one.** Pre-existing: a
+///   spot buy debits quote without crediting base, and a spot sell the reverse. Balances therefore
+///   track cash committed, not portfolio value; position-derived statistics come from the engine.
+/// - **Only [`OrderKind::Market`] is accepted**; every other kind is rejected.
 #[derive(Debug)]
 pub struct MockExchange {
     pub exchange: ExchangeId,
@@ -305,10 +331,16 @@ impl MockExchange {
             return (build_open_order_err_response(request, error), None);
         }
 
-        let underlying = match self.find_instrument_data(&request.key.instrument) {
-            Ok(instrument) => instrument.underlying.clone(),
-            Err(error) => return (build_open_order_err_response(request, error), None),
-        };
+        // Cloned out before the `&mut self` balance borrow below.
+        let (underlying, contract_size, cash_settled) =
+            match self.find_instrument_data(&request.key.instrument) {
+                Ok(instrument) => (
+                    instrument.underlying.clone(),
+                    instrument.kind.contract_size(),
+                    matches!(instrument.kind, InstrumentKind::Cfd(_)),
+                ),
+                Err(error) => return (build_open_order_err_response(request, error), None),
+            };
 
         // Compute fill price via the configured FillModel.
         //
@@ -351,13 +383,68 @@ impl MockExchange {
 
         let time_exchange = self.time_exchange();
 
-        // Compute fee using the configured FeeModel. For spot, contract_size = 1.
+        // Both the notional and the fee carry the instrument's `contract_size` multiplier, which is
+        // `Decimal::ONE` for `Spot` and a real per-point multiplier for a `Cfd`. Dropping it here
+        // while the engine applies it to PnL and fees
+        // (`InstrumentState::update_from_trade`) would make this ledger and the engine's
+        // position accounting disagree by exactly that factor -- balances moving 1x while PnL moves
+        // 25x, silently, with every balance-derived return, drawdown and Sharpe wrong by the same
+        // factor. (No fee model reads `contract_size` today, so passing it changes no fee amount
+        // yet; passing it is what keeps that an implementation detail of the models rather than a
+        // second place the multiplier can be lost.)
+        let order_notional_quote = fill_price * request.state.quantity.abs() * contract_size;
         let order_fees_quote =
             self.fee_model
-                .compute_fee(fill_price, request.state.quantity, Decimal::ONE);
+                .compute_fee(fill_price, request.state.quantity, contract_size);
 
-        let balance_change_result = match request.state.side {
-            Side::Buy => {
+        let balance_change_result = match (cash_settled, request.state.side) {
+            // A CFD is a cash-settled position on a price, not an exchange of the two underlying
+            // assets: there is nothing to deliver in either direction. A short is a margin position
+            // rather than a stock loan, so -- unlike a spot sell -- it requires no base inventory,
+            // which would otherwise force the caller to fund a phantom balance in an index or a
+            // commodity to open one. Both directions therefore post quote-denominated cash.
+            //
+            // The notional stands in for a margin requirement: this mock models no leverage, so
+            // "you must hold the full notional to open the position" is the conservative reading,
+            // and it matches what the spot buy path already requires.
+            (true, _) => {
+                #[allow(clippy::expect_used)]
+                // Invariant: MockExchange - balances exist for all configured instruments
+                let current = self
+                    .account
+                    .balance_mut(&underlying.quote)
+                    .expect("MockExchange has Balance for all configured Instrument assets");
+
+                // Currently we only supported MarketKind orders, so they should be identical
+                assert_eq!(current.balance.total, current.balance.free);
+
+                let quote_required = order_notional_quote + order_fees_quote;
+                let maybe_new_balance = current.balance.free - quote_required;
+
+                if maybe_new_balance >= Decimal::ZERO {
+                    current.balance.free = maybe_new_balance;
+                    current.balance.total = maybe_new_balance;
+                    current.time_exchange = time_exchange;
+
+                    Ok((
+                        current.clone(),
+                        AssetFees::new(
+                            underlying.quote.clone(),
+                            order_fees_quote,
+                            Some(order_fees_quote),
+                        ),
+                    ))
+                } else {
+                    Err(ApiError::BalanceInsufficient(
+                        underlying.quote.clone(),
+                        format!(
+                            "Available Balance: {}, Required Balance inc. fees: {}",
+                            current.balance.free, quote_required
+                        ),
+                    ))
+                }
+            }
+            (false, Side::Buy) => {
                 // Buying Instrument requires sufficient QuoteAsset Balance
                 #[allow(clippy::expect_used)]
                 // Invariant: MockExchange - balances exist for all configured instruments
@@ -369,8 +456,7 @@ impl MockExchange {
                 // Currently we only supported MarketKind orders, so they should be identical
                 assert_eq!(current.balance.total, current.balance.free);
 
-                let order_value_quote = fill_price * request.state.quantity.abs();
-                let quote_required = order_value_quote + order_fees_quote;
+                let quote_required = order_notional_quote + order_fees_quote;
 
                 let maybe_new_balance = current.balance.free - quote_required;
 
@@ -397,7 +483,7 @@ impl MockExchange {
                     ))
                 }
             }
-            Side::Sell => {
+            (false, Side::Sell) => {
                 // Selling Instrument requires sufficient BaseAsset Balance
                 #[allow(clippy::expect_used)]
                 // Invariant: MockExchange - balances exist for all configured instruments
@@ -411,11 +497,16 @@ impl MockExchange {
 
                 let order_value_base = request.state.quantity.abs();
                 // Fee is quote-denominated; convert to base for deduction.
-                // Note: For PerContractFeeModel this conversion is nonsensical (flat USD / price),
-                // but MockExchange is spot-only so PerContract isn't used in practice.
+                //
+                // Note: for `PerContractFeeModel` this conversion is nonsensical (a flat commission
+                // divided by a price). Only `Spot` reaches this branch -- a cash-settled kind is
+                // handled above and never debits base -- and a per-contract commission on a spot
+                // instrument is already a modelling error, so this stays an assert rather than a
+                // conversion this mock pretends to do correctly.
                 debug_assert!(
                     !matches!(self.fee_model, FeeModelConfig::PerContract(_)),
-                    "PerContractFeeModel produces nonsensical base-denominated fees on sell path"
+                    "PerContractFeeModel produces nonsensical base-denominated fees on the spot \
+                     sell path"
                 );
                 let order_fees_base = if fill_price.is_zero() {
                     Decimal::ZERO
@@ -584,7 +675,7 @@ mod tests {
         exchange::ExchangeId,
         instrument::{
             Instrument,
-            kind::InstrumentKind,
+            kind::{InstrumentKind, cfd::CfdContract},
             name::{InstrumentNameExchange, InstrumentNameInternal},
             quote::InstrumentQuoteAsset,
         },
@@ -713,6 +804,219 @@ mod tests {
             best_ask: p,
             last_price: p,
         }
+    }
+
+    /// `contract_size` of the CFD fixture below, as a per-point multiplier a real index CFD carries.
+    const CFD_CONTRACT_SIZE: &str = "25";
+
+    fn cfd_instrument_name() -> InstrumentNameExchange {
+        InstrumentNameExchange::new("spx500_usd")
+    }
+
+    /// A USD-quoted index CFD settling in **GBP** — the case that makes the settlement asset differ
+    /// from the quote asset — with **only the quote asset funded** and no `spx500` balance at all.
+    /// An index is not deliverable, so requiring base inventory to short one would be unfundable.
+    fn make_cfd_exchange(usd: &str, fee_model: FeeModelConfig) -> MockExchange {
+        let usd = d(usd);
+        make_cfd_exchange_with_balances(
+            vec![AssetBalance {
+                asset: AssetNameExchange::new("usd"),
+                balance: Balance::new(usd, usd),
+                time_exchange: Utc::now(),
+            }],
+            fee_model,
+        )
+    }
+
+    fn make_cfd_exchange_with_balances(
+        balances: Vec<AssetBalance<AssetNameExchange>>,
+        fee_model: FeeModelConfig,
+    ) -> MockExchange {
+        let initial_state = UnindexedAccountSnapshot {
+            exchange: EXCHANGE,
+            balances,
+            instruments: vec![],
+        };
+
+        let config = MockExecutionConfig::new(
+            EXCHANGE,
+            initial_state,
+            0, // latency_ms
+            fee_model,
+            SimFillConfig::default(),
+        );
+
+        let (_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, _) = broadcast::channel(1);
+
+        let mut instruments = FnvHashMap::default();
+        instruments.insert(
+            cfd_instrument_name(),
+            Instrument {
+                exchange: EXCHANGE,
+                name_internal: InstrumentNameInternal::new("spx500_usd"),
+                name_exchange: cfd_instrument_name(),
+                underlying: Underlying {
+                    base: AssetNameExchange::new("spx500"),
+                    quote: AssetNameExchange::new("usd"),
+                },
+                quote: InstrumentQuoteAsset::UnderlyingQuote,
+                kind: InstrumentKind::Cfd(CfdContract {
+                    contract_size: d(CFD_CONTRACT_SIZE),
+                    settlement_asset: AssetNameExchange::new("gbp"),
+                }),
+                spec: None,
+            },
+        );
+
+        MockExchange::new(config, request_rx, event_tx, instruments)
+    }
+
+    fn cfd_request(
+        side: Side,
+        quantity: &str,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        OrderEvent {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: cfd_instrument_name(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("test-cid"),
+            },
+            state: RequestOpen {
+                side,
+                price: None,
+                quantity: d(quantity),
+                kind: OrderKind::Market,
+                time_in_force: TimeInForce::ImmediateOrCancel,
+                position_id: None,
+                reduce_only: false,
+            },
+        }
+    }
+
+    /// The multiplier must reach the ledger, or balances move 1x while the engine's PnL moves
+    /// `contract_size`x — the same fill accounted two different ways.
+    #[test]
+    fn cfd_buy_debits_the_contract_size_scaled_notional() {
+        let mut exchange = make_cfd_exchange("200000", FeeModelConfig::default());
+
+        let (response, notifications) =
+            exchange.open_order(cfd_request(Side::Buy, "1"), market_prices("5000"));
+
+        assert!(
+            response.state.is_accepted(),
+            "cfd buy should fill: {:?}",
+            response.state
+        );
+        assert!(notifications.is_some());
+
+        // 1 contract * 5000 * 25 = 125,000 of true notional, not the unmultiplied 5,000.
+        let usd = exchange
+            .account
+            .balance_mut(&AssetNameExchange::new("usd"))
+            .unwrap();
+        assert_eq!(usd.balance.free, d("200000") - d("125000"));
+        assert_eq!(usd.balance.total, usd.balance.free);
+    }
+
+    /// A CFD short is a margin position, not a stock loan: it must not require inventory in an
+    /// index that cannot be held. This fixture funds no `spx500` balance at all, so a base debit
+    /// would panic on the missing balance rather than merely reject.
+    #[test]
+    fn cfd_sell_needs_no_base_inventory_and_debits_quote() {
+        let mut exchange = make_cfd_exchange("200000", FeeModelConfig::default());
+
+        let (response, notifications) =
+            exchange.open_order(cfd_request(Side::Sell, "1"), market_prices("5000"));
+
+        assert!(
+            response.state.is_accepted(),
+            "cfd short should fill without base inventory: {:?}",
+            response.state
+        );
+        let notifications = notifications.expect("successful short must notify");
+        assert_eq!(
+            notifications.balance.0.asset,
+            AssetNameExchange::new("usd"),
+            "a cash-settled short debits quote, not base"
+        );
+        assert_eq!(notifications.balance.0.balance.free, d("75000"));
+    }
+
+    /// The scaled notional is what the balance check tests, so an account that could fund the
+    /// unmultiplied order must still be rejected.
+    #[test]
+    fn cfd_buy_is_rejected_when_only_the_unscaled_notional_is_funded() {
+        let mut exchange = make_cfd_exchange("10000", FeeModelConfig::default());
+
+        let (response, notifications) =
+            exchange.open_order(cfd_request(Side::Buy, "1"), market_prices("5000"));
+
+        assert!(notifications.is_none());
+        match response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(
+                crate::error::OrderError::Rejected(ApiError::BalanceInsufficient(ref asset, _)),
+            )) => {
+                assert_eq!(*asset, AssetNameExchange::new("usd"));
+            }
+            other => panic!("expected BalanceInsufficient, got: {other:?}"),
+        }
+    }
+
+    /// Fees stay quote-denominated on both sides of a CFD, and are debited on top of the notional.
+    #[test]
+    fn cfd_fee_is_quote_denominated_on_both_sides() {
+        for side in [Side::Buy, Side::Sell] {
+            let mut exchange = make_cfd_exchange(
+                "200000",
+                // 0.1% of the scaled notional.
+                FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") }),
+            );
+
+            let (response, notifications) =
+                exchange.open_order(cfd_request(side, "1"), market_prices("5000"));
+
+            assert!(
+                response.state.is_accepted(),
+                "{side:?} should fill: {:?}",
+                response.state
+            );
+            let notifications = notifications.expect("successful fill must notify");
+            assert_eq!(
+                notifications.trade.fees.asset,
+                AssetNameExchange::new("usd"),
+                "{side:?} fee asset"
+            );
+
+            let fee = notifications.trade.fees.fees;
+            assert_eq!(
+                notifications.balance.0.balance.free,
+                d("200000") - d("125000") - fee,
+                "{side:?} debit must be notional + fee"
+            );
+        }
+    }
+
+    /// The documented caller obligation: the **quote** asset must be funded, even when the CFD
+    /// settles in another currency. This mock has no conversion rate, so it cannot fall back to the
+    /// settlement asset, and an unfunded quote balance is a mis-specified fixture rather than a
+    /// runtime condition.
+    #[test]
+    #[should_panic(expected = "MockExchange has Balance for all configured Instrument assets")]
+    fn cfd_panics_when_the_quote_asset_is_unfunded() {
+        // A realistically funded GBP account: the settlement asset is present, the quote asset is
+        // not. The mock cannot convert between them, so this is a mis-specified fixture.
+        let mut exchange = make_cfd_exchange_with_balances(
+            vec![AssetBalance {
+                asset: AssetNameExchange::new("gbp"),
+                balance: Balance::new(d("200000"), d("200000")),
+                time_exchange: Utc::now(),
+            }],
+            FeeModelConfig::default(),
+        );
+
+        let _ = exchange.open_order(cfd_request(Side::Buy, "1"), market_prices("5000"));
     }
 
     #[test]

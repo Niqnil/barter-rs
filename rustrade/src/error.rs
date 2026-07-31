@@ -18,19 +18,33 @@ pub enum BarterError {
     #[error("market data: {0}")]
     MarketData(#[from] DataError),
 
-    /// A backtest market data source failed, or violated a
-    /// [`BacktestMarketData`](crate::backtest::market_data::BacktestMarketData) caller obligation.
-    ///
-    /// Reaching a caller as the result of a backtest means the run was **aborted** — any statistics
-    /// it would have produced would cover only the portion of the dataset that was read.
-    #[error("backtest market data: {0}")]
-    BacktestMarketData(String),
-
     #[error("execution: {0}")]
     Execution(#[from] ExecutionError),
 
     #[error("JoinError: {0}")]
     JoinError(String),
+
+    /// A backtest market data source failed, or violated a
+    /// [`BacktestMarketData`](crate::backtest::market_data::BacktestMarketData) caller obligation.
+    ///
+    /// Reaching a caller as the result of a backtest means the run was **aborted** — any statistics
+    /// it would have produced would cover only the portion of the dataset that was read.
+    ///
+    /// # Why a `String` rather than a typed source
+    /// `BarterError` derives `Clone`, `Eq`, `Ord`, `Hash` and both serde impls, so every payload
+    /// must too. The sources this reports are caller-supplied and provider-specific — the LSE
+    /// integration's own error is deliberately neither `Clone` nor `PartialEq`, matching every
+    /// REST-backed integration in `rustrade-data` — so no typed variant could hold one. A source
+    /// whose failure *is* a [`DataError`] should surface as [`MarketData`](Self::MarketData), which
+    /// keeps the cause; this variant is for everything else, plus this crate's own obligation
+    /// diagnostics.
+    ///
+    /// # Appended deliberately
+    /// New variants belong at the end. `BarterError` derives `Ord`/`PartialOrd` from declaration
+    /// order and `Serialize`/`Deserialize`, so inserting mid-enum reorders every comparison and
+    /// shifts the variant index any index-based serializer writes.
+    #[error("backtest market data: {0}")]
+    BacktestMarketData(String),
 }
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 #[error("RxDropped")]

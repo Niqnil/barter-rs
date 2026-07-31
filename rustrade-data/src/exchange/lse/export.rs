@@ -73,6 +73,15 @@ const HASH_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Size of the write buffer coalescing download chunks before they reach the `.part` file.
 const DOWNLOAD_BUFFER_BYTES: usize = 256 * 1024;
 
+/// Total deadline for one artifact transfer, overriding the client's JSON-shaped one.
+///
+/// The shared client sets a 30 s *total* deadline, which `reqwest` applies through to the end of the
+/// response body — correct for a page of JSON, fatal for a multi-gigabyte artifact, which would abort
+/// at 30 s however healthy the connection. Six hours covers a 7 GB artifact on a link as slow as
+/// ~3 Mbit/s. It is a backstop, not the failure detector: a stall is caught in seconds by the
+/// client's per-read timeout, and an interrupted transfer resumes from the `.part` file.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// The literal the provider treats as a symbol rather than as "every symbol".
 const ALL_SYMBOLS_LITERAL: &str = "all";
 
@@ -208,21 +217,21 @@ impl LseExportRequest {
         // Rejecting the resolution before the request is sent, not after being billed for a 400.
         let _ = timeframe.as_lse_str()?;
 
-        // Exact match, deliberately NOT case-insensitive: `ALL` is Allstate's real ticker (verified
-        // live against the provider's own price endpoint), and rejecting it would forbid a correct
-        // export with no escape hatch. "Matches nothing" is a property of the (dataset, symbol)
-        // pair, not of this string alone. Lowercase is safe to reject because the provider
-        // publishes symbols uppercase, so `all` is nobody's real symbol - and the decoder's
-        // symbol-column assert would reject the artifact anyway.
-        if symbol == ALL_SYMBOLS_LITERAL {
+        // Case-insensitive with one exact-match escape hatch: `ALL` is Allstate's real ticker
+        // (verified live against the provider's own price endpoint), so rejecting *that* spelling
+        // would forbid a correct export with no way around it. Every other casing -- `all`, `All`,
+        // `aLL` -- is nobody's real symbol, because the provider publishes symbols uppercase, and
+        // title case is exactly what a spreadsheet produces. Each one costs a billed export to
+        // discover it matched nothing, so the guard covers them rather than only the lowercase form.
+        if symbol != "ALL" && symbol.eq_ignore_ascii_case(ALL_SYMBOLS_LITERAL) {
             return Err(LseError::InvalidInput {
                 message: format!(
-                    "symbol {ALL_SYMBOLS_LITERAL:?} is a literal the provider matches against the \
-                     symbol column, not a request for every symbol: an export naming it returns a \
-                     valid but EMPTY artifact, with no error, and still consumes one of five \
-                     hourly exports - name a real symbol instead. Measured on both the candle and \
-                     the tick path; every artifact this provider will produce is single-symbol. \
-                     (If you meant Allstate, its symbol is uppercase {:?}.)",
+                    "symbol {symbol:?} is a literal the provider matches against the symbol \
+                     column, not a request for every symbol: an export naming it returns a valid \
+                     but EMPTY artifact, with no error, and still consumes one of five hourly \
+                     exports - name a real symbol instead. Measured on both the candle and the \
+                     tick path; every artifact this provider will produce is single-symbol. (If \
+                     you meant Allstate, its symbol is exactly {:?}, uppercase.)",
                     ALL_SYMBOLS_LITERAL.to_uppercase()
                 ),
             });
@@ -431,6 +440,35 @@ pub struct LseExportJobStatus {
     /// The provider's internal source table, e.g. `candles_etf_1d` or `ticks_fx`.
     #[serde(default)]
     pub table_name: Option<String>,
+
+    /// What the provider says this job covers, echoed back in its own spelling.
+    ///
+    /// Retained rather than discarded because this provider **silently substitutes defaults for
+    /// parameters it does not recognise**: a misspelled field name earns a `200` and an artifact
+    /// covering something other than what was asked for. These echoes are the only client-side
+    /// evidence of what a job actually covers, so
+    /// [`download_export`](LseVaultClient::download_export) checks each present one against the
+    /// request it was handed. Kept as strings — the provider's own vocabulary — rather than parsed,
+    /// so an unexpected spelling is reported as a mismatch instead of failing to decode a job that
+    /// is otherwise fine.
+    #[serde(default)]
+    pub dataset: Option<String>,
+
+    /// See [`dataset`](Self::dataset).
+    #[serde(default)]
+    pub symbol: Option<String>,
+
+    /// See [`dataset`](Self::dataset).
+    #[serde(default)]
+    pub timeframe: Option<String>,
+
+    /// See [`dataset`](Self::dataset).
+    #[serde(default)]
+    pub start: Option<String>,
+
+    /// See [`dataset`](Self::dataset).
+    #[serde(default)]
+    pub end: Option<String>,
 }
 
 /// A downloaded export artifact, with the provenance needed to decode it safely.
@@ -574,6 +612,13 @@ impl LseVaultClient {
     /// this integration exposes the allowance signal and never decides pacing on the consumer's
     /// behalf.
     ///
+    /// `timeout` bounds the call whatever `poll_interval` is — the sleep is cut short at the deadline
+    /// rather than run in full — so a long interval paired with a short timeout reports
+    /// [`LseError::ExportTimeout`] promptly instead of blocking for an interval first. One status
+    /// request is still in flight when the deadline passes, so the call can overrun it by that
+    /// request's duration. A `timeout` so large that it would overflow the clock (`Duration::MAX`,
+    /// used as a "no timeout" sentinel) saturates rather than panicking.
+    ///
     /// # Errors
     /// - [`LseError::ExportFailed`] if the job reaches `failed` or `expired`.
     /// - [`LseError::ExportTimeout`] if `timeout` elapses first. The job keeps building — the
@@ -586,7 +631,13 @@ impl LseVaultClient {
         poll_interval: Duration,
         timeout: Duration,
     ) -> Result<LseExportJobStatus, LseError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        // `Instant + Duration` panics on overflow, and `Duration::MAX` is a plausible "no timeout"
+        // sentinel for a caller to pass. Saturating at a far-future instant makes that mean what the
+        // caller intended rather than aborting the process.
+        let now = tokio::time::Instant::now();
+        let deadline = now
+            .checked_add(timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
 
         loop {
             let status = self.export_status(job_id).await?;
@@ -612,15 +663,31 @@ impl LseVaultClient {
                 });
             }
 
-            tokio::time::sleep(poll_interval).await;
+            // Never sleeps past the deadline, so `timeout` bounds the call whatever `poll_interval`
+            // is. Sleeping the full interval first would let `poll_interval = 60s, timeout = 5s`
+            // block for a minute before reporting a timeout it had already passed.
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll_interval))
+                .await;
         }
     }
 
     /// Download a `ready` export artifact to `destination`.
     ///
+    /// # Transfer bound
+    /// The shared client applies a 30 s **total** deadline, which `reqwest` runs through to the end
+    /// of the response body — right for a page of JSON, fatal for an artifact, since a transfer
+    /// longer than 30 s would abort mid-body however healthy the connection. This request therefore
+    /// overrides it with a six-hour backstop (enough for a 7 GB artifact on a ~3 Mbit/s link) and
+    /// relies on the client's **per-read** timeout to detect an actual stall in seconds. An
+    /// interrupted transfer resumes rather than restarting, so a slower link than that still
+    /// converges across calls.
+    ///
     /// # Resume and integrity
-    /// Downloads into `destination` + `.part`, resuming an interrupted transfer with a `Range`
-    /// request (the provider advertises `Accept-Ranges: bytes` and answers `206`). A `206` is
+    /// Downloads into `destination` + `.<job id>.part`, resuming an interrupted transfer with a
+    /// `Range` request (the provider advertises `Accept-Ranges: bytes` and answers `206`). The
+    /// in-progress file is scoped to the **job**, not to the destination alone, so a leftover can
+    /// only ever be a prefix of the artifact this call is fetching — one job never resumes onto
+    /// another's bytes. A `206` is
     /// accepted only if its `Content-Range` starts at the byte that was asked for; a `416` is
     /// treated as "the `.part` already holds the whole artifact" rather than as a failure, so a
     /// transfer interrupted between the final write and the rename still converges. On completion
@@ -633,7 +700,11 @@ impl LseVaultClient {
     /// guarantee the provider makes. A `ready` job missing one is downloaded and renamed with that
     /// check skipped, and a `warn!` naming the skipped check is emitted. Skipping is deliberate:
     /// refusing an artifact the provider considers ready, over metadata this integration merely
-    /// expects, would forbid a correct download with no way around it.
+    /// expects, would forbid a correct download with no way around it. A job reporting **neither**
+    /// field additionally ignores any pre-existing `.part` and transfers the artifact in full, so
+    /// what lands at `destination` is at least something this call fetched end to end rather than a
+    /// leftover accepted on the strength of its filename. A download consumes no export allowance,
+    /// so that costs bandwidth only.
     ///
     /// # ⚠️ Caller obligation: one download per destination at a time
     /// Concurrent calls sharing a `destination` are **not supported**. Each reads the `.part` file's
@@ -641,12 +712,14 @@ impl LseVaultClient {
     /// against independently-primed hashers, corrupting the `.part` or failing verification
     /// spuriously. Serialise them, or give each its own destination.
     ///
-    /// The `.part` is normally **kept**, so re-calling resumes rather than restarting. The one
-    /// exception is a `.part` that failed verification after this call appended nothing to it —
-    /// either it already looked complete from the job's byte count, or the server rejected the
-    /// resume `Range` as unsatisfiable. Either way it belongs to a *different* job that used this
-    /// destination, so it is removed and a re-call restarts. Keeping it would fail identically
-    /// forever. [`LseError::IntegrityMismatch`] reports which happened via `discarded`.
+    /// A `.part` that failed verification is **kept when it is incomplete and discarded when it is
+    /// corrupt**, which is decided by *which* check failed rather than by whether this call happened
+    /// to append anything. Shorter than the artifact means a truncated transfer, so the bytes are a
+    /// valid prefix and a re-call resumes from them — for a multi-gigabyte artifact that is the
+    /// difference between finishing and starting over. Longer than the artifact, or the right length
+    /// at the wrong digest with nothing left to fetch, means corrupt: the file is removed so a
+    /// re-call restarts rather than failing identically forever. [`LseError::IntegrityMismatch`]
+    /// reports which happened via `discarded`.
     ///
     /// The URL is built from the client's base URL and the job id rather than from the job's
     /// `download_url`, preserving this client's invariant that it only ever requests URLs it
@@ -678,8 +751,10 @@ impl LseVaultClient {
             });
         }
 
+        verify_job_covers_request(job, request)?;
+
         let destination = destination.as_ref();
-        let part = part_path(destination);
+        let part = part_path(destination, &job.id);
 
         if let Some(parent) = destination
             .parent()
@@ -693,8 +768,21 @@ impl LseVaultClient {
                 })?;
         }
 
+        // A job reporting neither `bytes` nor `sha256` offers nothing to verify against, so a
+        // pre-existing `.part` cannot be checked even once it is complete — resuming onto it would
+        // rename an unverified file into place on the strength of its name alone, having fetched
+        // none of it. Re-downloading costs bandwidth and **no allowance** (the five-per-hour limit
+        // is on export *submits*), so the leftover is ignored and the transfer restarts. Every
+        // measured `ready` job reported both fields, so this is the unmeasured path rather than the
+        // normal one.
+        let verifiable = job.bytes.is_some() || job.sha256.is_some();
+
         // Hash the already-downloaded prefix so a resumed transfer still verifies end to end.
-        let (mut hasher, mut downloaded) = hash_existing_part(&part).await?;
+        let (mut hasher, mut downloaded) = if verifiable {
+            hash_existing_part(&part).await?
+        } else {
+            (Sha256::new(), 0)
+        };
 
         // A `.part` that already holds the whole artifact means a previous run was interrupted
         // between the final write and the rename. Re-requesting would only earn a 416. The
@@ -704,120 +792,42 @@ impl LseVaultClient {
         let mut complete = downloaded > 0 && job.bytes.is_some_and(|total| downloaded >= total);
 
         if !complete {
-            'download: {
-                let url = format!("{}/export/{}/download", self.base_url(), job.id);
-                let mut builder = self.http().get(&url);
-                if downloaded > 0 {
-                    builder =
-                        builder.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
-                }
+            let transferred = self.transfer_export(job, &part, hasher, downloaded).await?;
 
-                let response = builder.send().await?;
-                let status = response.status();
-
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    return Err(self.quota_exceeded().await);
-                }
-
-                // A `416` answers a `Range` starting at or past the artifact's length: the `.part`
-                // already holds everything the server has. That is precisely the case the `complete`
-                // check above cannot decide for itself, because it needs `job.bytes` and the job is
-                // entitled to report `None` — verification tolerates that absence (see below), so
-                // resuming must too. Failing here instead would make the documented "re-calling
-                // resumes" never converge: every retry would re-request the same unsatisfiable range.
-                // Whether those bytes are actually *this* job's artifact is still decided below.
-                if downloaded > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                    warn!(
-                        job_id = job.id,
-                        downloaded,
-                        "range request rejected as unsatisfiable; the existing part file already holds \
-                     the whole artifact"
-                    );
-                    complete = true;
-                    break 'download;
-                }
-
-                if !status.is_success() {
-                    let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
-                    return Err(LseError::Api {
-                        status: status.as_u16(),
-                        message: extract_detail(&body),
-                    });
-                }
-
-                // The server is entitled to ignore `Range` and answer `200` with the whole artifact.
-                // Restarting is then the only correct response — appending would duplicate the prefix.
-                let resuming = downloaded > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
-                if resuming {
-                    verify_resume_offset(&response, downloaded)?;
-                }
-                if downloaded > 0 && !resuming {
-                    warn!(
-                        job_id = job.id,
-                        downloaded, "range request answered in full; restarting the download"
-                    );
-                    hasher = Sha256::new();
-                    downloaded = 0;
-                }
-
-                let file = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(!resuming)
-                    .append(resuming)
-                    .open(&part)
-                    .await
-                    .map_err(|source| LseError::Io {
-                        message: format!("opening {}", part.display()),
-                        source,
-                    })?;
-
-                // Buffered because `tokio::fs` dispatches each write to the blocking pool: writing every
-                // HTTP chunk straight through costs one round trip per chunk, and artifacts run to
-                // gigabytes. An interrupted transfer loses at most one buffer of resume progress — the
-                // next call re-reads the `.part`'s real on-disk length, so it resumes correctly from
-                // whatever landed, just slightly further back.
-                let mut file = tokio::io::BufWriter::with_capacity(DOWNLOAD_BUFFER_BYTES, file);
-
-                let mut stream = response.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    hasher.update(&chunk);
-                    downloaded += chunk.len() as u64;
-                    file.write_all(&chunk)
-                        .await
-                        .map_err(|source| LseError::Io {
-                            message: format!("writing {}", part.display()),
-                            source,
-                        })?;
-                }
-
-                file.flush().await.map_err(|source| LseError::Io {
-                    message: format!("flushing {}", part.display()),
-                    source,
-                })?;
-            }
+            hasher = transferred.hasher;
+            downloaded = transferred.downloaded;
+            complete = transferred.exhausted;
         }
 
         let digest = hex::encode(hasher.finalize());
 
-        // Retaining the `.part` is only useful when this call appended something: those bytes are
-        // then a real prefix that a `Range` request can continue. `complete` means it appended
-        // nothing — either the transfer was skipped because a pre-existing `.part` already looked
-        // complete, or the server answered the resume `Range` with a 416. A failed check then proves
-        // that file is NOT this job's artifact — it is a leftover from a different job that used the
-        // same destination. Keeping it would fail identically on every retry, so the documented
-        // "re-calling resumes" would never converge. Discarding is loud, and only ever removes a
-        // file this integration is the sole writer of.
-        let discard = complete;
-
+        // The `.part` is scoped to this job (see `part_path`), so a leftover can only ever be a
+        // prefix of *this* artifact. What to do with a file that failed verification therefore
+        // follows from **which** check failed, rather than from the weaker "did this call append
+        // anything?" question:
+        //
+        // - **Shorter than the artifact**: the transfer was truncated — a dropped connection, a
+        //   closed stream. Those bytes are a valid prefix, so the file is KEPT and a re-call resumes
+        //   from it. For a multi-gigabyte artifact that is the difference between finishing and
+        //   starting over, and truncation is the common failure, not the rare one.
+        // - **Longer than the artifact**: it cannot be a prefix of anything, so it is corrupt.
+        //   DISCARDED, so a re-call restarts rather than failing identically forever.
+        // - **Right length (or no length reported), wrong digest**: with nothing left to fetch —
+        //   `complete`, i.e. the file already looked whole or the server answered the resume `Range`
+        //   with a `416` — the bytes on disk are all there will ever be, so they are corrupt and are
+        //   DISCARDED. Otherwise this call did append, and when no byte count was reported a short
+        //   read is indistinguishable from corruption: the file is KEPT so a re-call can resume, and
+        //   the call after that converges on the `416`.
+        //
+        // Discarding only ever removes a file this integration is the sole writer of.
         if let Some(expected) = job.bytes.filter(|expected| *expected != downloaded) {
+            let corrupt = downloaded > expected;
             return Err(self
                 .integrity_mismatch(
                     &part,
                     format!("{expected} bytes"),
                     format!("{downloaded} bytes"),
-                    discard,
+                    corrupt,
                 )
                 .await);
         }
@@ -828,7 +838,7 @@ impl LseVaultClient {
             .filter(|expected| !expected.eq_ignore_ascii_case(&digest))
         {
             return Err(self
-                .integrity_mismatch(&part, expected.clone(), digest, discard)
+                .integrity_mismatch(&part, expected.clone(), digest, complete)
                 .await);
         }
 
@@ -870,9 +880,148 @@ impl LseVaultClient {
         ))
     }
 
+    /// Fetch whatever of `job`'s artifact is not already in `part`, appending to it.
+    ///
+    /// `hasher` must already cover the `downloaded` bytes on disk, so that a resumed transfer still
+    /// verifies end to end.
+    ///
+    /// Split out of [`download_export`](Self::download_export) so that the decision of *what* to do
+    /// with the resulting file — resume, discard, rename — reads on its own, apart from the
+    /// mechanics of getting the bytes.
+    ///
+    /// # Errors
+    /// [`LseError::QuotaExceeded`] on a `429`, [`LseError::Api`] for any other non-success status,
+    /// [`LseError::Http`] for a transport failure mid-stream, and [`LseError::Io`] for a filesystem
+    /// failure. In every case the `.part` is left as it stands; the caller decides its fate.
+    async fn transfer_export(
+        &self,
+        job: &LseExportJobStatus,
+        part: &Path,
+        mut hasher: Sha256,
+        mut downloaded: u64,
+    ) -> Result<Transferred, LseError> {
+        // Held for the whole transfer, body included: an artifact download occupies a connection
+        // for as long as it runs, so counting it only while its headers are in flight would let
+        // the client exceed the provider's concurrency ceiling for hours.
+        let permit = self.enter_gate().await;
+
+        let url = format!("{}/export/{}/download", self.base_url(), job.id);
+        // Overrides the client's total deadline for this request only; see `DOWNLOAD_TIMEOUT`.
+        let mut builder = self.http().get(&url).timeout(DOWNLOAD_TIMEOUT);
+        if downloaded > 0 {
+            builder = builder.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
+        }
+
+        let response = builder.send().await?;
+        let status = response.status();
+
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Released before `quota_exceeded`, which issues a `usage` call that takes a permit of
+            // its own: holding this one across it would deadlock a client built with
+            // `with_concurrency(1)`.
+            drop(permit);
+            return Err(self.quota_exceeded().await);
+        }
+
+        // A `416` answers a `Range` starting at or past the artifact's length: the `.part` already
+        // holds everything the server has. That is precisely the case the caller's `complete` check
+        // cannot decide for itself, because it needs `job.bytes` and the job is entitled to report
+        // `None` — verification tolerates that absence, so resuming must too. Failing here instead
+        // would make the documented "re-calling resumes" never converge: every retry would
+        // re-request the same unsatisfiable range. Whether those bytes are actually *this* job's
+        // artifact is still decided by the caller's integrity checks.
+        if downloaded > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            warn!(
+                job_id = job.id,
+                downloaded,
+                "range request rejected as unsatisfiable; the existing part file already holds the \
+                 whole artifact"
+            );
+
+            return Ok(Transferred {
+                hasher,
+                downloaded,
+                exhausted: true,
+            });
+        }
+
+        if !status.is_success() {
+            let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
+            return Err(LseError::Api {
+                status: status.as_u16(),
+                message: extract_detail(&body),
+            });
+        }
+
+        // The server is entitled to ignore `Range` and answer `200` with the whole artifact.
+        // Restarting is then the only correct response — appending would duplicate the prefix.
+        let resuming = downloaded > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+        if resuming {
+            verify_resume_offset(&response, downloaded)?;
+        }
+        if downloaded > 0 && !resuming {
+            warn!(
+                job_id = job.id,
+                downloaded, "range request answered in full; restarting the download"
+            );
+            hasher = Sha256::new();
+            downloaded = 0;
+        }
+
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(!resuming)
+            .append(resuming)
+            .open(part)
+            .await
+            .map_err(|source| LseError::Io {
+                message: format!("opening {}", part.display()),
+                source,
+            })?;
+
+        // Buffered because `tokio::fs` dispatches each write to the blocking pool: writing every
+        // HTTP chunk straight through costs one round trip per chunk, and artifacts run to
+        // gigabytes. An interrupted transfer loses at most one buffer of resume progress — the next
+        // call re-reads the `.part`'s real on-disk length, so it resumes correctly from whatever
+        // landed, just slightly further back.
+        let mut file = tokio::io::BufWriter::with_capacity(DOWNLOAD_BUFFER_BYTES, file);
+
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            downloaded += chunk.len() as u64;
+            file.write_all(&chunk)
+                .await
+                .map_err(|source| LseError::Io {
+                    message: format!("writing {}", part.display()),
+                    source,
+                })?;
+        }
+
+        file.flush().await.map_err(|source| LseError::Io {
+            message: format!("flushing {}", part.display()),
+            source,
+        })?;
+
+        Ok(Transferred {
+            hasher,
+            downloaded,
+            // The stream ended, but without a byte count from the job there is no way to tell a
+            // complete artifact from a truncated one here. Reported as not exhausted so that a
+            // digest failure keeps the `.part` for a resume; the call after that converges on the
+            // `416` above.
+            exhausted: false,
+        })
+    }
+
     /// Issue an authenticated `POST` against a vault path and deserialise the JSON body.
     ///
     /// Accepts `202` as success — the export endpoint's normal answer.
+    ///
+    /// Rationed by the client's shared gate, exactly as `GET`s are: an export submission spends
+    /// the same allowance a candle page does.
     ///
     /// # Errors
     /// Maps a `429` to [`LseError::QuotaExceeded`], any other non-success status to
@@ -882,11 +1031,16 @@ impl LseVaultClient {
         B: Serialize + ?Sized,
         T: serde::de::DeserializeOwned,
     {
+        let permit = self.enter_gate().await;
+
         let url = format!("{}/{path}", self.base_url());
         let response = self.http().post(&url).json(body).send().await?;
         let status = response.status();
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // See `transfer_export`: `quota_exceeded` takes a permit of its own, so this one must
+            // go first or a single-permit client deadlocks.
+            drop(permit);
             return Err(self.quota_exceeded().await);
         }
 
@@ -909,10 +1063,11 @@ impl LseVaultClient {
     /// Build a [`LseError::IntegrityMismatch`], discarding the partial file when it cannot be
     /// resumed from.
     ///
-    /// `discard` is set when this call appended no bytes to the `.part` — it already looked
-    /// complete, or the resume `Range` came back `416` — so the file cannot be a partial download of
-    /// this job and no retry can advance it. A removal failure is logged rather than replacing the
-    /// integrity error, which is the more useful diagnostic of the two.
+    /// `discard` is set when the file is **corrupt** rather than merely **incomplete**: longer than
+    /// the artifact, or the right length at the wrong digest with nothing left to fetch. An
+    /// incomplete file is a valid prefix and is kept, so a re-call resumes from it instead of
+    /// re-transferring everything. A removal failure is logged rather than replacing the integrity
+    /// error, which is the more useful diagnostic of the two.
     async fn integrity_mismatch(
         &self,
         part: &Path,
@@ -925,9 +1080,9 @@ impl LseVaultClient {
                 path = %part.display(),
                 %expected,
                 %actual,
-                "a pre-existing partial file failed verification and this call appended no bytes to \
-                 it, so it cannot be a partial download of this job; discarding it so a re-call \
-                 restarts"
+                "the partial file is corrupt rather than incomplete -- it is longer than the \
+                 artifact, or complete at the wrong digest -- so it cannot be resumed; discarding \
+                 it so a re-call restarts"
             );
 
             if let Err(error) = tokio::fs::remove_file(part).await {
@@ -951,34 +1106,130 @@ impl LseVaultClient {
     /// Build a [`LseError::QuotaExceeded`] describing where the allowance stands.
     ///
     /// The export endpoints answer a `429` with no `Retry-After` and no rate-limit headers, so the
-    /// position has to be fetched. If that follow-up call fails there is nothing useful to report,
-    /// and the rejection is surfaced as a plain [`LseError::Api`] rather than a fabricated status.
+    /// position has to be fetched. A failed follow-up yields `status: None` rather than a fabricated
+    /// [`QuotaStatus`](super::quota::QuotaStatus) — and, importantly, **still**
+    /// [`LseError::QuotaExceeded`], so a caller pacing itself off that variant sees every exhausted
+    /// allowance rather than silently missing the ones where the follow-up call happened to fail too.
     async fn quota_exceeded(&self) -> LseError {
-        match self.usage().await {
-            Ok(status) => LseError::QuotaExceeded { status },
+        let status = match self.usage().await {
+            Ok(status) => Some(status),
             Err(error) => {
                 warn!(
                     %error,
                     "export allowance exhausted, and the follow-up usage call failed; reporting \
                      the rejection without an allowance position"
                 );
-                LseError::Api {
-                    status: reqwest::StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                    message: "export allowance exhausted; the allowance position could not be \
-                              retrieved"
-                        .to_owned(),
-                }
+                None
             }
-        }
+        };
+
+        LseError::QuotaExceeded { status }
     }
 }
 
-/// The in-progress filename for `destination`.
+/// What one call to [`LseVaultClient::transfer_export`] left on disk.
+struct Transferred {
+    /// Advanced over every byte of the `.part`, prefix included, so the digest is end to end.
+    hasher: Sha256,
+    /// The `.part`'s length afterwards.
+    downloaded: u64,
+    /// `true` when the server confirmed there is nothing left to fetch, which is the one thing a
+    /// byte count cannot say when the job reports none. It decides whether a later digest failure
+    /// means "corrupt, discard" or "truncated, keep and resume".
+    exhausted: bool,
+}
+
+/// Check that `job` describes `request`, on every dimension the provider echoed back.
 ///
-/// Appends to the whole filename rather than replacing the extension, so `x.parquet` becomes
-/// `x.parquet.part` and never collides with a sibling of a different type.
-fn part_path(destination: &Path) -> PathBuf {
+/// This provider **silently substitutes defaults for parameters it does not recognise**, so a
+/// misspelled field earns a `200` and an artifact covering something else — the failure mode a
+/// wiremock test already pins for the `timeframe` name. The status response echoes `dataset`,
+/// `symbol`, `timeframe`, `start` and `end`, and that echo is the only client-side evidence of what a
+/// job actually covers. Checking it here turns "decoded the wrong instrument's tape" into an error at
+/// the point the artifact is claimed, rather than a silent misattribution downstream.
+///
+/// A field the provider omits is not checked: absence is not disagreement, and refusing to download
+/// over metadata the provider never promised would forbid a correct download. `symbol` is compared
+/// case-insensitively — the provider publishes symbols uppercase but echoes back what was sent.
+fn verify_job_covers_request(
+    job: &LseExportJobStatus,
+    request: &LseExportRequest,
+) -> Result<(), LseError> {
+    let mismatch = |field: &str, requested: String, reported: &str| LseError::ExportJobMismatch {
+        job_id: job.id.clone(),
+        field: field.to_owned(),
+        requested,
+        reported: reported.to_owned(),
+    };
+
+    if let Some(reported) = job.dataset.as_deref() {
+        let requested = request.dataset().as_catalog_str();
+        if reported != requested {
+            return Err(mismatch("dataset", requested.to_owned(), reported));
+        }
+    }
+
+    if let Some(reported) = job.symbol.as_deref()
+        && !reported.eq_ignore_ascii_case(request.symbol())
+    {
+        return Err(mismatch("symbol", request.symbol().to_owned(), reported));
+    }
+
+    // `as_lse_str` is fallible only for a resolution this integration cannot express, which
+    // `LseExportRequest::new` already rejected -- so a request in hand always has one.
+    if let Some(reported) = job.timeframe.as_deref()
+        && let Ok(requested) = request.timeframe().as_lse_str()
+        && reported != requested
+    {
+        return Err(mismatch("timeframe", requested.to_owned(), reported));
+    }
+
+    if let Some(reported) = job.start.as_deref() {
+        let requested = request.range().start().to_string();
+        if reported != requested {
+            return Err(mismatch("start", requested, reported));
+        }
+    }
+
+    if let Some(reported) = job.end.as_deref() {
+        let requested = request.range().end().to_string();
+        if reported != requested {
+            return Err(mismatch("end", requested, reported));
+        }
+    }
+
+    Ok(())
+}
+
+/// The in-progress filename for one **job's** artifact: `x.parquet` becomes `x.parquet.<job>.part`.
+///
+/// Appends to the whole filename rather than replacing the extension, so it never collides with a
+/// sibling of a different type.
+///
+/// Scoped to the job rather than to the destination alone, which makes "a leftover in-progress file
+/// is a prefix of the artifact being fetched" an invariant of the *name*. Sharing one `.part` across
+/// jobs left that as an inference from whether the call had appended bytes — a test that cannot tell
+/// this job's prefix from a different job's, so a `.part` from an earlier job at the same destination
+/// was resumed onto, corrupting the result and costing a billed download to discover it.
+///
+/// The job id is an opaque provider token (measured: UUID-shaped). Any character outside
+/// `[A-Za-z0-9._-]` is replaced with `_`, so an id cannot introduce path components or escape the
+/// destination's directory.
+fn part_path(destination: &Path, job_id: &str) -> PathBuf {
     let mut name = destination.as_os_str().to_owned();
+    name.push(".");
+    name.push(
+        job_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>(),
+    );
     name.push(".part");
     PathBuf::from(name)
 }

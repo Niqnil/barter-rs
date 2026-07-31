@@ -334,7 +334,8 @@ fn bench_aux_seam(c: &mut Criterion) {
         },
     } = serde_json::from_str(CONFIG).unwrap();
 
-    let (args_constant, num_events) = args_constant_seam(instruments, executions);
+    let (args_constant, market_events) = args_constant_seam(instruments, executions);
+    let num_events = market_events.len();
     let args_dynamic = args_dynamic_seam(risk_free_return);
 
     let mut group = c.benchmark_group("Backtest AuxSeam");
@@ -371,10 +372,16 @@ fn bench_aux_seam(c: &mut Criterion) {
             .unwrap();
 
         b.iter_batched(
-            || (Arc::clone(&args_constant), args_dynamic.clone()),
-            |(constant, dynamic)| {
+            || {
+                (
+                    Arc::clone(&args_constant),
+                    Arc::clone(&market_events),
+                    args_dynamic.clone(),
+                )
+            },
+            |(constant, events, dynamic)| {
                 rt.block_on(async move {
-                    backtest_market_only(constant, dynamic, AuditMode::Disabled)
+                    backtest_market_only(constant, events, dynamic, AuditMode::Disabled)
                         .await
                         .unwrap()
                 })
@@ -417,7 +424,8 @@ fn bench_audit_seam(c: &mut Criterion) {
         },
     } = serde_json::from_str(CONFIG).unwrap();
 
-    let (args_constant, num_events) = args_constant_seam(instruments, executions);
+    let (args_constant, market_events) = args_constant_seam(instruments, executions);
+    let num_events = market_events.len();
     let args_dynamic = args_dynamic_seam(risk_free_return);
 
     let mut group = c.benchmark_group("Backtest AuditSeam");
@@ -436,10 +444,16 @@ fn bench_audit_seam(c: &mut Criterion) {
             .unwrap();
 
         b.iter_batched(
-            || (Arc::clone(&args_constant), args_dynamic.clone()),
-            |(constant, dynamic)| {
+            || {
+                (
+                    Arc::clone(&args_constant),
+                    Arc::clone(&market_events),
+                    args_dynamic.clone(),
+                )
+            },
+            |(constant, events, dynamic)| {
                 rt.block_on(async move {
-                    backtest_market_only(constant, dynamic, AuditMode::Disabled)
+                    backtest_market_only(constant, events, dynamic, AuditMode::Disabled)
                         .await
                         .unwrap()
                 })
@@ -456,10 +470,16 @@ fn bench_audit_seam(c: &mut Criterion) {
             .unwrap();
 
         b.iter_batched(
-            || (Arc::clone(&args_constant), args_dynamic.clone()),
-            |(constant, dynamic)| {
+            || {
+                (
+                    Arc::clone(&args_constant),
+                    Arc::clone(&market_events),
+                    args_dynamic.clone(),
+                )
+            },
+            |(constant, events, dynamic)| {
                 rt.block_on(async move {
-                    backtest_market_only(constant, dynamic, AuditMode::Enabled)
+                    backtest_market_only(constant, events, dynamic, AuditMode::Enabled)
                         .await
                         .unwrap()
                 })
@@ -479,13 +499,18 @@ fn bench_audit_seam(c: &mut Criterion) {
 /// derived, so `SystemBuild` accepts the raw `MarketStreamEvent` stream via its
 /// `Event: From<MarketStream::Item>` bound.
 ///
-/// # ⚠️ One deliberate divergence, and what it costs the numbers
-/// Since the market stream became fallible, this baseline unwraps the `Result` with a `filter_map`
-/// combinator where production does it in an inline `match` inside `poll_next` (see the comment at
-/// the call site). The A/B **delta** this benchmark exists to measure stays valid — both arms of
-/// every comparison here carry the same combinator — but **absolute** figures are no longer
-/// comparable against `--save-baseline` snapshots taken before that change. Re-baseline rather than
-/// comparing across it.
+/// # Why the baseline builds its own stream instead of calling `market_data.stream()`
+/// [`BacktestMarketData::stream`] is fallible, and production unwraps each `Result` in an inline
+/// `match` inside `TimedMergeStream::poll_next` — the very thing under measurement. Reaching for
+/// `.filter_map(|event| ready(event.ok()))` here would put a combinator layer plus a `Ready` future
+/// per event into the *baseline*, so arm B would carry work arm A does not and the seam cost this
+/// group exists to guard would be understated, possibly to zero. `market_events` is therefore the
+/// same `Arc<Vec<_>>` the fixture handed [`MarketDataInMemory`], replayed through the same
+/// lazy-clone iterator that type uses — minus the `Ok` wrapper it only adds to satisfy the trait.
+/// The merge is then the single difference between the arms.
+///
+/// **Absolute** figures still are not comparable against `--save-baseline` snapshots taken before
+/// the market stream became fallible. Re-baseline rather than comparing across it.
 ///
 /// `audit_mode` parameterises this baseline for two A/Bs: the aux-seam group always passes
 /// [`AuditMode::Disabled`], while [`bench_audit_seam`] runs it at both modes so the throughput delta
@@ -493,19 +518,14 @@ fn bench_audit_seam(c: &mut Criterion) {
 /// concurrently (see below), so the send actually enqueues to and is consumed by a live receiver.
 async fn backtest_market_only(
     args_constant: Arc<SeamConstant>,
+    market_events: Arc<Vec<MarketStreamEvent<InstrumentIndex, DataKind>>>,
     args_dynamic: SeamDynamic,
     audit_mode: AuditMode,
 ) -> Result<BacktestSummary<Daily>, BarterError> {
     let market_first = args_constant.market_data.time_first_event().await?;
-    // `MarketDataInMemory` cannot fail mid-stream, so the fallible item is unwrapped here rather
-    // than routed through the abort path `backtest` implements. This baseline exists to measure the
-    // merge seam's overhead, and adding error handling the fixture can never exercise would put
-    // work in the measured path that the real path does not do.
-    let raw_market = args_constant
-        .market_data
-        .stream()
-        .await?
-        .filter_map(|event| std::future::ready(event.ok()));
+    let raw_market = futures::stream::iter(
+        (0..market_events.len()).map(move |index| market_events[index].clone()),
+    );
     let clock = HistoricalClock::new(market_first);
 
     let ExecutionBuild {
@@ -662,17 +682,20 @@ impl
     }
 }
 
-/// Build the shared constants for the aux-seam A/B, returning the market-event count so the group can
-/// report events/sec.
+/// Build the shared constants for the aux-seam A/B, returning the market events themselves so each
+/// group can report events/sec and so [`backtest_market_only`] can replay the *same* fixture without
+/// going through the fallible [`BacktestMarketData`] stream.
 fn args_constant_seam(
     instruments: Vec<InstrumentConfig>,
     executions: Vec<ExecutionConfig>,
-) -> (Arc<SeamConstant>, usize) {
+) -> (
+    Arc<SeamConstant>,
+    Arc<Vec<MarketStreamEvent<InstrumentIndex, DataKind>>>,
+) {
     let instruments = IndexedInstruments::new(instruments);
 
-    let market_events = market_data_from_file(FILE_PATH_MARKET_DATA_INDEXED);
-    let num_events = market_events.len();
-    let market_data = MarketDataInMemory::new(Arc::new(market_events));
+    let market_events = Arc::new(market_data_from_file(FILE_PATH_MARKET_DATA_INDEXED));
+    let market_data = MarketDataInMemory::new(Arc::clone(&market_events));
     let time_engine_start = DateTime::<Utc>::from_str("2025-03-25T23:07:00.773674205Z").unwrap();
 
     let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
@@ -691,7 +714,7 @@ fn args_constant_seam(
             engine_state,
             aux_events: NoAuxEvents,
         }),
-        num_events,
+        market_events,
     )
 }
 

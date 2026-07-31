@@ -1,6 +1,9 @@
 use crate::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use chrono::{DateTime, Utc};
-use futures::{Stream, StreamExt, stream::Peekable};
+use futures::{
+    Stream, StreamExt,
+    stream::{FusedStream, Peekable},
+};
 use rustrade_instrument::exchange::ExchangeId;
 use std::{
     pin::Pin,
@@ -125,6 +128,22 @@ where
     }
 }
 
+impl<St, InstrumentKey, Kind, Error> FusedStream for TimeSortedMerge<St, InstrumentKey, Kind, Error>
+where
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, Kind>, Error>>,
+{
+    /// Terminated exactly when every input is.
+    ///
+    /// `Peekable` is itself a [`FusedStream`], and `poll_next` above returns `Poll::Ready(None)`
+    /// precisely when no input has either a buffered event or an outstanding poll — which is this
+    /// condition. Implementing it means the normal backtest shape, a `select!` over the merged
+    /// feed and a control channel, does not need a redundant `.fuse()` wrapper that would only
+    /// re-derive a property the merge already has.
+    fn is_terminated(&self) -> bool {
+        self.inputs.iter().all(|input| input.is_terminated())
+    }
+}
+
 /// Tag a stream of provider payloads as [`MarketStreamEvent::Item`]s for one instrument.
 ///
 /// The N=1 building block for [`merge_time_sorted`]: historical fetches are typically per-symbol
@@ -215,6 +234,24 @@ mod tests {
         merge_time_sorted(inputs.into_iter().map(futures::stream::iter))
             .collect::<Vec<_>>()
             .await
+    }
+
+    #[tokio::test]
+    async fn the_merge_reports_itself_terminated_once_every_input_has_ended() {
+        // `FusedStream` is what lets a `select!` over the merged feed and a control channel -- the
+        // normal backtest shape -- skip a redundant `.fuse()`. It has to be true before exhaustion
+        // as well as after, or a `select!` would drop the merge on its first poll.
+        let mut merged = merge_time_sorted(
+            vec![vec![item(0, 10)], vec![item(1, 20)]]
+                .into_iter()
+                .map(futures::stream::iter),
+        );
+
+        assert!(!merged.is_terminated());
+
+        while merged.next().await.is_some() {}
+
+        assert!(merged.is_terminated());
     }
 
     #[tokio::test]

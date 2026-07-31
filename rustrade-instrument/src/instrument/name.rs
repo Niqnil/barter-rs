@@ -39,11 +39,10 @@ impl InstrumentNameInternal {
     where
         for<'a> &'a Ass: Into<&'a AssetNameExchange>,
     {
-        // `as_str()`, NOT the `Display` impl: `ExchangeId` derives `derive_more::Display`
-        // with no format attribute, so `{exchange}` renders the *variant* name
-        // (`BinanceSpot` -> lowercased `binancespot`), while `as_str()` yields the
-        // canonical `binance_spot`. Interpolating the `ExchangeId` directly here is the
-        // bug this spelling exists to prevent.
+        // Named explicitly rather than interpolating the `ExchangeId`. The two now agree --
+        // `ExchangeId`'s `Display` delegates to `as_str` -- but this is an identity key, and it
+        // costs nothing to depend on the one spelling that is defined to be canonical rather than
+        // on a `Display` impl remaining a delegation.
         let exchange = exchange.as_str();
         Self::new(format_smolstr!(
             "{exchange}-{}_{}",

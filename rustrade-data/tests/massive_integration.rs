@@ -145,9 +145,13 @@ async fn test_rest_aggregates_crypto() {
         let candle = result.expect("Failed to fetch candle");
         assert!(candle.open > Decimal::ZERO, "Open should be positive");
         assert!(candle.high >= candle.low, "High should be >= low");
+        // `is_some_and`, not `is_none_or`: crypto aggregates carry a real traded volume (unlike
+        // the forex tape, whose `v` is a tick count and is therefore reported as `None`), so
+        // accepting `None` here would pass a decoder that had stopped populating the field.
         assert!(
-            candle.volume.is_none_or(|v| v >= Decimal::ZERO),
-            "Volume should be non-negative when present"
+            candle.volume.is_some_and(|v| v >= Decimal::ZERO),
+            "Volume {:?} is absent or negative; crypto aggregates always carry one",
+            candle.volume
         );
         count += 1;
 

@@ -24,7 +24,9 @@
 //!
 //! # Skip vs. fail contract
 //!
-//! - `LSE_API_KEY` unset → **SKIP** (logged, test passes), so CI without secrets stays green.
+//! - `LSE_API_KEY` **unset** → **SKIP** (logged, test passes), so CI without secrets stays green.
+//! - `LSE_API_KEY` set but unusable → **FAIL**. A skip here would be indistinguishable from "no
+//!   secrets configured", so a mistyped key would report green forever.
 //! - Key present but the assertion fails → **FAIL** (the real signal).
 //!
 //! # Running
@@ -45,15 +47,24 @@ use rustrade_data::subscription::candle::{Candle, CandleInterval};
 
 const KEY_ENV: &str = "LSE_API_KEY";
 
-/// Build a client, or `None` when the key is absent (skip rather than fail).
+/// Build a client, or `None` when the key is **absent** (skip rather than fail).
+///
+/// Only an unset variable skips. A key that is *set but unusable* — a stray newline from a `.env`
+/// edit, a mis-encoded paste — is a misconfiguration, and reporting it as a skip would let this
+/// canary pass green while never once reaching the provider, which is exactly the state it exists
+/// to detect. The error is safe to print: [`LseError`] redacts the key from every message.
+///
+/// [`LseError`]: rustrade_data::exchange::lse::error::LseError
 fn client() -> Option<LseVaultClient> {
-    match LseVaultClient::from_env() {
-        Ok(client) => Some(client),
-        Err(error) => {
-            println!("CANARY_SKIP: no usable {KEY_ENV} ({error}) - skipping");
-            None
-        }
+    if std::env::var_os(KEY_ENV).is_none() {
+        println!("CANARY_SKIP: {KEY_ENV} is not set - skipping");
+        return None;
     }
+
+    Some(
+        LseVaultClient::from_env()
+            .unwrap_or_else(|error| panic!("{KEY_ENV} is set but unusable: {error}")),
+    )
 }
 
 /// Assert the bars actually arrived at the resolution that was requested.

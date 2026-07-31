@@ -32,10 +32,33 @@ use std::{marker::PhantomData, sync::Arc};
 ///
 /// A source that cannot fail mid-stream (e.g. [`MarketDataInMemory`]) simply yields `Ok`.
 ///
-/// # Memory model
-/// The time-merge consumes this stream **lazily** (it is polled on demand, never collected), so the
-/// harness's memory overhead is O(1) in the dataset size — a source streamed item-by-item stays
-/// streamed end to end.
+/// # Memory model, and the obligation it puts on the implementation
+/// The time-merge consumes this stream **lazily** — polled on demand, never collected — and buffers
+/// at most one item per input. That is necessary for a dataset larger than memory, but on its own it
+/// is **not sufficient**, and the difference matters:
+///
+/// The harness forwards this stream into the engine's feed channel, which is **unbounded**. Whatever
+/// the engine has not yet processed sits in that channel. So peak memory tracks how far the source
+/// runs ahead of the engine, not how lazily it is polled — and a source that never returns
+/// `Poll::Pending` never lets the engine run at all until it is exhausted. A blocking iterator
+/// wrapped in [`futures::stream::iter`] is exactly that shape: the entire artifact is decoded and
+/// enqueued before the first event is handled, which is O(dataset), not O(1).
+///
+/// **An implementation is therefore responsible for bounding its own read-ahead** — for yielding
+/// `Pending` rather than running to exhaustion. A network-paced source (a paginated fetch) does so
+/// incidentally, because awaiting a response yields. A local decoder does not, and must be bridged:
+/// [`stream_blocking_iter`](rustrade_data::streams::blocking::stream_blocking_iter) moves the decode
+/// to a blocking thread and parks it whenever it gets a fixed number of events ahead of *that
+/// channel's reader*.
+///
+/// That reader is the time-merge, **not the engine**, so this is not an end-to-end memory bound. The
+/// harness forwards the merged stream into the unbounded feed channel with a synchronous send that
+/// never waits on capacity, and no implementation of this trait can change that — the feed channel is
+/// harness-side. What the bridge buys is real but narrower: the artifact is no longer decoded in one
+/// uninterruptible burst before the engine runs, so decoding overlaps processing instead of preceding
+/// it. Peak memory still tracks how far the engine lags the source. Bounding it outright needs the
+/// feed channel itself to apply back-pressure, which it does not today — see
+/// <https://github.com/Niqnil/rustrade/issues/220>.
 pub trait BacktestMarketData {
     /// The type of market events provided by this data source.
     type Kind;
@@ -141,8 +164,12 @@ impl<Kind> MarketDataInMemory<Kind> {
 /// Lazily streamed market data, produced on demand by a caller-supplied factory.
 ///
 /// The counterpart to [`MarketDataInMemory`] for datasets that cannot be resident: a multi-gigabyte
-/// Parquet export, a compressed tick archive, or a paginated provider fetch. Memory overhead is
-/// O(1) in the dataset size, because the harness never collects the stream.
+/// Parquet export, a compressed tick archive, or a paginated provider fetch. The harness never
+/// collects the stream, so nothing here scales with the dataset — but see
+/// [the trait's memory model](BacktestMarketData#memory-model-and-the-obligation-it-puts-on-the-implementation):
+/// bounding read-ahead is the **factory's** job, and a blocking decoder handed straight to
+/// [`futures::stream::iter`] will still park the whole artifact in the engine's feed channel. Bridge
+/// it with [`stream_blocking_iter`](rustrade_data::streams::blocking::stream_blocking_iter).
 ///
 /// # The factory
 /// `factory` is called **once per [`stream`](BacktestMarketData::stream) invocation** and returns a
@@ -159,7 +186,8 @@ impl<Kind> MarketDataInMemory<Kind> {
 /// its runs, so N strategy configurations cost **1 + N** full source reads — where
 /// [`MarketDataInMemory`] would cost one `Arc` clone each.
 ///
-/// That is the deliberate price of O(1) memory, and it is the right trade for a local file. It is
+/// That is the deliberate price of streaming rather than holding the dataset, and it is the right
+/// trade for a local file. It is
 /// usually the **wrong** trade against a metered or rate-limited network source, where 1 + N reads
 /// multiply both latency and quota consumption: fetch once to a local file (or, for a small enough
 /// slice, into [`MarketDataInMemory`]) and stream from that instead.

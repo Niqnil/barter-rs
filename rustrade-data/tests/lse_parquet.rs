@@ -4,6 +4,12 @@
 //! shaped from measurements of the live API. No provider data is committed — the provider
 //! prohibits redistribution (<https://londonstrategicedge.com/terms>).
 //!
+//! What is measured is the *shape*: which columns each dataset publishes, their types and
+//! nullability, and what `ts` means. **Every number is invented** — deliberately round and
+//! obviously synthetic, so that no row here can be mistaken for a real quote or bar. Decoding is
+//! value-independent, so nothing is lost by that: a fixture priced at `1.1` exercises exactly the
+//! same code path as one priced at a real tick.
+//!
 //! The measured facts these encode:
 //!
 //! - The tick schema **varies by dataset**: `fx` is `{ts, symbol, bid, ask}`, `stocks` is
@@ -24,6 +30,7 @@ use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_data::event::DataKind;
 use rustrade_data::exchange::lse::error::LseError;
@@ -46,46 +53,59 @@ enum Col {
     OptDbl(Vec<Option<f64>>),
 }
 
-/// Write a Parquet file with the given schema and columns.
+/// Write a Parquet file with the given schema and columns, as one row group.
 fn write_parquet(path: &Path, message: &str, columns: Vec<Col>) {
+    write_parquet_row_groups(path, message, vec![columns]);
+}
+
+/// Write a Parquet file whose rows are split across one row group per element of `groups`.
+///
+/// Every measured artifact holds exactly one, but that is a property of the provider's writer and
+/// not a guarantee of the format, so the decoder walks groups — and something has to exercise the
+/// walk.
+fn write_parquet_row_groups(path: &Path, message: &str, groups: Vec<Vec<Col>>) {
     let schema = Arc::new(parse_message_type(message).unwrap());
     let props = Arc::new(WriterProperties::builder().build());
     let mut writer = SerializedFileWriter::new(File::create(path).unwrap(), schema, props).unwrap();
-    let mut group = writer.next_row_group().unwrap();
 
-    for column in columns {
-        let mut col = group.next_column().unwrap().unwrap();
-        match column {
-            Col::Ts(values) => {
-                col.typed::<Int64Type>()
-                    .write_batch(&values, None, None)
-                    .unwrap();
+    for columns in groups {
+        let mut group = writer.next_row_group().unwrap();
+
+        for column in columns {
+            let mut col = group.next_column().unwrap().unwrap();
+            match column {
+                Col::Ts(values) => {
+                    col.typed::<Int64Type>()
+                        .write_batch(&values, None, None)
+                        .unwrap();
+                }
+                Col::Sym(values) => {
+                    let values: Vec<ByteArray> = values.iter().map(|s| (*s).into()).collect();
+                    col.typed::<ByteArrayType>()
+                        .write_batch(&values, None, None)
+                        .unwrap();
+                }
+                Col::Dbl(values) => {
+                    col.typed::<DoubleType>()
+                        .write_batch(&values, None, None)
+                        .unwrap();
+                }
+                Col::OptDbl(values) => {
+                    // Top-level OPTIONAL: definition level 1 means present, 0 means null, and only
+                    // the present values are supplied.
+                    let def: Vec<i16> = values.iter().map(|v| i16::from(v.is_some())).collect();
+                    let present: Vec<f64> = values.iter().flatten().copied().collect();
+                    col.typed::<DoubleType>()
+                        .write_batch(&present, Some(&def), None)
+                        .unwrap();
+                }
             }
-            Col::Sym(values) => {
-                let values: Vec<ByteArray> = values.iter().map(|s| (*s).into()).collect();
-                col.typed::<ByteArrayType>()
-                    .write_batch(&values, None, None)
-                    .unwrap();
-            }
-            Col::Dbl(values) => {
-                col.typed::<DoubleType>()
-                    .write_batch(&values, None, None)
-                    .unwrap();
-            }
-            Col::OptDbl(values) => {
-                // Top-level OPTIONAL: definition level 1 means present, 0 means null, and only
-                // the present values are supplied.
-                let def: Vec<i16> = values.iter().map(|v| i16::from(v.is_some())).collect();
-                let present: Vec<f64> = values.iter().flatten().copied().collect();
-                col.typed::<DoubleType>()
-                    .write_batch(&present, Some(&def), None)
-                    .unwrap();
-            }
+            col.close().unwrap();
         }
-        col.close().unwrap();
+
+        group.close().unwrap();
     }
 
-    group.close().unwrap();
     writer.close().unwrap();
 }
 
@@ -168,8 +188,8 @@ fn an_fx_tick_export_decodes_to_a_two_sided_quote() {
         vec![
             Col::Ts(vec![T0, T0 + HOUR]),
             Col::Sym(vec!["EUR/USD", "EUR/USD"]),
-            Col::Dbl(vec![1.14126, 1.14130]),
-            Col::Dbl(vec![1.14135, 1.14138]),
+            Col::Dbl(vec![1.1, 1.3]),
+            Col::Dbl(vec![1.2, 1.4]),
         ],
     );
 
@@ -184,8 +204,8 @@ fn an_fx_tick_export_decodes_to_a_two_sided_quote() {
     let DataKind::OrderBookL1(book) = &events[0].kind else {
         panic!("expected OrderBookL1, got {:?}", events[0].kind);
     };
-    assert_eq!(book.best_bid.unwrap().price, dec!(1.14126));
-    assert_eq!(book.best_ask.unwrap().price, dec!(1.14135));
+    assert_eq!(book.best_bid.unwrap().price, dec!(1.1));
+    assert_eq!(book.best_ask.unwrap().price, dec!(1.2));
 }
 
 #[test]
@@ -198,7 +218,7 @@ fn a_stocks_tick_export_decodes_to_a_trade() {
         vec![
             Col::Ts(vec![T0]),
             Col::Sym(vec!["AAPL"]),
-            Col::Dbl(vec![289.75]),
+            Col::Dbl(vec![20.5]),
             Col::Dbl(vec![100.0]),
         ],
     );
@@ -213,7 +233,7 @@ fn a_stocks_tick_export_decodes_to_a_trade() {
     let DataKind::Trade(trade) = &events[0].kind else {
         panic!("expected Trade, got {:?}", events[0].kind);
     };
-    assert_eq!(trade.price, dec!(289.75));
+    assert_eq!(trade.price, dec!(20.5));
     assert_eq!(trade.amount, dec!(100));
     // No aggressor side is published, and a bid-side price cannot imply one.
     assert!(trade.side.is_none());
@@ -233,9 +253,9 @@ fn a_synth_tick_export_decodes_price_as_the_bid() {
         vec![
             Col::Ts(vec![T0, T0 + HOUR]),
             Col::Sym(vec!["VIX/USD", "VIX/USD"]),
-            Col::Dbl(vec![16.92, 16.95]),
+            Col::Dbl(vec![2.0, 2.5]),
             Col::OptDbl(vec![Some(0.0), None]),
-            Col::OptDbl(vec![Some(16.93), None]),
+            Col::OptDbl(vec![Some(2.1), None]),
         ],
     );
 
@@ -254,14 +274,14 @@ fn a_synth_tick_export_decodes_price_as_the_bid() {
     let DataKind::OrderBookL1(book) = &events[0].kind else {
         panic!("expected OrderBookL1");
     };
-    assert_eq!(book.best_bid.unwrap().price, dec!(16.92));
-    assert_eq!(book.best_ask.unwrap().price, dec!(16.93));
+    assert_eq!(book.best_bid.unwrap().price, dec!(2.0));
+    assert_eq!(book.best_ask.unwrap().price, dec!(2.1));
 
     // A null ask yields a one-sided book rather than a fabricated price.
     let DataKind::OrderBookL1(book) = &events[1].kind else {
         panic!("expected OrderBookL1");
     };
-    assert_eq!(book.best_bid.unwrap().price, dec!(16.95));
+    assert_eq!(book.best_bid.unwrap().price, dec!(2.5));
     assert!(book.best_ask.is_none());
 }
 
@@ -279,11 +299,11 @@ fn a_candle_export_derives_close_time_from_the_bars_open_time() {
         vec![
             Col::Ts(vec![T0]),
             Col::Sym(vec!["SPY"]),
-            Col::Dbl(vec![746.77]),
-            Col::Dbl(vec![749.44]),
-            Col::Dbl(vec![742.39]),
-            Col::Dbl(vec![744.97]),
-            Col::Dbl(vec![110173547528.0]),
+            Col::Dbl(vec![100.0]),
+            Col::Dbl(vec![110.0]),
+            Col::Dbl(vec![90.0]),
+            Col::Dbl(vec![105.0]),
+            Col::Dbl(vec![1000.0]),
         ],
     );
 
@@ -303,9 +323,9 @@ fn a_candle_export_derives_close_time_from_the_bars_open_time() {
     };
     // The `ts` column held 2026-07-01T00:00Z, so the exclusive close is the next midnight.
     assert_eq!(candle.close_time.to_rfc3339(), "2026-07-02T00:00:00+00:00");
-    assert_eq!(candle.open, dec!(746.77));
-    assert_eq!(candle.close, dec!(744.97));
-    assert_eq!(candle.volume, Some(dec!(110173547528)));
+    assert_eq!(candle.open, dec!(100));
+    assert_eq!(candle.close, dec!(105));
+    assert_eq!(candle.volume, Some(dec!(1000)));
     // Never published on any dataset.
     assert!(candle.trade_count.is_none());
     // `time_exchange` is the close, NOT the `ts` it was read from: a bar enters the timeline when
@@ -327,10 +347,10 @@ fn an_fx_candle_export_omitting_the_volume_column_yields_none() {
         vec![
             Col::Ts(vec![T0]),
             Col::Sym(vec!["EUR/USD"]),
-            Col::Dbl(vec![1.14126]),
-            Col::Dbl(vec![1.14137]),
-            Col::Dbl(vec![1.13614]),
-            Col::Dbl(vec![1.13772]),
+            Col::Dbl(vec![1.1]),
+            Col::Dbl(vec![1.3]),
+            Col::Dbl(vec![0.9]),
+            Col::Dbl(vec![1.2]),
         ],
     );
 
@@ -364,10 +384,10 @@ fn a_literal_zero_volume_is_passed_through_rather_than_rewritten_to_none() {
         vec![
             Col::Ts(vec![T0]),
             Col::Sym(vec!["AAPL"]),
-            Col::Dbl(vec![289.0]),
-            Col::Dbl(vec![290.0]),
-            Col::Dbl(vec![288.0]),
-            Col::Dbl(vec![289.5]),
+            Col::Dbl(vec![100.0]),
+            Col::Dbl(vec![110.0]),
+            Col::Dbl(vec![90.0]),
+            Col::Dbl(vec![105.0]),
             Col::Dbl(vec![0.0]),
         ],
     );
@@ -387,6 +407,141 @@ fn a_literal_zero_volume_is_passed_through_rather_than_rewritten_to_none() {
         panic!("expected Candle");
     };
     assert_eq!(candle.volume, Some(dec!(0)));
+}
+
+// ── batching and row groups ──────────────────────────────────────────────────
+
+/// Mirrors the decoder's private batch width.
+///
+/// The decoder reads a fixed number of rows per column-reader call rather than a whole row group,
+/// which is what bounds its memory over a multi-gigabyte artifact. Nothing below asserts this exact
+/// figure — only that crossing it changes nothing — so the tests stay correct if it is retuned;
+/// they merely stop straddling the boundary, which is why it is worth keeping in step.
+const BATCH_ROWS: usize = 8 * 1024;
+
+#[test]
+fn an_artifact_longer_than_one_read_batch_decodes_every_row_in_order() {
+    // Deliberately not a round multiple: the final batch is partial, and the row after the last
+    // one has to end the iterator rather than read off the end of the buffers.
+    let rows = BATCH_ROWS * 2 + 7;
+
+    let mut ts = Vec::with_capacity(rows);
+    let mut price = Vec::with_capacity(rows);
+    let mut ask = Vec::with_capacity(rows);
+    for index in 0..rows {
+        let index = i32::try_from(index).unwrap();
+
+        ts.push(T0 + i64::from(index));
+        // Distinct per row, so a value paired with the wrong timestamp is visible rather than
+        // coincidentally equal to the right one.
+        price.push(f64::from(index));
+        // Alternating nulls: an OPTIONAL column's value buffer is shorter than its batch, so the
+        // per-column cursor has to survive a batch boundary landing mid-pattern. A cursor reset one
+        // row early or late shifts every subsequent ask onto the wrong row.
+        ask.push((index % 2 == 0).then(|| f64::from(index) + 0.5));
+    }
+
+    let dir = dir();
+    let path = dir.path().join("long.parquet");
+    write_parquet(
+        &path,
+        SYNTH_TICK,
+        vec![
+            Col::Ts(ts),
+            Col::Sym(vec!["VIX/USD"; rows]),
+            Col::Dbl(price),
+            Col::OptDbl(vec![None; rows]),
+            Col::OptDbl(ask),
+        ],
+    );
+
+    let export = export(
+        path,
+        LseDataset::Volatility,
+        "VIX/USD",
+        LseExportTimeframe::Tick,
+    );
+    let events: Vec<_> = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(events.len(), rows);
+
+    for (index, event) in events.iter().enumerate() {
+        let expected = Decimal::from(i64::try_from(index).unwrap());
+
+        assert_eq!(
+            event.time_exchange.timestamp_micros(),
+            T0 + i64::try_from(index).unwrap(),
+            "row {index} decoded against the wrong timestamp"
+        );
+
+        let DataKind::OrderBookL1(book) = &event.kind else {
+            panic!("expected OrderBookL1 on row {index}, got {:?}", event.kind);
+        };
+        assert_eq!(
+            book.best_bid.unwrap().price,
+            expected,
+            "row {index} decoded the wrong bid"
+        );
+        assert_eq!(
+            book.best_ask.map(|level| level.price),
+            (index % 2 == 0).then(|| expected + dec!(0.5)),
+            "row {index} decoded the wrong ask"
+        );
+    }
+}
+
+#[test]
+fn an_artifact_written_as_several_row_groups_decodes_every_row_in_order() {
+    let dir = dir();
+    let path = dir.path().join("groups.parquet");
+    write_parquet_row_groups(
+        &path,
+        FX_TICK,
+        (0..3)
+            .map(|group| {
+                let base = T0 + i64::from(group) * DAY;
+
+                vec![
+                    Col::Ts(vec![base, base + HOUR]),
+                    Col::Sym(vec!["EUR/USD"; 2]),
+                    Col::Dbl(vec![f64::from(group), f64::from(group) + 0.5]),
+                    Col::Dbl(vec![f64::from(group) + 0.1, f64::from(group) + 0.6]),
+                ]
+            })
+            .collect(),
+    );
+
+    let export = export(path, LseDataset::Fx, "EUR/USD", LseExportTimeframe::Tick);
+    let events: Vec<_> = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    // Every group is walked, in file order, and the boundary between two of them is not an end.
+    assert_eq!(events.len(), 6);
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].time_exchange <= pair[1].time_exchange),
+        "row groups must be decoded in file order"
+    );
+
+    let bids: Vec<_> = events
+        .iter()
+        .map(|event| {
+            let DataKind::OrderBookL1(book) = &event.kind else {
+                panic!("expected OrderBookL1, got {:?}", event.kind);
+            };
+            book.best_bid.unwrap().price
+        })
+        .collect();
+    assert_eq!(
+        bids,
+        vec![dec!(0), dec!(0.5), dec!(1), dec!(1.5), dec!(2), dec!(2.5)]
+    );
 }
 
 // ── invariants ───────────────────────────────────────────────────────────────
@@ -488,7 +643,7 @@ fn a_row_whose_symbol_contradicts_the_descriptor_is_rejected() {
         vec![
             Col::Ts(vec![T0]),
             Col::Sym(vec!["BP"]),
-            Col::Dbl(vec![43.9]),
+            Col::Dbl(vec![10.0]),
             Col::Dbl(vec![1.0]),
         ],
     );

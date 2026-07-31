@@ -21,7 +21,11 @@ use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped};
 use crate::exchange::lse::error::{LseError, extract_detail};
 use crate::exchange::lse::quota::QuotaStatus;
 use reqwest::header::{HeaderMap, HeaderValue};
-use std::{env, time::Duration};
+use std::{env, sync::Arc, time::Duration};
+use tokio::{
+    sync::{Mutex, Semaphore, SemaphorePermit},
+    time::{Instant, sleep_until},
+};
 use tracing::debug;
 
 /// Base URL of the vault data plane.
@@ -33,8 +37,20 @@ const API_KEY_HEADER: &str = "x-api-key";
 /// Environment variable read by [`LseVaultClient::from_env`].
 const API_KEY_ENV: &str = "LSE_API_KEY";
 
-/// Per-request HTTP timeout.
+/// Total deadline for a JSON request: connect, send, and read the whole body.
+///
+/// Sound for the JSON endpoints, whose bodies are a page of candles at most. It is **not** sound for
+/// an export artifact, which is why [`download_export`](super::export) overrides it per-request —
+/// `reqwest` applies this as a total deadline "from when the request starts connecting until the
+/// response body has finished", so a multi-gigabyte transfer would abort mid-body however healthy
+/// the connection.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-read timeout, applied to every request including a streaming download.
+///
+/// Resets after each successful read, so it detects a *stalled* connection without bounding total
+/// transfer time — the correct tool for a body whose length is not known up front.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `User-Agent` sent on every vault request.
 ///
@@ -45,18 +61,97 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// provider's allowance accounting, so it fails in a way that looks nothing like an API error.
 const USER_AGENT: &str = concat!("rustrade-data/", env!("CARGO_PKG_VERSION"));
 
-/// Default delay between pages of a paged fetch.
+/// Default minimum delay between the *starts* of two requests.
 ///
 /// Derived from the provider's documented allowance of 200 calls per minute, which is one call per
 /// 300ms. This is *proactive courtesy only* — it never inspects a `429`, never retries, and never
 /// adapts. Override with [`LseVaultClient::with_pace`].
 const DEFAULT_PACE: Duration = Duration::from_millis(300);
 
+/// Default ceiling on requests in flight at once.
+///
+/// The provider reports its own ceiling as [`vault_concurrency`](QuotaStatus::vault_concurrency),
+/// measured at 2. A key on a different plan may be allowed more — read
+/// [`usage`](LseVaultClient::usage) and raise this with
+/// [`with_concurrency`](LseVaultClient::with_concurrency) rather than assuming the default is your
+/// key's limit.
+const DEFAULT_CONCURRENCY: usize = 2;
+
+/// Shared gate every request passes through: bounds concurrency, then spaces request starts.
+///
+/// Held behind an [`Arc`] so that all clones of one [`LseVaultClient`] — and therefore every
+/// concurrent stream built from one — queue at the *same* gate.
+///
+/// # Why this cannot be per-request state
+/// Pacing a single paged fetch is a claim about that fetch only. A multi-instrument replay such as
+/// [`replay_candles`](super::backtest::replay_candles) drives N fetches concurrently, so N
+/// independently-paced streams produce an aggregate rate of N per `pace` — which is exactly what
+/// [`DEFAULT_PACE`]'s "200 calls per minute" derivation says must not happen, and N in-flight
+/// requests against a `vault_concurrency` of 2. Both bounds therefore belong to the client, not to
+/// any one call site, so that they hold for every entry point without the caller re-deriving them.
+#[derive(Debug)]
+struct RequestGate {
+    /// Configured in-flight ceiling. Retained separately because [`Semaphore`] reports only the
+    /// permits *currently* available, which says nothing about the limit under load.
+    concurrency: usize,
+    /// One permit per allowed in-flight request.
+    permits: Semaphore,
+    /// Earliest instant at which the next request may start.
+    ///
+    /// Fair (FIFO) locking gives each waiter a distinct, increasing slot, so `n` requests leave at
+    /// `pace` intervals rather than all reading the same "now".
+    next_slot: Mutex<Instant>,
+}
+
+impl RequestGate {
+    fn new(concurrency: usize) -> Self {
+        Self {
+            // A gate of zero permits would park every request forever. Clamping (rather than
+            // erroring) keeps `with_concurrency` infallible for what is plainly a caller slip.
+            concurrency: concurrency.max(1),
+            permits: Semaphore::new(concurrency.max(1)),
+            next_slot: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Wait for a slot. The returned permit must be held for the whole request, body included.
+    ///
+    /// `None` is returned only if the semaphore were closed, which cannot happen: it is private to
+    /// this type and nothing closes it. Degrading to an unpaced-but-still-spaced request beats
+    /// panicking a caller's run over an unreachable condition, and this crate denies
+    /// `clippy::unwrap_used`.
+    async fn enter(&self, pace: Duration) -> Option<SemaphorePermit<'_>> {
+        let permit = self.permits.acquire().await.ok();
+
+        let slot = {
+            let mut next_slot = self.next_slot.lock().await;
+            // `max(now)` so an idle client accrues no credit: a burst after a quiet period starts
+            // immediately and then spaces out, instead of firing a backlog of "owed" requests.
+            let slot = (*next_slot).max(Instant::now());
+            *next_slot = slot + pace;
+            slot
+        };
+
+        sleep_until(slot).await;
+
+        permit
+    }
+}
+
 /// Authenticated client for the London Strategic Edge vault.
 ///
 /// Holds one configured [`reqwest::Client`] (auth header + timeout) plus the vault base URL.
 /// Endpoint families build on it: [`usage`](Self::usage) here, paged candles in
 /// [`historical`](super::historical).
+///
+/// # Request rationing is per client, not per call
+/// Every request this client issues — candle page, export submit, status poll, artifact download —
+/// first passes a gate that bounds requests in flight to
+/// [`with_concurrency`](Self::with_concurrency) and spaces their starts by
+/// [`with_pace`](Self::with_pace). That gate is **shared by clones**, so driving N concurrent
+/// fetches from one client (`Arc` it, or clone it) keeps the aggregate inside those two bounds
+/// rather than multiplying them by N. Two clients built separately by `new` share nothing and
+/// ration independently — one client per API key is the usable unit.
 ///
 /// # ⚠️ Licensing
 /// Data retrieved through this client is **not redistributable**. See the
@@ -66,6 +161,7 @@ pub struct LseVaultClient {
     http: reqwest::Client,
     base_url: String,
     pace: Duration,
+    gate: Arc<RequestGate>,
 }
 
 impl std::fmt::Debug for LseVaultClient {
@@ -75,6 +171,7 @@ impl std::fmt::Debug for LseVaultClient {
         f.debug_struct("LseVaultClient")
             .field("base_url", &self.base_url)
             .field("pace", &self.pace)
+            .field("concurrency", &self.gate.concurrency)
             .finish_non_exhaustive()
     }
 }
@@ -98,12 +195,14 @@ impl LseVaultClient {
             .default_headers(headers)
             .user_agent(USER_AGENT)
             .timeout(REQUEST_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()?;
 
         Ok(Self {
             http,
             base_url: VAULT_BASE_URL.to_owned(),
             pace: DEFAULT_PACE,
+            gate: Arc::new(RequestGate::new(DEFAULT_CONCURRENCY)),
         })
     }
 
@@ -154,7 +253,12 @@ impl LseVaultClient {
         self
     }
 
-    /// Override the delay applied between pages of a paged fetch.
+    /// Override the minimum delay between the starts of two requests.
+    ///
+    /// Applies to **every** request this client issues, not just successive pages of one fetch, and
+    /// is enforced against the [gate](Self#request-rationing-is-per-client-not-per-call) this client
+    /// shares with its clones — so N concurrent fetches still start one request per `pace` between
+    /// them.
     ///
     /// Pass [`Duration::ZERO`] to disable pacing entirely, at which point staying within the
     /// provider's [`calls_per_minute`](QuotaStatus::calls_per_minute) allowance becomes the
@@ -165,9 +269,30 @@ impl LseVaultClient {
         self
     }
 
-    /// The configured inter-page delay.
-    pub(crate) fn pace(&self) -> Duration {
-        self.pace
+    /// Override how many requests this client may have in flight at once.
+    ///
+    /// The default is the provider's measured [`vault_concurrency`](QuotaStatus::vault_concurrency);
+    /// raise it only against a key whose [`usage`](Self::usage) reports a higher one. `0` is
+    /// clamped to `1`, since a client that can never issue a request is never what was meant.
+    ///
+    /// # ⚠️ Call this before cloning
+    /// This installs a **fresh** gate. Clones taken *before* the call keep the old one and ration
+    /// separately from this client, which defeats the point of sharing; clones taken after share
+    /// the new gate as usual.
+    #[must_use]
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.gate = Arc::new(RequestGate::new(concurrency));
+        self
+    }
+
+    /// Wait for this client's shared gate to admit one request.
+    ///
+    /// The returned permit bounds concurrency and must be held until the response body has been
+    /// consumed — dropping it early lets another request start while this one is still on the wire.
+    /// Endpoint families outside this module call it before issuing a request that does not go
+    /// through [`get_json`](Self::get_json).
+    pub(crate) async fn enter_gate(&self) -> Option<SemaphorePermit<'_>> {
+        self.gate.enter(self.pace).await
     }
 
     /// The configured vault base URL.
@@ -201,6 +326,9 @@ impl LseVaultClient {
 
     /// Issue an authenticated `GET` against a vault path and deserialise the JSON body.
     ///
+    /// Rationed by this client's shared [gate](Self#request-rationing-is-per-client-not-per-call),
+    /// so a caller driving several of these concurrently does not have to pace them itself.
+    ///
     /// # Errors
     /// Maps a `429` to [`LseError::RateLimited`] (carrying `Retry-After` when present), any other
     /// non-success status to [`LseError::Api`] with the provider's diagnostic unwrapped from its
@@ -213,6 +341,10 @@ impl LseVaultClient {
     where
         T: serde::de::DeserializeOwned,
     {
+        // Held until the body has been read below, so the permit measures a request's real
+        // occupancy of a connection rather than just the time to get response headers back.
+        let _permit = self.enter_gate().await;
+
         let url = format!("{}/{path}", self.base_url);
         let response = self.http.get(&url).query(query).send().await?;
         let status = response.status();
@@ -233,10 +365,14 @@ impl LseVaultClient {
             });
         }
 
-        let body = response.text().await?;
+        // `bytes()`, not `text()`: `text()` copies the whole body out of the response's buffer into a
+        // fresh `String` first, purely to validate UTF-8 that `serde_json` validates again. A
+        // multi-year one-minute backfill runs to hundreds of pages, so that copy is not free, and
+        // `len` for the log line is available either way.
+        let body = response.bytes().await?;
         debug!(len = body.len(), path, "vault response received");
 
-        serde_json::from_str(&body).map_err(|error| LseError::Deserialize {
+        serde_json::from_slice(&body).map_err(|error| LseError::Deserialize {
             message: format!("{path}: {error}"),
         })
     }
@@ -354,5 +490,86 @@ mod tests {
     #[test]
     fn retry_after_is_none_when_absent() {
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    /// The bound that makes the `vault_concurrency` claim true: however many callers want in, only
+    /// `concurrency` of them are ever inside at once.
+    #[tokio::test]
+    async fn the_gate_never_admits_more_callers_than_its_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let gate = RequestGate::new(2);
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+
+        futures::future::join_all((0..8).map(|_| async {
+            let _permit = gate.enter(Duration::ZERO).await;
+
+            let entered = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(entered, Ordering::SeqCst);
+            // Keeps the permit held across a suspension point, so a later caller gets the chance
+            // to overlap; without it every caller would trivially run to completion alone.
+            tokio::task::yield_now().await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+        }))
+        .await;
+
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    /// The property M6 was about: N concurrent callers share ONE schedule, so the aggregate rate is
+    /// one request per `pace` — not N.
+    #[tokio::test(start_paused = true)]
+    async fn the_gate_spaces_concurrent_callers_against_one_shared_schedule() {
+        let pace = Duration::from_millis(300);
+        // Wide enough that the semaphore never blocks, isolating pacing from concurrency.
+        let gate = RequestGate::new(8);
+        let started = Instant::now();
+
+        let admitted = futures::future::join_all((0..4).map(|_| async {
+            let _permit = gate.enter(pace).await;
+            started.elapsed()
+        }))
+        .await;
+
+        assert_eq!(admitted, vec![Duration::ZERO, pace, pace * 2, pace * 3]);
+    }
+
+    /// An idle client must not bank credit: a burst after a quiet period should start at once and
+    /// only then space out, rather than firing everything it "could have" sent while idle.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_gate_accrues_no_credit() {
+        let pace = Duration::from_millis(300);
+        let gate = RequestGate::new(8);
+
+        drop(gate.enter(pace).await);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        let started = Instant::now();
+        drop(gate.enter(pace).await);
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// Clones must queue together — otherwise handing a clone to each of N concurrent fetches would
+    /// restore exactly the N × rate this gate exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn a_cloned_client_queues_at_the_same_gate_as_its_original() {
+        let pace = Duration::from_millis(300);
+        let client = LseVaultClient::new("key").unwrap().with_pace(pace);
+        let clone = client.clone();
+        let started = Instant::now();
+
+        let _first = client.enter_gate().await;
+        let _second = clone.enter_gate().await;
+
+        assert_eq!(started.elapsed(), pace);
+    }
+
+    #[test]
+    fn a_concurrency_of_zero_is_clamped_rather_than_parking_every_request_forever() {
+        let client = LseVaultClient::new("key").unwrap().with_concurrency(0);
+
+        assert!(format!("{client:?}").contains("concurrency: 1"));
     }
 }

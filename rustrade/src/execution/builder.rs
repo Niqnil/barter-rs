@@ -407,9 +407,15 @@ impl IntoIterator for ExecutionHandles {
 /// limit of the mock — it fills at price × quantity with no expiry, settlement or contract chain —
 /// not a statement about which kinds are executable in general.
 ///
-/// `Cfd` is supported because a CFD fill is exactly that same price × quantity arithmetic (its
-/// `contract_size` multiplier is applied by the engine, not here), and without it every CFD-quoted
-/// dataset would panic at execution-build time and be unbacktestable.
+/// `Cfd` is supported because the mock accounts for a cash-settled position directly: it applies
+/// `contract_size` to the notional and the fee, and debits the **quote** asset in both directions.
+/// Without it every CFD-quoted dataset would panic at execution-build time and be unbacktestable.
+///
+/// `settlement_asset` is re-resolved to its exchange name so the projected instrument describes
+/// itself faithfully, but the mock does not settle in it — see [`MockExchange`]'s limitations for
+/// why, and for the balances a caller must fund.
+///
+/// [`MockExchange`]: rustrade_execution::exchange::mock::MockExchange
 #[allow(clippy::unwrap_used)] // Invariant: IndexedInstruments - all referenced assets exist; panics for unsupported InstrumentKind
 fn generate_mock_exchange_instruments(
     instruments: &IndexedInstruments,
