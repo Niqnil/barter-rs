@@ -389,9 +389,10 @@ impl MockExchange {
         // (`InstrumentState::update_from_trade`) would make this ledger and the engine's
         // position accounting disagree by exactly that factor -- balances moving 1x while PnL moves
         // 25x, silently, with every balance-derived return, drawdown and Sharpe wrong by the same
-        // factor. (No fee model reads `contract_size` today, so passing it changes no fee amount
-        // yet; passing it is what keeps that an implementation detail of the models rather than a
-        // second place the multiplier can be lost.)
+        // factor. Which models actually consult the multiplier is theirs to decide --
+        // `PercentageFeeModel` scales by it, `PerContractFeeModel` deliberately does not -- and
+        // passing it is what keeps that decision in the models rather than making this a second
+        // place the multiplier can be lost.
         let order_notional_quote = fill_price * request.state.quantity.abs() * contract_size;
         let order_fees_quote =
             self.fee_model
@@ -964,7 +965,12 @@ mod tests {
         }
     }
 
-    /// Fees stay quote-denominated on both sides of a CFD, and are debited on top of the notional.
+    /// Fees stay quote-denominated on both sides of a CFD, are computed on the `contract_size`
+    /// scaled notional, and are debited on top of it.
+    ///
+    /// Every amount below is hard-coded rather than read back from the notification: an assertion
+    /// that subtracts the reported fee from its own expected balance is satisfied by *any* fee,
+    /// including the unscaled one this exists to rule out.
     #[test]
     fn cfd_fee_is_quote_denominated_on_both_sides() {
         for side in [Side::Buy, Side::Sell] {
@@ -989,10 +995,15 @@ mod tests {
                 "{side:?} fee asset"
             );
 
-            let fee = notifications.trade.fees.fees;
+            // 0.001 * 5000 * 1 * 25. The unscaled answer is 5, so this pins the multiplier.
+            assert_eq!(
+                notifications.trade.fees.fees,
+                d("125"),
+                "{side:?} fee must be 0.1% of the contract_size-scaled notional"
+            );
             assert_eq!(
                 notifications.balance.0.balance.free,
-                d("200000") - d("125000") - fee,
+                d("200000") - d("125000") - d("125"),
                 "{side:?} debit must be notional + fee"
             );
         }

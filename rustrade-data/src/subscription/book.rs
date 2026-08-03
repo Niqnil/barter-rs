@@ -34,6 +34,22 @@ impl std::fmt::Display for OrderBooksL1 {
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize, Constructor,
 )]
 pub struct OrderBookL1 {
+    /// The venue's own instant for this book state.
+    ///
+    /// # Producer obligation
+    ///
+    /// A producer **must** set this to the same instant it puts in the wrapping
+    /// [`MarketEvent::time_exchange`](crate::event::MarketEvent::time_exchange), and it must come
+    /// from the venue rather than from a local or aggregator clock.
+    ///
+    /// Downstream state orders L1 updates on this field, not on the event's, so the two must not
+    /// disagree. Stamping it from a different clock has two silent effects, neither of which
+    /// produces an error or a log: a staleness guard keyed on this field can reject legitimately
+    /// newer updates and freeze the held book, and a consumer ranking price sources by recency —
+    /// `DefaultInstrumentMarketData::price` in the `rustrade` crate is one — will rank this book
+    /// wrongly against trades and candles, moving `pnl_unrealised`.
+    ///
+    /// Every in-tree producer satisfies this.
     pub last_update_time: DateTime<Utc>,
     pub best_bid: Option<Level>,
     pub best_ask: Option<Level>,

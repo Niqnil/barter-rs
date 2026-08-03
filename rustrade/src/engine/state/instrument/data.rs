@@ -17,6 +17,7 @@ use rustrade_instrument::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Defines a state object for tracking and managing custom instrument level data.
 ///
@@ -73,7 +74,14 @@ pub trait InstrumentDataState<
 ///
 /// Does not implement `Ord`/`PartialOrd`: `last_traded_price` holds a [`Timed`] value, whose
 /// whole-struct ordering is intentionally not provided (see [`Timed`] docs).
+///
+/// # Deserialising state written by an older build
+/// Every field is `#[serde(default)]`, so state persisted before a field existed still loads, with
+/// the absent field taking its `Default`. Without it serde treats a missing key as a hard error
+/// even for an `Option` — deriving `Default` does not change that — and an engine-state snapshot,
+/// audit replica or replay stream from an earlier version would fail to load outright.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Default, Deserialize, Serialize, Constructor)]
+#[serde(default)]
 pub struct DefaultInstrumentMarketData {
     pub l1: OrderBookL1,
     pub last_traded_price: Option<Timed<Decimal>>,
@@ -109,6 +117,13 @@ impl InstrumentDataState for DefaultInstrumentMarketData {
     /// A **one-sided** book contributes nothing: half a book has no mid, and
     /// marking a position at whichever side happens to be quoted is a judgement this state does not
     /// make on the caller's behalf.
+    ///
+    /// # Caller obligation
+    /// The L1 candidate is ranked on [`OrderBookL1::last_update_time`], so a producer must stamp
+    /// that field with the same venue instant it puts in `MarketEvent::time_exchange` (the
+    /// obligation is stated on the field). A custom connector that stamps it from its own
+    /// aggregator clock instead gets no error and no log — just a book that can freeze, and a
+    /// recency ranking that silently moves `pnl_unrealised`.
     fn price(&self) -> Option<Decimal> {
         [
             self.l1_price()
@@ -126,6 +141,19 @@ impl InstrumentDataState for DefaultInstrumentMarketData {
         .map(|(_, _, price)| price)
     }
 }
+
+/// Lookahead candles dropped by [`DefaultInstrumentMarketData`] in this process.
+///
+/// Rate-limits the warning that accompanies the drop. A mis-stamped producer is not a one-off — it
+/// stamps every bar the same way — so an unconditional `warn!` is one line per candle, millions of
+/// them on a large backtest. Logging on the 1st, 2nd, 4th, 8th … occurrence keeps the condition
+/// observable, which is the entire reason it is logged (`Processor::Audit` is `()` here, so there
+/// is no error channel to use instead), at a logarithmic number of lines. The running total rides
+/// along on each line, so a reader can see the true scale from any one of them.
+///
+/// Process-global rather than per-instrument: `InstrumentKey` carries no bound this impl could key
+/// a map on, which is the same reason the warning cannot name the instrument it came from.
+static LOOKAHEAD_CANDLES_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Tie-break order for [`DefaultInstrumentMarketData::price`], coarsest first.
 ///
@@ -165,7 +193,10 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
     /// A candle whose `close_time` is **ahead of its own `time_exchange`** is dropped with a
     /// warning rather than applied: it would mark positions with the outcome of a period the
     /// engine's clock says is still open. See the `DataKind::Candle` arm for why that input is
-    /// reachable at all.
+    /// reachable at all. Every such candle is dropped, but the warning is rate-limited by a
+    /// counter shared by **every instance of this type in the process**: on a multi-instrument run
+    /// the power-of-two cadence and the `dropped` total on the line count drops across all of them
+    /// combined, so neither is scoped to the exchange the line does name.
     ///
     /// The match is **exhaustive on purpose**: a catch-all is how `DataKind::Candle` went unhandled
     /// here for as long as it did — silently, with no compile error to prompt the edit. Each
@@ -211,18 +242,25 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
             // (`Audit = ()`), so the warning is what makes it observable.
             DataKind::Candle(candle) => {
                 if candle.close_time > event.time_exchange {
-                    // No instrument field: `InstrumentKey` is unbounded here, and narrowing this
-                    // impl to `Debug` keys to name it in a log would be a breaking change for a
-                    // downstream key type. The exchange and the two instants identify the
-                    // mis-stamped producer, which is what the reader needs to act on.
-                    tracing::warn!(
-                        exchange = %event.exchange,
-                        close_time = %candle.close_time,
-                        time_exchange = %event.time_exchange,
-                        "dropping candle closing after its own time_exchange: the producer is \
-                         stamping the event before the period it describes has ended, which would \
-                         inject lookahead"
-                    );
+                    // Rate-limited: see `LOOKAHEAD_CANDLES_DROPPED`. The drop itself is
+                    // unconditional; only the line about it is thinned out.
+                    let dropped = LOOKAHEAD_CANDLES_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if dropped.is_power_of_two() {
+                        // No instrument field: `InstrumentKey` is unbounded here, and narrowing
+                        // this impl to `Debug` keys to name it in a log would be a breaking change
+                        // for a downstream key type. The exchange and the two instants identify the
+                        // mis-stamped producer, which is what the reader needs to act on.
+                        tracing::warn!(
+                            exchange = %event.exchange,
+                            close_time = %candle.close_time,
+                            time_exchange = %event.time_exchange,
+                            dropped,
+                            "dropping candle closing after its own time_exchange: the producer is \
+                             stamping the event before the period it describes has ended, which \
+                             would inject lookahead. This warning is rate-limited; `dropped` is \
+                             the running total for the process"
+                        );
+                    }
                 } else if self
                     .candle
                     .is_none_or(|current| current.close_time < candle.close_time)
@@ -336,6 +374,40 @@ mod tests {
     #[test]
     fn price_is_none_without_any_input() {
         assert_eq!(DefaultInstrumentMarketData::default().price(), None);
+    }
+
+    /// The compatibility claim `#[serde(default)]` is here for: engine state written by a build
+    /// predating a field still loads, with the absent field taking its `Default`.
+    ///
+    /// Pinned because the attribute is easy to drop in a refactor and nothing else would notice.
+    /// Serde treats a missing key as a hard error even when the field is an `Option`, and deriving
+    /// `Default` does not change that — without the attribute this is `missing field 'candle'`,
+    /// and a persisted snapshot, audit replica or replay stream from an earlier version fails to
+    /// load outright.
+    #[test]
+    fn state_written_before_the_candle_field_existed_still_deserialises() {
+        // Exactly the pre-field shape: `candle` absent, everything else as it was written.
+        let pre_candle = r#"{
+            "l1": {
+                "last_update_time": "2024-01-01T00:00:00Z",
+                "best_bid": null,
+                "best_ask": null
+            },
+            "last_traded_price": null
+        }"#;
+
+        let data: DefaultInstrumentMarketData = serde_json::from_str(pre_candle).unwrap();
+
+        assert_eq!(data.candle, None);
+        // The fields that *were* present still round-trip rather than being defaulted wholesale.
+        assert_eq!(data.l1.last_update_time, at(1_704_067_200));
+
+        // The degenerate case, so a field added after `candle` inherits the same protection
+        // without a further edit here.
+        assert_eq!(
+            serde_json::from_str::<DefaultInstrumentMarketData>("{}").unwrap(),
+            DefaultInstrumentMarketData::default()
+        );
     }
 
     #[test]

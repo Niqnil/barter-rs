@@ -212,10 +212,12 @@ mod tests {
 
     #[test]
     fn test_both_constructors_agree_on_the_same_instrument() {
-        // The two constructors are reached from different entry points -- the JSON config path
-        // uses `new_from_exchange_underlying`, library-side construction uses
-        // `new_from_exchange` -- and `InstrumentNameInternal` is an identity key, so a divergence
-        // silently splits one instrument into two that never resolve to each other.
+        // Two public constructors for the same identity key. `new_from_exchange` is what the
+        // library builds names with today; `new_from_exchange_underlying` is offered to callers who
+        // hold the underlying pair rather than an assembled name, and has no in-tree caller. That
+        // is precisely why it needs pinning: `InstrumentNameInternal` is an identity key, so a
+        // downstream user reaching for the unused constructor while the library uses the other
+        // would silently split one instrument into two that never resolve to each other.
         for exchange in MULTI_WORD_EXCHANGES {
             let from_underlying = InstrumentNameInternal::new_from_exchange_underlying(
                 exchange,

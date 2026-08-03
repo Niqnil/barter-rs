@@ -371,6 +371,10 @@ fn describe_type(field: &SchemaType) -> String {
 /// column owns two buffers for the whole decode and a batch read appends into them.
 struct BatchedColumn<T: DataType> {
     reader: ColumnReaderImpl<T>,
+    /// Index of this leaf in the file schema. Carried only so an underrun can name the column it
+    /// happened in — `BatchedColumn` is generic over the physical type, not the layout, so the
+    /// human-readable name is not in scope here.
+    leaf: usize,
     /// `true` when the column is `OPTIONAL`, so `values` is sparse and `def_levels` says which rows
     /// it covers.
     optional: bool,
@@ -405,6 +409,7 @@ impl<T: DataType> BatchedColumn<T> {
 
         Ok(Self {
             reader,
+            leaf: column.leaf,
             optional: column.optional,
             values: Vec::new(),
             def_levels: Vec::new(),
@@ -441,19 +446,37 @@ impl<T: DataType> BatchedColumn<T> {
         Ok(rows)
     }
 
-    /// Take the value at `row` of the buffered batch, or `None` if that row is null.
+    /// Take the value at `row` of the buffered batch, or `Ok(None)` if that row is null.
     ///
     /// Must be called once per row per column, in row order, whether or not the layout reads the
     /// value: the cursor over the non-null values only advances by being taken.
-    fn take(&mut self, row: usize) -> Option<T::T> {
+    ///
+    /// # Errors
+    /// [`LseError::Parquet`] if the row is marked present but the batch holds no value for it —
+    /// a malformed chunk, or a caller that skipped a row and desynchronised the cursor.
+    ///
+    /// Reported rather than folded into the `None` a genuine SQL null returns: the two mean
+    /// opposite things. A fabricated null surfaces as [`LseError::NullValue`] on a required column,
+    /// blaming the file for a fault that is not in it, and on a nullable one it is not surfaced at
+    /// all — the row simply decodes with a missing `volume` or a one-sided book.
+    fn take(&mut self, row: usize) -> Result<Option<T::T>, LseError> {
         if self.optional && self.def_levels.get(row).copied().unwrap_or_default() == 0 {
-            return None;
+            return Ok(None);
         }
 
-        let value = self.values.get(self.cursor)?.clone();
+        let Some(value) = self.values.get(self.cursor) else {
+            return Err(ParquetError::General(format!(
+                "export column {} row {row} is marked present, but its batch holds only {} value(s)",
+                self.leaf,
+                self.values.len()
+            ))
+            .into());
+        };
+
+        let value = value.clone();
         self.cursor += 1;
 
-        Some(value)
+        Ok(Some(value))
     }
 }
 
@@ -610,7 +633,7 @@ pub fn symbols_in_export(path: impl AsRef<Path>) -> Result<Vec<String>, LseError
 
             for row in 0..rows {
                 let value = buffered
-                    .take(row)
+                    .take(row)?
                     .ok_or(LseError::NullValue { column: COL_SYMBOL })?;
                 let value = value.as_utf8()?;
                 // Compare before allocating: every artifact is single-symbol, so all but the first
@@ -864,7 +887,7 @@ impl LseExportEvents {
             // Checked before anything else is read: it is the only check that catches a file
             // described by the wrong descriptor, and it compares bytes rather than allocating a
             // `String` per row for a column that is one dictionary-encoded value for the whole file.
-            match cursor.symbol.take(row).as_ref().map(ByteArray::data) {
+            match cursor.symbol.take(row)?.as_ref().map(ByteArray::data) {
                 Some(symbol) if symbol == self.expected_symbol.as_bytes() => {}
                 Some(symbol) => {
                     return Err(LseError::SymbolMismatch {
@@ -875,7 +898,7 @@ impl LseExportEvents {
                 None => return Err(LseError::NullValue { column: COL_SYMBOL }),
             }
 
-            let Some(micros) = cursor.ts.take(row) else {
+            let Some(micros) = cursor.ts.take(row)? else {
                 return Err(LseError::NullValue { column: COL_TS });
             };
 
@@ -884,7 +907,7 @@ impl LseExportEvents {
             // `MAX_VALUE_COLUMNS`, so nothing is dropped and there is no unreachable branch here.
             let mut values = [None; MAX_VALUE_COLUMNS];
             for (slot, column) in values.iter_mut().zip(cursor.values.iter_mut()) {
-                *slot = column.take(row);
+                *slot = column.take(row)?;
             }
 
             break (micros, values);

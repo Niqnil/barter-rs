@@ -796,7 +796,16 @@ impl LseVaultClient {
 
             hasher = transferred.hasher;
             downloaded = transferred.downloaded;
-            complete = transferred.exhausted;
+            // `transfer_export` cannot tell a finished stream from a truncated one on its own, so
+            // it only ever reports `exhausted` for the `416` that proves there is nothing left. The
+            // byte count settles the remaining case here, where `job.bytes` is in scope: a transfer
+            // that produced the whole artifact is exhausted whether or not the server said so, and
+            // treating it as resumable would keep a wrong-digest file that no further request can
+            // ever repair.
+            complete = transferred.exhausted
+                || job
+                    .bytes
+                    .is_some_and(|total| transferred.downloaded >= total);
         }
 
         let digest = hex::encode(hasher.finalize());
@@ -1008,10 +1017,11 @@ impl LseVaultClient {
         Ok(Transferred {
             hasher,
             downloaded,
-            // The stream ended, but without a byte count from the job there is no way to tell a
-            // complete artifact from a truncated one here. Reported as not exhausted so that a
-            // digest failure keeps the `.part` for a resume; the call after that converges on the
-            // `416` above.
+            // The stream ended, but nothing observed *here* distinguishes a complete artifact from
+            // a truncated one — only the `416` above proves exhaustion. Reported as not exhausted
+            // so that a digest failure keeps the `.part` for a resume; `download_export` overrides
+            // this when the job's byte count shows the transfer already produced the whole
+            // artifact, and otherwise the call after next converges on the `416`.
             exhausted: false,
         })
     }

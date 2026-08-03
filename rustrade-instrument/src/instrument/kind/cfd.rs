@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 /// # Fields
 /// * `contract_size` - Multiplier that determines the actual exposure per contract. Real CFDs are
 ///   commonly quoted per point (eg/ €25 per index point), so this is genuinely load-bearing: it
-///   feeds fee computation, unrealised PnL and risk notional. Providers that quote CFDs 1:1 with
+///   feeds unrealised PnL, risk notional, and any notional-based fee model (`PercentageFeeModel`
+///   scales by it; a per-contract model deliberately does not). Providers that quote CFDs 1:1 with
 ///   the underlying set it to `Decimal::ONE`.
 /// * `settlement_asset` - Asset used for settlement. A CFD is cash-settled in the *account*
 ///   currency, which is routinely **not** the quote asset (eg/ a GBP-denominated account trading

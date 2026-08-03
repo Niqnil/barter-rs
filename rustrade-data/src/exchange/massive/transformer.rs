@@ -186,10 +186,14 @@ impl AggregateBar {
     ///
     /// `volume` says what this market's `v` means — see [`AggregateVolume`], and
     /// [`AggregateVolume::for_ticker`] to derive it from the ticker you requested.
-    // Public convenience API; the internal REST stream uses `into_candle_with_step`
-    // (pre-computes the step once per stream), so this is unused in-crate.
-    #[allow(dead_code)]
-    pub fn into_candle(
+    ///
+    /// Test-only. `mod transformer` is `pub(crate)` and this type is not re-exported, so a `pub fn`
+    /// here would not actually be reachable by a downstream user however it were annotated —
+    /// leaving it looking like public API while carrying `#[allow(dead_code)]` claimed a contract
+    /// that does not exist. Production code takes `into_candle_with_step`, which pre-computes the
+    /// step once per stream instead of per bar.
+    #[cfg(test)]
+    fn into_candle(
         self,
         multiplier: u32,
         timespan: &str,

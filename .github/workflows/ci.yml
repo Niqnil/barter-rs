@@ -91,6 +91,12 @@ jobs:
         # Exclude examples to avoid mold linker hitting .debug_str section size limits
         run: cargo test --locked --workspace --all-features --lib --bins --tests
 
+      # `--lib --bins --tests` above excludes doc-tests, so without this step a rustdoc example
+      # that no longer compiles ships green. Separate from the step above so a failure here is
+      # attributable at a glance; it reuses that step's build.
+      - name: Run doc-tests
+        run: cargo test --locked --workspace --all-features --doc
+
   clippy:
     name: cargo clippy
     needs: [fmt, check]

@@ -440,17 +440,32 @@ async fn a_page_that_does_not_advance_the_cursor_is_an_error_not_an_infinite_loo
         .mount(&server)
         .await;
 
-    let error = client(&server)
-        .collect_candles(
+    // Bounded, because the failure this guards against is a *hang*, not a wrong error: delete the
+    // non-advance check and this mock answers the same page forever. Without the timeout the test
+    // would not fail, it would run until the CI job's own limit killed the whole run with nothing
+    // pointing back here.
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        client(&server).collect_candles(
             "AAPL",
             CandleInterval::Day1,
             utc("2024-01-02T00:00:00Z"),
             utc("2024-01-10T00:00:00Z"),
-        )
-        .await
-        .unwrap_err();
+        ),
+    )
+    .await
+    .expect("pagination did not terminate: the cursor non-advance guard is gone")
+    .unwrap_err();
 
-    assert!(matches!(error, LseError::Api { .. }));
+    // Pinned on the message, not just the variant: every transport and provider failure in this
+    // path is also `Api`, so the variant alone would be satisfied by an unrelated error.
+    let LseError::Api { message, .. } = &error else {
+        panic!("expected LseError::Api, got {error:?}");
+    };
+    assert!(
+        message.contains("did not advance"),
+        "expected the cursor non-advance diagnostic, got: {message}"
+    );
 }
 
 #[tokio::test]

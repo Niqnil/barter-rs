@@ -635,30 +635,266 @@ fn a_row_whose_symbol_contradicts_the_descriptor_is_rejected() {
     // The file and its descriptor disagree, so the artifact is not the one the caller thinks it
     // is. `BP` and `BP.L` are different instruments in different currencies -- a silent
     // misattribution here is a 100x pricing error.
+    //
+    // The offending row is deliberately NOT the first: the check is documented as applying to
+    // every row, and a single-row fixture is equally satisfied by an implementation that inspects
+    // only row 0 and then trusts the rest of the file.
     let dir = dir();
     let path = dir.path().join("wrong.parquet");
     write_parquet(
         &path,
         STOCK_TICK,
         vec![
-            Col::Ts(vec![T0]),
-            Col::Sym(vec!["BP"]),
-            Col::Dbl(vec![10.0]),
-            Col::Dbl(vec![1.0]),
+            Col::Ts(vec![T0, T0 + HOUR, T0 + DAY]),
+            Col::Sym(vec!["BP.L", "BP.L", "BP"]),
+            Col::Dbl(vec![10.0, 11.0, 12.0]),
+            Col::Dbl(vec![1.0, 1.0, 1.0]),
         ],
     );
 
     let export = export(path, LseDataset::Stocks, "BP.L", LseExportTimeframe::Tick);
-    let error = read_export(&export, idx())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_err();
+    let mut events = read_export(&export, idx()).unwrap();
 
+    // The matching rows decode; the contradiction is what stops the stream.
+    assert!(events.next().unwrap().is_ok());
+    assert!(events.next().unwrap().is_ok());
+
+    let error = events.next().unwrap().unwrap_err();
     let LseError::SymbolMismatch { expected, found } = error else {
         panic!("expected SymbolMismatch");
     };
     assert_eq!(expected, "BP.L");
     assert_eq!(found, "BP");
+}
+
+// ── typed decode failures ────────────────────────────────────────────────────
+//
+// Each of these is a silent-corruption class rather than a crash: nothing downstream can tell a
+// millisecond timestamp read as microseconds, or a zero substituted for a NaN, from real data. The
+// decoder turns every one into a typed error, and these pin that so a refactor or a `parquet`
+// upgrade cannot quietly reintroduce the guess.
+
+/// `STOCK_TICK` with `ts` in milliseconds — a 1000x time error if it were read as microseconds.
+const STOCK_TICK_TS_MILLIS: &str = "
+message schema {
+  REQUIRED INT64 ts (TIMESTAMP(MILLIS,true));
+  REQUIRED BYTE_ARRAY symbol (STRING);
+  REQUIRED DOUBLE price;
+  REQUIRED DOUBLE volume;
+}";
+
+/// `STOCK_TICK` with `ts` in local time — epoch microseconds against an unknown zone.
+const STOCK_TICK_TS_NOT_UTC: &str = "
+message schema {
+  REQUIRED INT64 ts (TIMESTAMP(MICROS,false));
+  REQUIRED BYTE_ARRAY symbol (STRING);
+  REQUIRED DOUBLE price;
+  REQUIRED DOUBLE volume;
+}";
+
+/// `STOCK_TICK` with an integer `price` rather than a `DOUBLE`.
+const STOCK_TICK_INT_PRICE: &str = "
+message schema {
+  REQUIRED INT64 ts (TIMESTAMP(MICROS,true));
+  REQUIRED BYTE_ARRAY symbol (STRING);
+  REQUIRED INT64 price;
+  REQUIRED DOUBLE volume;
+}";
+
+/// `STOCK_TICK` with a nullable `price`, which the tick layout has no substitute for.
+const STOCK_TICK_NULLABLE_PRICE: &str = "
+message schema {
+  REQUIRED INT64 ts (TIMESTAMP(MICROS,true));
+  REQUIRED BYTE_ARRAY symbol (STRING);
+  OPTIONAL DOUBLE price;
+  REQUIRED DOUBLE volume;
+}";
+
+#[test]
+fn a_millisecond_timestamp_column_is_rejected_rather_than_read_as_microseconds() {
+    let dir = dir();
+    let path = dir.path().join("millis.parquet");
+    write_parquet(
+        &path,
+        STOCK_TICK_TS_MILLIS,
+        vec![
+            Col::Ts(vec![T0 / 1000]),
+            Col::Sym(vec!["AAPL"]),
+            Col::Dbl(vec![1.0]),
+            Col::Dbl(vec![1.0]),
+        ],
+    );
+
+    let export = export(path, LseDataset::Stocks, "AAPL", LseExportTimeframe::Tick);
+    let error = read_export(&export, idx()).unwrap_err();
+
+    let LseError::UnsupportedColumnType { column, .. } = &error else {
+        panic!("expected UnsupportedColumnType, got {error:?}");
+    };
+    assert_eq!(column, "ts");
+}
+
+#[test]
+fn a_timestamp_column_not_adjusted_to_utc_is_rejected() {
+    // The half of the check that has no downstream symptom at all: a local-time column is the right
+    // physical type, the right unit, and off by the writer's UTC offset on every row.
+    let dir = dir();
+    let path = dir.path().join("local.parquet");
+    write_parquet(
+        &path,
+        STOCK_TICK_TS_NOT_UTC,
+        vec![
+            Col::Ts(vec![T0]),
+            Col::Sym(vec!["AAPL"]),
+            Col::Dbl(vec![1.0]),
+            Col::Dbl(vec![1.0]),
+        ],
+    );
+
+    let export = export(path, LseDataset::Stocks, "AAPL", LseExportTimeframe::Tick);
+    let error = read_export(&export, idx()).unwrap_err();
+
+    let LseError::UnsupportedColumnType { column, .. } = &error else {
+        panic!("expected UnsupportedColumnType, got {error:?}");
+    };
+    assert_eq!(column, "ts");
+}
+
+#[test]
+fn a_value_column_of_the_wrong_physical_type_is_rejected() {
+    let dir = dir();
+    let path = dir.path().join("intprice.parquet");
+    write_parquet(
+        &path,
+        STOCK_TICK_INT_PRICE,
+        vec![
+            Col::Ts(vec![T0]),
+            Col::Sym(vec!["AAPL"]),
+            Col::Ts(vec![1]),
+            Col::Dbl(vec![1.0]),
+        ],
+    );
+
+    let export = export(path, LseDataset::Stocks, "AAPL", LseExportTimeframe::Tick);
+    let error = read_export(&export, idx()).unwrap_err();
+
+    let LseError::UnsupportedColumnType {
+        column, required, ..
+    } = &error
+    else {
+        panic!("expected UnsupportedColumnType, got {error:?}");
+    };
+    assert_eq!(column, "price");
+    assert_eq!(*required, "DOUBLE");
+}
+
+#[test]
+fn a_null_in_a_column_the_layout_has_no_substitute_for_is_an_error() {
+    // Nullable `volume`/`ask` map to `None` by design; `price` does not — a tick with no price is
+    // not a tick, and defaulting it would put a zero into the money path.
+    let dir = dir();
+    let path = dir.path().join("nullprice.parquet");
+    write_parquet(
+        &path,
+        STOCK_TICK_NULLABLE_PRICE,
+        vec![
+            Col::Ts(vec![T0]),
+            Col::Sym(vec!["AAPL"]),
+            Col::OptDbl(vec![None]),
+            Col::Dbl(vec![1.0]),
+        ],
+    );
+
+    let export = export(path, LseDataset::Stocks, "AAPL", LseExportTimeframe::Tick);
+    let error = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_err();
+
+    let LseError::NullValue { column } = error else {
+        panic!("expected NullValue, got {error:?}");
+    };
+    assert_eq!(column, "price");
+}
+
+#[test]
+fn a_price_with_no_decimal_representation_is_surfaced_not_zeroed() {
+    // `f64::NAN` has no `Decimal`. Substituting zero would put a real-looking price into the money
+    // path -- and a zero price is not obviously wrong to anything downstream.
+    let dir = dir();
+    let path = dir.path().join("nan.parquet");
+    write_parquet(
+        &path,
+        STOCK_TICK,
+        vec![
+            Col::Ts(vec![T0]),
+            Col::Sym(vec!["AAPL"]),
+            Col::Dbl(vec![f64::NAN]),
+            Col::Dbl(vec![1.0]),
+        ],
+    );
+
+    let export = export(path, LseDataset::Stocks, "AAPL", LseExportTimeframe::Tick);
+    let error = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_err();
+
+    let LseError::PriceNotRepresentable { value, .. } = error else {
+        panic!("expected PriceNotRepresentable, got {error:?}");
+    };
+    assert!(value.is_nan());
+}
+
+#[test]
+fn an_infinite_price_is_surfaced_too() {
+    let dir = dir();
+    let path = dir.path().join("inf.parquet");
+    write_parquet(
+        &path,
+        STOCK_TICK,
+        vec![
+            Col::Ts(vec![T0]),
+            Col::Sym(vec!["AAPL"]),
+            Col::Dbl(vec![f64::INFINITY]),
+            Col::Dbl(vec![1.0]),
+        ],
+    );
+
+    let export = export(path, LseDataset::Stocks, "AAPL", LseExportTimeframe::Tick);
+    let error = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_err();
+
+    assert!(matches!(error, LseError::PriceNotRepresentable { .. }));
+}
+
+#[test]
+fn a_timestamp_outside_the_representable_range_is_an_error_not_a_wrapped_instant() {
+    let dir = dir();
+    let path = dir.path().join("farfuture.parquet");
+    write_parquet(
+        &path,
+        STOCK_TICK,
+        vec![
+            Col::Ts(vec![i64::MAX]),
+            Col::Sym(vec!["AAPL"]),
+            Col::Dbl(vec![1.0]),
+            Col::Dbl(vec![1.0]),
+        ],
+    );
+
+    let export = export(path, LseDataset::Stocks, "AAPL", LseExportTimeframe::Tick);
+    let error = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_err();
+
+    let LseError::TimestampNotRepresentable { micros } = error else {
+        panic!("expected TimestampNotRepresentable, got {error:?}");
+    };
+    assert_eq!(micros, i64::MAX);
 }
 
 #[test]
@@ -717,6 +953,9 @@ fn a_zero_row_artifact_decodes_to_no_events_without_erroring() {
 
 #[test]
 fn symbols_in_export_lists_the_files_symbols_without_decoding_it() {
+    // Deliberately multi-symbol, with the repeat in the middle. An all-one-symbol fixture is
+    // satisfied by an implementation that reads row 0 and stops, and a caller using this to decide
+    // which instruments to index would then silently drop every symbol but the first.
     let dir = dir();
     let path = dir.path().join("syms.parquet");
     write_parquet(
@@ -724,13 +963,48 @@ fn symbols_in_export_lists_the_files_symbols_without_decoding_it() {
         STOCK_TICK,
         vec![
             Col::Ts(vec![T0, T0 + HOUR, T0 + DAY]),
-            Col::Sym(vec!["AAPL", "AAPL", "AAPL"]),
+            Col::Sym(vec!["AAPL", "AAPL", "MSFT"]),
             Col::Dbl(vec![1.0, 2.0, 3.0]),
             Col::Dbl(vec![1.0, 1.0, 1.0]),
         ],
     );
 
-    assert_eq!(symbols_in_export(&path).unwrap(), vec!["AAPL".to_owned()]);
+    // Deduplicated, in first-seen order.
+    assert_eq!(
+        symbols_in_export(&path).unwrap(),
+        vec!["AAPL".to_owned(), "MSFT".to_owned()]
+    );
+}
+
+#[test]
+fn symbols_in_export_walks_every_row_group_not_just_the_first() {
+    // The provider's writer emits one row group per artifact, so a decoder that stopped after the
+    // first would pass every other test in this file.
+    let dir = dir();
+    let path = dir.path().join("syms_groups.parquet");
+    write_parquet_row_groups(
+        &path,
+        STOCK_TICK,
+        vec![
+            vec![
+                Col::Ts(vec![T0]),
+                Col::Sym(vec!["AAPL"]),
+                Col::Dbl(vec![1.0]),
+                Col::Dbl(vec![1.0]),
+            ],
+            vec![
+                Col::Ts(vec![T0 + DAY]),
+                Col::Sym(vec!["MSFT"]),
+                Col::Dbl(vec![2.0]),
+                Col::Dbl(vec![1.0]),
+            ],
+        ],
+    );
+
+    assert_eq!(
+        symbols_in_export(&path).unwrap(),
+        vec!["AAPL".to_owned(), "MSFT".to_owned()]
+    );
 }
 
 #[test]

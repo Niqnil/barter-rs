@@ -43,6 +43,14 @@ fn part_path(destination: &Path, job_id: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// A destination the guard under test must reject before the filesystem is ever touched.
+///
+/// These tests assert that a *client-side* check fires, not that a path is unwritable, so any name
+/// that is never created will do. Portable where a `/dev/null/...` sentinel is not.
+fn unwritten_destination(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join("never-written.parquet")
+}
+
 fn client(server: &MockServer) -> LseVaultClient {
     LseVaultClient::new("test-key")
         .unwrap()
@@ -143,7 +151,14 @@ async fn submit_sends_the_measured_payload_shape() {
         .mount(&server)
         .await;
 
-    assert!(client(&server).submit_export(&tick_request()).await.is_ok());
+    let job = client(&server)
+        .submit_export(&tick_request())
+        .await
+        .unwrap();
+
+    // The mock matches on the exact body, so a wrong payload would 404 — but pinning the decoded
+    // job id costs nothing and makes the response half of the round trip an assertion too.
+    assert_eq!(job.job_id, "abc123");
 }
 
 #[tokio::test]
@@ -792,6 +807,57 @@ async fn a_416_on_a_part_file_that_fails_verification_discards_it_and_converges(
 }
 
 #[tokio::test]
+async fn a_fresh_transfer_of_the_right_length_at_the_wrong_digest_is_discarded_not_kept() {
+    // The case a `416` is never reached for. The job reports `bytes`, no `.part` exists, and the
+    // server answers `200` with the right *number* of bytes and the wrong content — a provider
+    // regenerating the artifact between the status poll and the download, or any transport that
+    // preserves length but not content.
+    //
+    // The length check passes, so only the digest fails, and the transfer is over: the artifact is
+    // exactly as long as it will ever be and no `Range` request can add to it. Keeping the `.part`
+    // would leave a corrupt file at the artifact's true length, indistinguishable at rest from a
+    // legitimate one, for a caller that treats the hard `Err` as terminal and never retries.
+    let expected = b"0123456789abcdef";
+    // Same length, different bytes.
+    let served = b"corrupted-bytes!";
+    assert_eq!(expected.len(), served.len());
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(served.to_vec()))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("out.parquet");
+    let part = part_path(&destination, "job1");
+    let job = serde_json::from_str(&ready_body("job1", expected)).unwrap();
+
+    let error = client(&server)
+        .download_export(&job, &destination, &tick_request())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            LseError::IntegrityMismatch {
+                discarded: true,
+                ..
+            }
+        ),
+        "a complete-but-corrupt artifact is not resumable: {error:?}"
+    );
+    // Fails safe either way — the corrupt bytes never reach the destination.
+    assert!(!destination.exists());
+    assert!(
+        !part.exists(),
+        "the corrupt .part must not survive at the artifact's true length"
+    );
+}
+
+#[tokio::test]
 async fn a_job_with_no_integrity_metadata_ignores_a_partial_file_and_transfers_in_full() {
     // With neither `bytes` nor `sha256` there is nothing to verify the result against, so resuming
     // would rename a file into place having fetched only part of it and checked none of it — the
@@ -842,6 +908,8 @@ async fn a_job_describing_a_different_request_is_rejected_before_a_byte_is_fetch
         (r#""end":"2026-08-01""#, "end", "2026-08-01"),
     ];
 
+    let dir = tempfile::tempdir().unwrap();
+
     for (echo, field, reported) in cases {
         let server = MockServer::start().await;
         let job: LseExportJobStatus = serde_json::from_str(&format!(
@@ -850,7 +918,7 @@ async fn a_job_describing_a_different_request_is_rejected_before_a_byte_is_fetch
         .unwrap();
 
         let error = client(&server)
-            .download_export(&job, "/dev/null/nope", &tick_request())
+            .download_export(&job, unwritten_destination(&dir), &tick_request())
             .await
             .unwrap_err();
 
@@ -899,15 +967,19 @@ async fn a_job_that_echoes_nothing_back_is_downloaded_rather_than_refused() {
 async fn downloading_a_job_that_is_not_ready_is_rejected_before_a_request_is_sent() {
     let server = MockServer::start().await;
     let job = serde_json::from_str(r#"{"id":"job1","status":"queued"}"#).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let destination = unwritten_destination(&dir);
 
     let error = client(&server)
-        .download_export(&job, "/dev/null/nope", &tick_request())
+        .download_export(&job, &destination, &tick_request())
         .await
         .unwrap_err();
 
     assert!(matches!(error, LseError::InvalidInput { .. }));
     // Nothing was requested: the guard is client-side.
     assert!(server.received_requests().await.unwrap().is_empty());
+    // ...and nothing was created either, not even the parent directory.
+    assert!(!destination.exists());
 }
 
 // ── pre-flight validation: every one of these would otherwise cost a real export ──

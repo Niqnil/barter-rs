@@ -38,7 +38,7 @@ impl IndexedInstrumentsBuilder {
             instrument.underlying.quote.clone(),
         ));
 
-        // If Perpetual, Future, or Option, add settlement asset
+        // Add the settlement asset for every kind that has one (all but Spot)
         if let Some(settlement_asset) = instrument.kind.settlement_asset() {
             self.assets.push(ExchangeAsset::new(
                 instrument.exchange,

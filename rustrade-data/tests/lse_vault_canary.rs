@@ -181,8 +181,10 @@ async fn usage_reports_every_allowance_dimension() {
 
     let status = client.usage().await.expect("usage");
 
-    // The static request-shaping limits must be present and non-zero; a zero would mean the field
-    // had been renamed and silently defaulted.
+    // Sanity bounds on the values themselves. Note these cannot detect a *renamed* field:
+    // `QuotaStatus` has no `#[serde(default)]`, so a rename is a missing key, which fails
+    // deserialisation at the `expect` above before any assertion here runs. That is the desired
+    // behaviour -- a rename should be loud -- but it means the real content check is the one below.
     assert!(status.calls_per_minute > 0, "calls_per_minute missing");
     assert!(
         status.max_rows_per_request > 0,

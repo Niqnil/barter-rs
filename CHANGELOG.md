@@ -38,12 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **London Strategic Edge bulk export** (`rustrade-data`, `lse` feature): submit, poll and download
   the provider's asynchronous export jobs. This is the **only** path to the raw tick tape — neither
   REST nor WebSocket reaches it. Downloads resume via `Range`, verify the job's SHA-256, and rename
-  atomically; on a mismatch the destination is left absent and the partial file is kept, so a
-  repeated call resumes rather than restarting. The exception is a partial file that this call
-  appended nothing to — it already looked complete, or the resume `Range` came back `416`: failing
-  verification then proves it belongs to a *different* job that used the same destination, so it is
-  discarded and a repeated call restarts — keeping it would fail identically forever.
-  `LseError::IntegrityMismatch` reports which happened. A resumed
+  atomically. On a verification failure the destination is left absent and what happens to the
+  partial file follows from *which* check failed: one **shorter** than the artifact is a valid
+  prefix, so it is kept and a repeated call resumes from it, which for a multi-gigabyte artifact is
+  the difference between finishing and starting over. One that is **longer**, or that is already as
+  long as the artifact will ever get and still fails the digest, cannot be repaired by fetching
+  more, so it is discarded and a repeated call restarts — keeping it would fail identically forever.
+  `LseError::IntegrityMismatch` reports which happened via its `discarded` field. A resumed
   transfer is checked at the seam: a `206` is accepted only when its `Content-Range` begins at the
   requested byte (the job's `bytes`/`sha256` are both optional, so they cannot be relied on to catch
   a mis-ranged response), and a `416` is read as "the partial file already holds the whole artifact"
@@ -418,9 +419,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session of quote ticks followed by a year of daily bars, a year-old book would mark every position
   after it, `pnl_unrealised` would stop moving, and the tear sheet would look entirely normal.
   The struct gains a `candle: Option<Candle>` field, so its positional `new()` and its serialized
-  shape both change. `OrderBook` (L2), `Liquidation` and `OptionGreeks` remain excluded, now with a
+  shape both change. It is now `#[serde(default)]`, so state written by a build predating the field
+  still deserializes with `candle: None` instead of failing on a missing key — serde requires an
+  absent field to be declared defaultable even when its type is `Option`, and deriving `Default` does
+  not change that. Given that engine state is persisted, replicated to the audit path and replayed,
+  a snapshot from an older build failing to load outright would be the more disruptive default.
+  `OrderBook` (L2), `Liquidation` and `OptionGreeks` remain excluded, now with a
   stated reason each in place of the catch-all; `Liquidation` in particular is a forced fill at a
   potentially dislocated price and must never reach `price()`.
+
+- **`OrderBookL1::last_update_time` now documents a producer obligation** (`rustrade-data`). It must
+  carry the venue's own instant and match the wrapping `MarketEvent::time_exchange`. Downstream
+  state orders L1 updates on this field rather than on the event's, so a custom connector stamping
+  it from a local or aggregator clock gets two effects with no error and no log: a staleness guard
+  keyed on it can reject legitimately newer updates and freeze the held book, and recency ranking
+  against trades and candles goes wrong, silently moving `pnl_unrealised`. Every in-tree producer
+  already satisfies this; only the contract is new.
 
 - **`BacktestMarketData::stream()` items are now `Result<_, BarterError>`, and a source failure
   aborts the backtest** (`rustrade`). The item type was infallible, which was adequate only while
@@ -680,6 +694,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`PercentageFeeModel` ignored `contract_size`, understating fees by the multiplier**
+  (`rustrade-execution`). The model computed `rate * price * quantity`, discarding the
+  `contract_size` argument both call sites pass it. Percentage-of-notional is *the* natural fee
+  model for a CFD, and a CFD's notional is the per-point multiplier times the price: a €25/point
+  index CFD at 5000, quantity 1, at 0.1% was charged **€5 instead of €125** — silently, on every
+  fill, in the direction that flatters a backtest. The formula is now
+  `rate * price * quantity.abs() * contract_size`.
+  **⚠️ Behaviour change**: fees increase by `contract_size` for any instrument whose multiplier is
+  not one — every `Cfd`, and any `Future`/`Perpetual` configured with a real contract size. `Spot`
+  is unaffected (its multiplier is `Decimal::ONE`), and `PerContractFeeModel` still deliberately
+  ignores the multiplier, because that fee genuinely is per contract rather than per underlying
+  unit. Backtest results for affected instruments will change; that difference is the error being
+  removed.
+
+- **A failed download could leave a corrupt artifact at the file's true length**
+  (`rustrade-data`, `lse` feature). `download_export` derived "there is nothing left to fetch" only
+  from a `416` on a resume request, so a *fresh* transfer that produced the whole artifact was still
+  treated as resumable. When the server answered with the right number of bytes and the wrong
+  content — a provider regenerating the artifact between the status poll and the download — the
+  length check passed, the digest check failed, and the `.part` was **kept**: a corrupt file sitting
+  at exactly the artifact's length, indistinguishable at rest from a legitimate one, for any caller
+  that treats the hard `IntegrityMismatch` as terminal. It now also counts the transfer complete
+  when the job's reported `bytes` have been received, so that file is discarded and a re-call starts
+  clean. No corrupt bytes ever reached the destination — the rename does not run — so this was a
+  disk-hygiene and contract defect rather than data corruption.
+
 - **A candle whose `close_time` was after its own `time_exchange` injected lookahead into the
   engine** (`rustrade`). `DefaultInstrumentMarketData` keys everything candle-shaped on
   `close_time`, while the merge and the `HistoricalClock` key on `MarketEvent::time_exchange`. The
@@ -690,6 +730,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   candle is now **dropped** with a `tracing::warn!` and the previously stored candle is left intact,
   rather than being admitted and quietly biasing every downstream statistic. A candle closing
   *before* its `time_exchange` (a late-delivered bar) is unaffected — that direction is ordinary.
+  The drop is unconditional; the warning is rate-limited to the 1st, 2nd, 4th, 8th … occurrence,
+  because a producer that mis-stamps one bar mis-stamps all of them, and one line per candle is
+  millions of lines on a large backtest. Each line carries the running total.
 
 - **The LSE vault's pacing was a per-fetch claim, so a multi-instrument replay multiplied it**
   (`rustrade-data`, `lse` feature). `LseVaultClient`'s 300 ms pace was applied between the pages of
