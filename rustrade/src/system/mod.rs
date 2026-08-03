@@ -34,6 +34,9 @@ pub mod config;
 ///
 /// It provides methods for interacting with the system, such as sending `Engine` [`Command`]s,
 /// managing [`TradingState`], and shutting down gracefully.
+// `#[derive(Debug)]` bounds only the type parameters, never the associated types `Engine::Audit`
+// and `Engine::Snapshot` that `engine` and `audit` are built from, so it does not compile here. A
+// hand-written impl would have to demand those bounds of every caller that merely holds a `System`.
 #[allow(missing_debug_implementations)]
 pub struct System<Engine, Event>
 where
@@ -229,7 +232,7 @@ where
 /// Collection of task handles for auxiliary system components that support the `Engine`.
 ///
 /// Used by the [`System`] to shut down auxillary components.
-#[allow(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct SystemAuxillaryHandles {
     /// Handles for running execution components.
     pub execution: ExecutionHandles,

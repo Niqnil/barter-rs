@@ -21,7 +21,7 @@ use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped};
 use crate::exchange::lse::error::{LseError, extract_detail};
 use crate::exchange::lse::quota::QuotaStatus;
 use reqwest::header::{HeaderMap, HeaderValue};
-use std::{env, sync::Arc, time::Duration};
+use std::{env, num::NonZeroU32, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, Semaphore, SemaphorePermit},
     time::{Instant, sleep_until},
@@ -76,6 +76,17 @@ const DEFAULT_PACE: Duration = Duration::from_millis(300);
 /// [`with_concurrency`](LseVaultClient::with_concurrency) rather than assuming the default is your
 /// key's limit.
 const DEFAULT_CONCURRENCY: usize = 2;
+
+/// Default rows requested per page of a paged fetch.
+///
+/// Matches the provider's measured
+/// [`max_rows_per_request`](QuotaStatus::max_rows_per_request). The cap is enforced **silently** —
+/// an over-large range returns exactly this many rows with a `200` and no truncation marker — which
+/// is why pagination never treats a short page as the end of the data. A key on a different plan may
+/// be allowed more: read [`usage`](LseVaultClient::usage) and raise this with
+/// [`with_page_limit`](LseVaultClient::with_page_limit) rather than assuming the default is your
+/// key's limit.
+const DEFAULT_PAGE_LIMIT: NonZeroU32 = NonZeroU32::new(5000).unwrap();
 
 /// Shared gate every request passes through: bounds concurrency, then spaces request starts.
 ///
@@ -161,6 +172,7 @@ pub struct LseVaultClient {
     http: reqwest::Client,
     base_url: String,
     pace: Duration,
+    page_limit: NonZeroU32,
     gate: Arc<RequestGate>,
 }
 
@@ -171,6 +183,7 @@ impl std::fmt::Debug for LseVaultClient {
         f.debug_struct("LseVaultClient")
             .field("base_url", &self.base_url)
             .field("pace", &self.pace)
+            .field("page_limit", &self.page_limit)
             .field("concurrency", &self.gate.concurrency)
             .finish_non_exhaustive()
     }
@@ -202,6 +215,7 @@ impl LseVaultClient {
             http,
             base_url: VAULT_BASE_URL.to_owned(),
             pace: DEFAULT_PACE,
+            page_limit: DEFAULT_PAGE_LIMIT,
             gate: Arc::new(RequestGate::new(DEFAULT_CONCURRENCY)),
         })
     }
@@ -269,6 +283,27 @@ impl LseVaultClient {
         self
     }
 
+    /// Override how many rows a paged fetch requests per page.
+    ///
+    /// The default is the provider's measured
+    /// [`max_rows_per_request`](QuotaStatus::max_rows_per_request); raise it only against a key whose
+    /// [`usage`](Self::usage) reports a higher one. Requesting **more** than your key allows is not
+    /// an error — the vault caps the page silently, and pagination handles a short page — so an
+    /// over-large value costs nothing but degrades into more, smaller pages. Requesting fewer than
+    /// the cap is a legitimate way to bound per-page memory or response latency.
+    ///
+    /// # Why `NonZeroU32`, where [`with_concurrency`](Self::with_concurrency) clamps
+    /// A concurrency of `0` parks every request — visibly broken, so clamping to `1` is a safe
+    /// reading of a caller slip. A page limit of `0` is worse than broken: the vault answers `200`
+    /// with an empty page, which pagination reads as the end of the data, so the fetch **completes
+    /// successfully having returned nothing**. That is a silent wrong answer, and the type system
+    /// rules it out rather than a clamp papering over it.
+    #[must_use]
+    pub fn with_page_limit(mut self, limit: NonZeroU32) -> Self {
+        self.page_limit = limit;
+        self
+    }
+
     /// Override how many requests this client may have in flight at once.
     ///
     /// The default is the provider's measured [`vault_concurrency`](QuotaStatus::vault_concurrency);
@@ -301,6 +336,15 @@ impl LseVaultClient {
     /// never follows a server-supplied URL.
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The configured rows-per-page for a paged fetch.
+    ///
+    /// Endpoint families send this as the `limit` query parameter. The non-zero guarantee
+    /// [`with_page_limit`](Self::with_page_limit) argues for is carried in the type rather than
+    /// asserted here, so a caller cannot reintroduce the empty-page-reads-as-end-of-data case.
+    pub(crate) fn page_limit(&self) -> NonZeroU32 {
+        self.page_limit
     }
 
     /// The configured, authenticated HTTP client.

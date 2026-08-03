@@ -16,6 +16,7 @@ use rust_decimal_macros::dec;
 use rustrade_data::exchange::lse::error::LseError;
 use rustrade_data::exchange::lse::vault::LseVaultClient;
 use rustrade_data::subscription::candle::CandleInterval;
+use std::num::NonZeroU32;
 use std::time::Duration;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -152,6 +153,34 @@ async fn pins_the_resolution_parameter_to_timeframe() {
         .await;
 
     client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-03T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    // `expect(1)` is verified on drop.
+}
+
+#[tokio::test]
+async fn with_page_limit_overrides_the_rows_requested_per_page() {
+    // A key on a plan allowing more (or a caller bounding per-page memory) must be able to move
+    // this; the default above is the provider's measured cap, not a protocol constant.
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/vault/candles"))
+        .and(query_param("limit", "250"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .with_page_limit(NonZeroU32::new(250).unwrap())
         .collect_candles(
             "AAPL",
             CandleInterval::Day1,

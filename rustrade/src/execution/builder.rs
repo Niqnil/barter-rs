@@ -59,6 +59,9 @@ type RunFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// - Building live execution managers, setting up an external connection to each exchange.
 /// - Constructs a [`MultiExchangeTxMap`] with an entry for each mock/live execution manager.
 /// - Combines all exchange account streams into a unified [`AccountStreamEvent`] `Stream`.
+// `mock_exchange_futures` and `execution_init_futures` hold `Pin<Box<dyn Future>>`, which has no
+// `Debug` to delegate to. A hand-written impl could only print a placeholder for the two fields
+// that carry the builder's actual pending work, so it would say less than the type's name already does.
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuilder<'a> {
     instruments: &'a IndexedInstruments,
@@ -238,6 +241,7 @@ impl<'a> ExecutionBuilder<'a> {
 ///
 /// Call [`ExecutionBuild::init`] to run all the required execution component futures on tokio
 /// tasks - returns the [`MultiExchangeTxMap`] and multi-exchange [`AccountStreamEvent`] stream.
+// Holds an `ExecutionBuildFutures`, whose boxed futures have no `Debug` — see below.
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuild {
     pub execution_tx_map: MultiExchangeTxMap,
@@ -286,6 +290,7 @@ impl ExecutionBuild {
     }
 }
 
+// Both fields are collections of `Pin<Box<dyn Future>>`, which has no `Debug` to delegate to.
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuildFutures {
     pub mock_exchange_run_futures: Vec<RunFuture>,
@@ -350,7 +355,7 @@ impl ExecutionBuildFutures {
     }
 }
 
-#[allow(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct ExecutionHandles {
     pub mock_exchanges: Vec<JoinHandle<()>>,
     pub managers: Vec<JoinHandle<()>>,

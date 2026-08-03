@@ -40,14 +40,6 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::debug;
 
-/// Rows requested per page.
-///
-/// Matches the provider's [`max_rows_per_request`](super::quota::QuotaStatus::max_rows_per_request).
-/// The cap is enforced **silently** — an over-large range returns exactly this many rows with a
-/// `200` and no truncation marker — which is why pagination does not treat a short page as the end
-/// of the data. See [`LseVaultClient::fetch_candles`].
-const PAGE_LIMIT: u32 = 5000;
-
 /// Format of the `ts` field in a candle row (`2024-01-02 09:09:00.000000`).
 ///
 /// `%.f` makes the fractional part optional, so a response that drops the microseconds still
@@ -178,9 +170,10 @@ impl LseVaultClient {
     /// of the data. Pagination therefore continues until a page comes back **empty** or the cursor
     /// passes the requested range, which costs at most one extra request per fetch. Treating a
     /// short page as terminal would be faster and would silently truncate the result if the
-    /// provider ever lowered its cap below the 5,000 rows requested per page — the figure the
-    /// provider itself reports as
-    /// [`max_rows_per_request`](super::quota::QuotaStatus::max_rows_per_request).
+    /// provider ever lowered its cap below the rows requested per page — the figure the provider
+    /// itself reports as [`max_rows_per_request`](super::quota::QuotaStatus::max_rows_per_request),
+    /// measured at 5,000 and overridable with
+    /// [`with_page_limit`](LseVaultClient::with_page_limit).
     #[must_use = "fetch_candles returns a lazy Stream that does nothing unless polled"]
     pub fn fetch_candles<'a>(
         &'a self,
@@ -233,7 +226,7 @@ impl LseVaultClient {
                     ("timeframe", timeframe.to_owned()),
                     ("start", cursor.format(CURSOR_FORMAT).to_string()),
                     ("end", range_end.format(CURSOR_FORMAT).to_string()),
-                    ("limit", PAGE_LIMIT.to_string()),
+                    ("limit", self.page_limit().to_string()),
                 ];
 
                 let rows: Vec<LseCandleRow> = self.get_json("candles", &query).await?;
@@ -288,7 +281,7 @@ impl LseVaultClient {
 
                 let next_cursor = last_open
                     .checked_add_signed(TimeDelta::seconds(CURSOR_STEP_SECS))
-                    .ok_or(LseError::TimestampOverflow { open: last_open, interval })?;
+                    .ok_or(LseError::CursorOverflow { last_open })?;
 
                 // A page consisting solely of bars at or before the cursor would leave the cursor
                 // unmoved and loop forever. That requires the provider to ignore `start`, which is

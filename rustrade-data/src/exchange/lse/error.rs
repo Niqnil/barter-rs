@@ -107,6 +107,16 @@ pub enum LseError {
         interval: CandleInterval,
     },
 
+    /// The pagination cursor could not be advanced past the last bar received.
+    ///
+    /// The cursor steps one second past the newest open time on a page, which is not representable
+    /// within a second of [`DateTime::MAX_UTC`]. Distinct from
+    /// [`TimestampOverflow`](Self::TimestampOverflow), which is a *candle's* period end: the addend
+    /// here is the cursor step, not the interval, and naming the interval would send a reader
+    /// looking at arithmetic the code never performed.
+    #[error("pagination cursor overflow: open time {last_open} + 1s is not representable")]
+    CursorOverflow { last_open: DateTime<Utc> },
+
     /// The shared allowance is exhausted.
     ///
     /// Carries the allowance state at the point of rejection so the caller can decide how to pace.
@@ -421,14 +431,26 @@ mod tests {
     }
 
     #[test]
-    fn pathological_nesting_terminates_instead_of_spinning() {
-        // Deeper than the unwrap budget: it must stop and return something, not loop.
+    fn nesting_deeper_than_the_budget_stops_exactly_at_the_budget() {
+        // Six wrappers against a budget of four: it must stop mid-way rather than spin, and the
+        // assertion pins *where* it stopped. Asserting only that the result is non-empty would
+        // hold for any budget at all, including an off-by-one one.
+        let wrap =
+            |inner: &str| serde_json::to_string(&serde_json::json!({ "detail": inner })).unwrap();
+
         let mut body = r#"{"detail":"bottom"}"#.to_owned();
-        for _ in 0..20 {
-            body = serde_json::to_string(&serde_json::json!({ "detail": body })).unwrap();
+        for _ in 0..6 {
+            body = wrap(&body);
         }
 
-        assert!(!extract_detail(&body).is_empty());
+        // Four unwraps consume four of the six wrappers, leaving the two-deep remainder — still
+        // encoded JSON, because the budget ran out before the message did.
+        let mut expected = r#"{"detail":"bottom"}"#.to_owned();
+        for _ in 0..2 {
+            expected = wrap(&expected);
+        }
+
+        assert_eq!(extract_detail(&body), expected);
     }
 
     #[test]

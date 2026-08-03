@@ -403,14 +403,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine fed a candle-only feed was silently inert — `price()` returned `None`, no position could be
   valued, and nothing reported a problem. Candle-first data sources therefore required a custom
   `InstrumentDataState` that every user had to copy from an example.
-  **This changes behaviour for existing feeds**: an instrument receiving candles (or candles and
-  trades) with no L1 book now has a price where it previously had none, which moves
-  `pnl_unrealised` and anything derived from it. The precedence is explicit and documented: the L1
-  volume-weighted mid-price wins unconditionally, as before; otherwise the **more recent** of the
-  last candle (by `close_time`) and the last traded price wins, with a trade taking an exact tie
-  since `close_time` is the exclusive period end. Recency rather than a fixed "candle beats trade"
-  is deliberate — the latter would let a stale `1d` bar silently shadow every trade tick received
-  since it closed.
+  **This changes behaviour for existing feeds, in two ways.** An instrument receiving candles (or
+  candles and trades) with no L1 book now has a price where it previously had none. And `price()`
+  now ranks **all three** inputs by recency instead of giving the L1 book unconditional precedence,
+  so **an instrument with both an L1 book and trades — no candles involved — can now be marked from
+  a trade**, whenever that trade is newer than the book's `last_update_time`. Both move
+  `pnl_unrealised` and anything derived from it.
+  The rule: each candidate is stamped with the instant it describes — the L1 book's
+  `last_update_time`, a candle's `close_time`, a trade's `Timed::time` — and the newest wins. An
+  **exact** tie is broken by granularity, finest first: L1 book, then trade, then candle (a trade
+  stamped at a bar's `close_time` belongs to the next period, since `close_time` is the exclusive
+  period end). Recency rather than any fixed precedence is deliberate: a fixed order lets a stale
+  input shadow a fresh one indefinitely — on a mixed feed one provider alone can produce, such as a
+  session of quote ticks followed by a year of daily bars, a year-old book would mark every position
+  after it, `pnl_unrealised` would stop moving, and the tear sheet would look entirely normal.
   The struct gains a `candle: Option<Candle>` field, so its positional `new()` and its serialized
   shape both change. `OrderBook` (L2), `Liquidation` and `OptionGreeks` remain excluded, now with a
   stated reason each in place of the catch-all; `Liquidation` in particular is a forced fill at a
@@ -512,8 +518,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WsAggregateMsg::into_candle` gain a leading `AggregateVolume` parameter (`Traded` /
   `QuoteTicks`) so the classification is made once, at the call site that knows the ticker, rather
   than re-derived per bar. `AggregateVolume::for_ticker` applies the provider's own `C:` prefix
-  convention. Migration: pass `AggregateVolume::for_ticker(ticker)`, or `AggregateVolume::Traded`
-  if the ticker is known to be an equity.
+  convention, matched ASCII case-insensitively since nothing upstream normalises a caller-supplied
+  ticker. Migration: pass `AggregateVolume::for_ticker(ticker)`, or `AggregateVolume::Traded` if
+  the ticker is known to be an equity.
 
 - **BREAKING: `IbkrHistoricalData::fetch_option_chain` now returns `OptionChainResult`, and no
   longer discards already-decoded entries on a mid-stream IB error** (`rustrade-data`, `ibkr`
@@ -696,6 +703,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching the provider's reported `vault_concurrency`); `with_pace` now spaces the starts of *all*
   requests rather than only successive pages, so the "200 calls per minute" derivation holds however
   many sources a caller passes. A large N therefore makes a replay slower rather than louder.
+  New `with_page_limit` completes the set, overriding the rows requested per page (default 5,000,
+  matching the provider's reported `max_rows_per_request`) for a key on a plan allowing more, or to
+  bound per-page memory. It takes a `NonZeroU32` where `with_concurrency` clamps: a concurrency of
+  `0` parks every request and is visibly broken, whereas a page limit of `0` returns an empty page
+  that pagination reads as end-of-data — a fetch that *succeeds* having returned nothing.
+
+- **A pagination cursor overflow named an addend the code never used** (`rustrade-data`, `lse`
+  feature). Advancing the cursor past a page's newest bar steps forward one second; when that
+  overflowed, `fetch_candles` reported `LseError::TimestampOverflow { open, interval }`, which
+  displays as `candle boundary overflow: open time {open} + {interval} is not representable`. Two
+  things in that sentence were wrong: the overflow is not a candle boundary, and the interval is
+  not the addend — it is the *candle's* period length, which that variant legitimately names at its
+  other call sites, where `close_time == open + interval` really is the arithmetic performed. A
+  reader diagnosing this was pointed at a calculation the code never ran. New
+  `LseError::CursorOverflow { last_open }` names the one-second cursor step that actually overflowed.
+  Only reachable within one second of `DateTime::MAX_UTC`; `LseError` is `#[non_exhaustive]`, so
+  the added variant is not a breaking change, but code matching on `TimestampOverflow` to catch
+  this specific case will no longer see it.
 
 - **The aux-seam benchmark's baseline arm did work the production arm does not** (`rustrade`,
   benches only). `Backtest AuxSeam` compares `backtest()` (arm A) against `backtest_market_only`

@@ -145,9 +145,21 @@ impl AggregateVolume {
     /// `C:` is forex (`C:EURUSD`); everything else — `X:` crypto, `O:` options, bare stock
     /// symbols — has a trade tape. A ticker whose class Massive adds later defaults to
     /// [`Traded`](Self::Traded), matching the pre-existing behaviour for anything unrecognised.
+    ///
+    /// The prefix match is **ASCII case-insensitive**. Massive's own tickers are uppercase, but
+    /// nothing upstream of here normalises one: `validate_ticker` rejects empty strings and
+    /// URL-breaking characters only. A case-sensitive match would classify `c:eurusd` as
+    /// [`Traded`](Self::Traded) and report a quote-update count as real traded volume — precisely
+    /// the silent lie this type exists to prevent.
     #[must_use]
     pub fn for_ticker(ticker: &str) -> Self {
-        if ticker.starts_with("C:") {
+        // `get` rather than slicing: a leading character 3 or 4 bytes wide puts byte 2 *inside* it,
+        // and `&ticker[..2]` panics on a non-char boundary. `get` returns `None` there, falling
+        // through to `Traded` like any other ticker that is not `C:`-prefixed.
+        if ticker
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("C:"))
+        {
             Self::QuoteTicks
         } else {
             Self::Traded
@@ -1447,6 +1459,34 @@ mod tests {
                 AggregateVolume::for_ticker(traded),
                 AggregateVolume::Traded,
                 "{traded}"
+            );
+        }
+    }
+
+    /// Nothing upstream normalises a caller-supplied ticker, so a case-sensitive prefix match
+    /// would report a forex quote-update count as real traded volume.
+    #[test]
+    fn aggregate_volume_classifies_the_forex_prefix_regardless_of_case() {
+        for forex in ["c:eurusd", "c:EURUSD", "C:eurusd"] {
+            assert_eq!(
+                AggregateVolume::for_ticker(forex),
+                AggregateVolume::QuoteTicks,
+                "{forex}"
+            );
+        }
+    }
+
+    /// `..2` is a byte range, and `€:EURUSD` is the case that matters: a 3-byte leading character
+    /// puts byte 2 mid-character, which slicing would panic on. The rest do not straddle a
+    /// boundary — `é` is exactly 2 bytes, and the short strings stop before index 2 — and are here
+    /// to pin that every non-`C:` shape reaches `Traded`, not only the ones `get` rejects.
+    #[test]
+    fn aggregate_volume_does_not_panic_on_a_short_or_non_ascii_ticker() {
+        for ticker in ["", "C", "€:EURUSD", "é"] {
+            assert_eq!(
+                AggregateVolume::for_ticker(ticker),
+                AggregateVolume::Traded,
+                "{ticker}"
             );
         }
     }

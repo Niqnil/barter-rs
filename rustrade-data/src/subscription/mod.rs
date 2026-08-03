@@ -205,6 +205,10 @@ where
 
 /// Determines whether the [`Connector`] associated with this [`ExchangeId`] supports the
 /// ingestion of market data for the provided [`MarketDataInstrumentKind`].
+// The arms are grouped by `MarketDataInstrumentKind`, each group ending in a default whose
+// open-vs-closed choice is documented in place (see the `Spot` note below). Collapsing to
+// `matches!` would fold every group into one boolean expression, leaving nowhere to record which
+// defaults are deliberate and which exchange lists were verified against what.
 #[allow(clippy::match_like_matches_macro)]
 pub fn exchange_supports_instrument_kind(
     exchange: ExchangeId,
