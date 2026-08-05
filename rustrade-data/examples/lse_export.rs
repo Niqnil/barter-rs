@@ -145,27 +145,40 @@ async fn main() {
     // `instrument_index_for` - that makes a fabricated or typo'd index unrepresentable.
     let instrument = InstrumentIndex::new(0);
 
-    // The event type follows the columns present. FX ticks carry `bid` and `ask`, so they decode to
-    // an L1 book; an equities tick export would decode to trades from the same call.
-    let events = read_export(&export, instrument).expect("the artifact to decode");
+    // Decoding is blocking file I/O, so it runs on a blocking thread rather than on this async
+    // one -- `read_export`'s own rustdoc warns against calling it directly from an async context,
+    // where it would stall a runtime worker for the whole file.
+    //
+    // `spawn_blocking` suits a one-shot drain like this. To feed a backtest instead, use
+    // `stream_blocking_iter`, which additionally back-pressures the decoder against its consumer;
+    // see `engine_backtest_with_lse_candles.rs`.
+    let decoded = tokio::task::spawn_blocking(move || {
+        // The event type follows the columns present. FX ticks carry `bid` and `ask`, so they
+        // decode to an L1 book; an equities tick export would decode to trades from the same call.
+        let events = read_export(&export, instrument).expect("the artifact to decode");
 
-    let mut decoded = 0_usize;
-    for event in events {
-        let event = event.expect("every row to decode");
-        decoded += 1;
+        let mut decoded = 0_usize;
+        for event in events {
+            let event = event.expect("every row to decode");
+            decoded += 1;
 
-        if decoded <= 3 {
-            match &event.kind {
-                DataKind::OrderBookL1(book) => info!(
-                    time = %event.time_exchange,
-                    bid = ?book.best_bid.map(|level| level.price),
-                    ask = ?book.best_ask.map(|level| level.price),
-                    "quote"
-                ),
-                other => info!(time = %event.time_exchange, ?other, "event"),
+            if decoded <= 3 {
+                match &event.kind {
+                    DataKind::OrderBookL1(book) => info!(
+                        time = %event.time_exchange,
+                        bid = ?book.best_bid.map(|level| level.price),
+                        ask = ?book.best_ask.map(|level| level.price),
+                        "quote"
+                    ),
+                    other => info!(time = %event.time_exchange, ?other, "event"),
+                }
             }
         }
-    }
+
+        decoded
+    })
+    .await
+    .expect("the decode task not to panic");
 
     info!(decoded, "decode complete");
 }

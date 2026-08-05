@@ -1161,6 +1161,17 @@ struct Transferred {
 /// A field the provider omits is not checked: absence is not disagreement, and refusing to download
 /// over metadata the provider never promised would forbid a correct download. `symbol` is compared
 /// case-insensitively — the provider publishes symbols uppercase but echoes back what was sent.
+///
+/// # ⚠️ `start`/`end` are compared as strings, against [`NaiveDate`]'s `Display`
+/// This assumes the provider echoes dates as `YYYY-MM-DD`, which is measured but not guaranteed.
+/// The assumption **fails safe**: a provider that switched to `DD/MM/YYYY` or added a time
+/// component would make every comparison unequal, so the job is rejected as a mismatch rather than
+/// accepted on a bad match. That is over-strict, not unsound — a correct download would start
+/// failing loudly, and the fix is to parse both sides rather than to relax the check. Parsing is
+/// not done today because the *purpose* here is detecting a substituted default, and an
+/// unparseable echo is itself evidence of one.
+///
+/// [`NaiveDate`]: chrono::NaiveDate
 fn verify_job_covers_request(
     job: &LseExportJobStatus,
     request: &LseExportRequest,

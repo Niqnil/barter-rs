@@ -88,6 +88,20 @@ impl<'a> ExecutionBuilder<'a> {
     ///
     /// The provided [`MockExecutionConfig`] is used to configure the [`MockExchange`] and provide
     /// the initial account state.
+    ///
+    /// # Panics
+    /// Despite returning a `Result`, this **panics** if any indexed instrument on `mocked_exchange`
+    /// has an [`InstrumentKind`] other than `Spot` or `Cfd`. `MockExchange` models no expiry,
+    /// funding or contract chain, so a `Perpetual`, `Future` or `Option` has no faithful
+    /// projection. The panic happens here, at build time, rather than at first order — an
+    /// unbacktestable instrument set is a configuration error, and deferring it would surface as a
+    /// rejected order mid-run.
+    ///
+    /// It also panics if an instrument references a settlement asset absent from the index, which
+    /// [`IndexedInstruments`] construction already rules out.
+    ///
+    /// [`InstrumentKind`]: rustrade_instrument::instrument::kind::InstrumentKind
+    /// [`IndexedInstruments`]: rustrade_instrument::index::IndexedInstruments
     pub fn add_mock<Clock>(
         mut self,
         config: MockExecutionConfig,

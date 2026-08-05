@@ -8,6 +8,12 @@
 //! The provider's tick schema **varies by dataset**, so there is no single "LSE tick" event. All
 //! four layouts below are measured, and the decoder dispatches on the columns actually present:
 //!
+//! One qualification on "the columns actually present": candle-versus-tick comes from the
+//! [`LseExportTimeframe`] the caller ran the job with, and only the tick sub-dispatch reads the
+//! schema. This is not a fallback if the two disagree — a tick export whose file carries OHLC
+//! columns is rejected as [`LseError::UnsupportedSchema`] rather than silently decoded as candles,
+//! so a mismatch fails observably in either direction.
+//!
 //! ```text
 //! bid,   ask                      => DataKind::OrderBookL1   (fx)
 //! price, ask   (+ volume)         => DataKind::OrderBookL1   (volatility, interest_rates, currency_index)
@@ -107,8 +113,24 @@ const MAX_VALUE_COLUMNS: usize = 5;
 enum RowLayout {
     /// `bid` + `ask` — an explicit two-sided quote.
     Quote { bid: usize, ask: usize },
-    /// `price` + `ask`, where `price` is the bid. `volume` is present but always empty here.
-    QuoteFromPrice { price: usize, ask: usize },
+    /// `price` + `ask`, where `price` is the bid.
+    ///
+    /// `volume` is present in these schemas but carries no information: it was measured as a
+    /// literal `0.0` on every row of the one synthetic dataset sampled — never null, though the
+    /// column *is* nullable, so `None` is expressible and a different dataset may well use it. An
+    /// L1 quote has nowhere to put a single undifferentiated size anyway: it cannot be split into a
+    /// bid size and an ask size without inventing one.
+    ///
+    /// So the slot exists to *check* the measurement, not to use it. The check keys on a **non-zero**
+    /// value, because a zero is the provider doing exactly what it has always done and discarding it
+    /// loses nothing — whereas a real size means the provider started populating a column this
+    /// layout drops, which is a fact worth one `warn!` rather than a silent drop. Keying on
+    /// non-null instead would warn on every artifact, which is noise rather than observability.
+    QuoteFromPrice {
+        price: usize,
+        ask: usize,
+        volume: Option<usize>,
+    },
     /// `price` + `volume` with no ask.
     Trade { price: usize, volume: usize },
     /// OHLC, with `volume` present only on some datasets.
@@ -207,10 +229,25 @@ impl ColumnPlan {
             LseExportTimeframe::Tick => match (has("bid"), has("ask"), has("price")) {
                 (true, true, _) => (RowLayout::Quote { bid: 0, ask: 1 }, vec!["bid", "ask"]),
                 // `price` beside an `ask` is the bid, so this is a quote despite the column name.
-                (false, true, true) => (
-                    RowLayout::QuoteFromPrice { price: 0, ask: 1 },
-                    vec!["price", "ask"],
-                ),
+                (false, true, true) => {
+                    let mut names = vec!["price", "ask"];
+
+                    // Opened only to verify it stays a zero -- see `RowLayout::QuoteFromPrice`.
+                    let mut volume = None;
+                    if has("volume") {
+                        volume = Some(names.len());
+                        names.push("volume");
+                    }
+
+                    (
+                        RowLayout::QuoteFromPrice {
+                            price: 0,
+                            ask: 1,
+                            volume,
+                        },
+                        names,
+                    )
+                }
                 (false, false, true) if has("volume") => (
                     RowLayout::Trade {
                         price: 0,
@@ -765,6 +802,7 @@ pub fn read_export(
         failed: false,
         // Saturating rather than failing: the row count only feeds `size_hint`, which is a hint.
         remaining: usize::try_from(rows).unwrap_or(usize::MAX),
+        warned_discarded_volume: false,
     })
 }
 
@@ -807,6 +845,11 @@ pub struct LseExportEvents {
     failed: bool,
     /// Rows not yet consumed, from the file metadata — the `size_hint` upper bound.
     remaining: usize,
+    /// One-shot latch for the discarded-`volume` warning; see [`RowLayout::QuoteFromPrice`].
+    ///
+    /// Per artifact, not per row: the condition is a property of the file, and a tick export runs
+    /// to millions of rows.
+    warned_discarded_volume: bool,
 }
 
 impl std::fmt::Debug for LseExportEvents {
@@ -957,7 +1000,7 @@ impl LseExportEvents {
     /// the observation instant; for a candle it is the bar's **close**, not the `ts` it was read
     /// from — see [`read_export`].
     fn decode_kind(
-        &self,
+        &mut self,
         values: &[Option<f64>; MAX_VALUE_COLUMNS],
         time: DateTime<Utc>,
     ) -> Result<(DateTime<Utc>, DataKind), LseError> {
@@ -970,7 +1013,7 @@ impl LseExportEvents {
                     required(values, ask, "ask")?,
                 ),
             )),
-            RowLayout::QuoteFromPrice { price, ask } => {
+            RowLayout::QuoteFromPrice { price, ask, volume } => {
                 // `price` is the bid; `ask` is nullable on these datasets, so a null row yields a
                 // one-sided book rather than a fabricated ask.
                 let bid = required(values, price, "price")?;
@@ -982,6 +1025,33 @@ impl LseExportEvents {
                         best_ask: None,
                     }),
                 };
+
+                // The measurement that says this column is a constant zero is not re-run per
+                // artifact, so check rather than assume. A zero is the measured state and says
+                // nothing; only a real size means the provider started using the column. Warned
+                // once and not escalated: the quote itself is still correct, and failing a whole
+                // decode over a column this layout has nowhere to put would be worse than
+                // reporting it.
+                if !self.warned_discarded_volume
+                    && let Some(slot) = volume
+                    && values
+                        .get(slot)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|volume| volume != 0.0)
+                {
+                    self.warned_discarded_volume = true;
+                    warn!(
+                        symbol = %self.expected_symbol,
+                        // Deliberately not "a non-zero size": the comparison is also true of a
+                        // NaN, which is not a size at all, and mislabelling garbage as a quantity
+                        // would send a reader looking for the wrong thing.
+                        "LSE quote export populated the `volume` column with a value other than \
+                         the measured `0.0`, which this layout discards: an L1 quote has no \
+                         undifferentiated size field. Reported once per artifact; the decoded \
+                         bid/ask are unaffected"
+                    );
+                }
 
                 Ok((time, kind))
             }

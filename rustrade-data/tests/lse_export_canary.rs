@@ -176,42 +176,52 @@ async fn an_fx_tick_export_round_trips_and_decodes_to_two_sided_quotes() {
         status.table_name
     );
 
-    // The instrument index is irrelevant to schema validation; the decoder checks the symbol
-    // column against the descriptor, which is the assertion that matters here.
-    let events = read_export(&export, InstrumentIndex::new(0)).expect("the artifact to decode");
+    // Decoding is blocking file I/O; `read_export`'s rustdoc warns against driving it from an
+    // async context, so the canary demonstrates the supported shape rather than the shortcut.
+    let decoded = tokio::task::spawn_blocking(move || {
+        // The instrument index is irrelevant to schema validation; the decoder checks the symbol
+        // column against the descriptor, which is the assertion that matters here.
+        let events = read_export(&export, InstrumentIndex::new(0)).expect("the artifact to decode");
 
-    let mut decoded = 0_u64;
-    let mut previous = None;
+        let mut decoded = 0_u64;
+        let mut previous = None;
 
-    for event in events {
-        let event = event.expect("every row to decode");
+        for event in events {
+            let event = event.expect("every row to decode");
 
-        // FX ticks are `{ts, symbol, bid, ask}`, so the decoder must dispatch to a two-sided quote.
-        // A renamed or dropped column would land on a different `DataKind`, not a parse failure.
-        let DataKind::OrderBookL1(book) = &event.kind else {
-            panic!(
-                "expected an FX tick to decode to OrderBookL1, got {:?} - the tick schema appears \
-                 to have changed",
-                event.kind
-            );
-        };
-        assert!(
-            book.best_bid.is_some() && book.best_ask.is_some(),
-            "an FX tick decoded to a one-sided book; both bid and ask are expected on this dataset"
-        );
-
-        // Non-decreasing, not strictly ascending: ties are legitimate and common.
-        if let Some(previous) = previous {
+            // FX ticks are `{ts, symbol, bid, ask}`, so the decoder must dispatch to a two-sided
+            // quote. A renamed or dropped column would land on a different `DataKind`, not a
+            // parse failure.
+            let DataKind::OrderBookL1(book) = &event.kind else {
+                panic!(
+                    "expected an FX tick to decode to OrderBookL1, got {:?} - the tick schema \
+                     appears to have changed",
+                    event.kind
+                );
+            };
             assert!(
-                event.time_exchange >= previous,
-                "timestamps went backwards: {previous} then {}",
-                event.time_exchange
+                book.best_bid.is_some() && book.best_ask.is_some(),
+                "an FX tick decoded to a one-sided book; both bid and ask are expected on this \
+                 dataset"
             );
-        }
-        previous = Some(event.time_exchange);
 
-        decoded += 1;
-    }
+            // Non-decreasing, not strictly ascending: ties are legitimate and common.
+            if let Some(previous) = previous {
+                assert!(
+                    event.time_exchange >= previous,
+                    "timestamps went backwards: {previous} then {}",
+                    event.time_exchange
+                );
+            }
+            previous = Some(event.time_exchange);
+
+            decoded += 1;
+        }
+
+        decoded
+    })
+    .await
+    .expect("the decode task not to panic");
 
     assert_eq!(
         decoded, rows,

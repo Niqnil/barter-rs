@@ -21,7 +21,9 @@ use std::{
 /// # Caller obligations
 /// - **Every input MUST be sorted ascending by `time_exchange`.** A merge cannot recover ordering
 ///   its inputs do not have; an unsorted input yields an unsorted output, which in a backtest means
-///   a non-monotonic clock and wrong results with no failure point.
+///   a non-monotonic clock and wrong results with no failure point. Violations trip a
+///   `debug_assert!` naming the offending input — so tests fail loudly — but the check is compiled
+///   out of release builds, where this stays an obligation rather than a guarantee.
 /// - Inputs should already be tagged with the right instrument key. Resolving a source's key is the
 ///   producer's job, not the merge's.
 ///
@@ -52,11 +54,15 @@ pub fn merge_time_sorted<St, InstrumentKey, Kind, Error>(
 where
     St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, Kind>, Error>>,
 {
+    let inputs = streams
+        .into_iter()
+        .map(|stream| Box::pin(stream.peekable()))
+        .collect::<Vec<_>>();
+
     TimeSortedMerge {
-        inputs: streams
-            .into_iter()
-            .map(|stream| Box::pin(stream.peekable()))
-            .collect(),
+        #[cfg(debug_assertions)]
+        last_peeked: vec![None; inputs.len()],
+        inputs,
     }
 }
 
@@ -67,6 +73,15 @@ where
     St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, Kind>, Error>>,
 {
     inputs: Vec<Pin<Box<Peekable<St>>>>,
+    /// Last `time_exchange` peeked from each input, for the debug-only sortedness check.
+    ///
+    /// *Enforcing* the sort obligation would need buffering, which defeats the O(1) memory the
+    /// merge exists for. *Detecting* a violation needs only the previous timestamp per input, which
+    /// is O(N) in the input count and costs a release build nothing — the field does not exist
+    /// there. So the obligation stays a caller obligation in production and becomes a loud failure
+    /// in every test that runs this code.
+    #[cfg(debug_assertions)]
+    last_peeked: Vec<Option<DateTime<Utc>>>,
 }
 
 impl<St, InstrumentKey, Kind, Error> Stream for TimeSortedMerge<St, InstrumentKey, Kind, Error>
@@ -100,6 +115,22 @@ where
                 }
                 Poll::Ready(Some(Ok(MarketStreamEvent::Item(event)))) => {
                     let time = event.time_exchange;
+
+                    // `poll_peek` re-reports the same buffered event until it is consumed, so this
+                    // must accept equality -- and ties across a genuine advance are legal anyway.
+                    // Only a step backwards is the violation.
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert!(
+                            this.last_peeked[index].is_none_or(|previous| previous <= time),
+                            "merge_time_sorted input {index} is not sorted ascending by \
+                             time_exchange: {:?} was followed by {time}. An unsorted input yields \
+                             an unsorted output, which a backtest cannot detect downstream",
+                            this.last_peeked[index]
+                        );
+                        this.last_peeked[index] = Some(time);
+                    }
+
                     // Strictly `<`, so ties resolve to the earliest-listed input and the merge
                     // stays deterministic for a given input ordering.
                     if earliest.is_none_or(|(_, seen)| time < seen) {
@@ -290,6 +321,17 @@ mod tests {
         .await;
 
         assert_eq!(observed(&merged), vec![(0, 10), (1, 20), (1, 30), (1, 40)]);
+    }
+
+    /// The sort obligation cannot be *enforced* without buffering, so the debug-only check is the
+    /// only thing that makes a violation loud — and a check nothing exercises is one that can be
+    /// inverted or deleted without a single test noticing.
+    // Neither the assert nor the state it reads exists in a release build.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "is not sorted ascending")]
+    async fn an_input_that_steps_backwards_trips_the_debug_assert() {
+        let _merged = merge(vec![vec![item(0, 20), item(0, 10)]]).await;
     }
 
     /// An input that has not yet produced must not be overtaken by one that has.

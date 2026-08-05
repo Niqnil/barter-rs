@@ -207,7 +207,9 @@ const NON_VENUE_SUFFIXES: [&str; 3] = ["A", "B", "F"];
 /// # Venue suffixes
 /// `.L` → GBX, `.T` → JPY, `.HK` → HKD, `.NS` → INR, `.AX` → AUD, `.KS` → KRW, `.TW` → TWD.
 /// Everything else — including the share-class suffixes `.A`/`.B` and the continuous-futures `.F`
-/// — is USD. The suffix is *not* stripped from the base asset; see [`underlying`].
+/// — is USD. Suffix matching is **case-insensitive**, so `bp.l` and `BP.L` agree; defaulting a
+/// mis-cased London ticker to USD would be the 100× error above. The suffix is *not* stripped from
+/// the base asset; see [`underlying`].
 ///
 /// Currency is deliberately **not** derived from the catalog's `country` field, which records
 /// issuer domicile rather than listing venue: Bermuda- and Ireland-domiciled names are USD-quoted,
@@ -217,16 +219,24 @@ pub fn quote_asset(symbol: &str) -> AssetNameExchange {
         return AssetNameExchange::new(quote.to_uppercase_smolstr());
     }
 
+    // The suffix is case-normalised before matching. Matching the literals directly would send a
+    // lowercase `bp.l` to the USD default -- silently, and with exactly the 100x consequence the
+    // warning above describes. Venue suffixes are at most two ASCII characters, so the uppercased
+    // copy stays inline in the `SmolStr` and does not allocate.
     let quote = match symbol.rsplit_once('.') {
-        Some((_, "L")) => "GBX",
-        Some((_, "T")) => "JPY",
-        Some((_, "HK")) => "HKD",
-        Some((_, "NS")) => "INR",
-        Some((_, "AX")) => "AUD",
-        Some((_, "KS")) => "KRW",
-        Some((_, "TW")) => "TWD",
-        // Unrecognised suffix, share class, or no suffix at all.
-        _ => "USD",
+        Some((_, suffix)) => match suffix.to_uppercase_smolstr().as_str() {
+            "L" => "GBX",
+            "T" => "JPY",
+            "HK" => "HKD",
+            "NS" => "INR",
+            "AX" => "AUD",
+            "KS" => "KRW",
+            "TW" => "TWD",
+            // Unrecognised suffix or share class.
+            _ => "USD",
+        },
+        // No suffix at all.
+        None => "USD",
     };
 
     AssetNameExchange::new(quote)
@@ -275,17 +285,21 @@ pub fn underlying(symbol: &str) -> Underlying<AssetNameExchange> {
 /// that does not exist fails observably as a `404` — unlike the ambiguous case above, which is why
 /// only ambiguity is an error here.
 pub fn slug(symbol: &str) -> Result<LseSlug, LseError> {
-    let stem = symbol.strip_suffix(".F").unwrap_or(symbol);
-    let slug = stem.replace('/', "_").to_lowercase_smolstr();
+    // Case-normalise *before* stripping, in the order the doc states. Stripping first makes the
+    // strip an exact-literal match that a lowercase `.f` survives, leaving a stem of `fbtp.f`
+    // that matches nothing in `AMBIGUOUS_SLUG_STEMS` -- so the one input the ambiguity check
+    // exists for is the one that walks past it.
+    let normalised = symbol.replace('/', "_").to_lowercase_smolstr();
+    let slug = normalised.strip_suffix(".f").unwrap_or(&normalised);
 
-    if AMBIGUOUS_SLUG_STEMS.contains(&slug.as_str()) {
+    if AMBIGUOUS_SLUG_STEMS.contains(&slug) {
         return Err(LseError::AmbiguousSlug {
             symbol: symbol.to_string(),
             slug: slug.to_string(),
         });
     }
 
-    Ok(LseSlug(slug))
+    Ok(LseSlug(SmolStr::new(slug)))
 }
 
 /// Returns the provider's spelling of `interval`, or `None` if it does not serve that resolution.
@@ -370,10 +384,35 @@ mod tests {
     fn test_quote_asset_london_listings_are_pence_not_pounds() {
         // The 100x trap. GBX must be a genuinely distinct name from GBP -- asset names are
         // lowercased internally, so a `GBp`/`GBP` casing distinction would collapse to one asset.
-        let gbx = quote_asset("BP.L");
-        assert_eq!(gbx, AssetNameExchange::new("GBX"));
-        assert_ne!(gbx, AssetNameExchange::new("GBP"));
-        assert_ne!(gbx.name().to_lowercase_smolstr(), "gbp");
+        //
+        // Every casing must reach GBX: falling through to the USD default is not a near miss but
+        // the full 100x error, since GBX prices are pence and USD/GBP prices are units.
+        for symbol in ["BP.L", "bp.l", "BP.l", "bp.L"] {
+            let gbx = quote_asset(symbol);
+            assert_eq!(gbx, AssetNameExchange::new("GBX"), "{symbol}");
+            assert_ne!(gbx, AssetNameExchange::new("GBP"), "{symbol}");
+            assert_ne!(gbx.name().to_lowercase_smolstr(), "gbp", "{symbol}");
+        }
+    }
+
+    #[test]
+    fn test_quote_asset_venue_suffixes_are_case_insensitive() {
+        // The suffix arms are literals, so every venue -- not just `.L` -- would default to USD on
+        // a lowercase spelling. Each of these is a currency error, not a cosmetic one.
+        for (symbol, expected) in [
+            ("7203.t", "JPY"),
+            ("0700.hk", "HKD"),
+            ("RELIANCE.ns", "INR"),
+            ("BHP.ax", "AUD"),
+            ("005930.ks", "KRW"),
+            ("2330.tw", "TWD"),
+        ] {
+            assert_eq!(
+                quote_asset(symbol),
+                AssetNameExchange::new(expected),
+                "{symbol} must resolve its venue regardless of case"
+            );
+        }
     }
 
     #[test]
@@ -433,8 +472,11 @@ mod tests {
             ("EUR/USD", "eur_usd"),
             ("SPX500/USD", "spx500_usd"),
             ("NQ.F", "nq"),
+            // The `.F` strip is part of the case-normalised transformation, not a literal match.
+            ("NQ.f", "nq"),
+            ("nq.f", "nq"),
         ] {
-            assert_eq!(slug(symbol).unwrap().as_str(), expected);
+            assert_eq!(slug(symbol).unwrap().as_str(), expected, "{symbol}");
         }
     }
 
@@ -468,10 +510,24 @@ mod tests {
 
     #[test]
     fn test_slug_ambiguity_is_case_insensitive() {
-        assert!(matches!(
-            slug("fbtp.F").unwrap_err(),
-            LseError::AmbiguousSlug { .. }
-        ));
+        // All four casings of the suffixed spelling, not just the canonical one. A lowercase `.f`
+        // is the spelling an exact-literal strip lets through -- it leaves the stem as `fbtp.f`,
+        // which matches no entry in the ambiguous list and so is silently accepted.
+        for symbol in ["fbtp.F", "FBTP.F", "fbtp.f", "FBTP.f", "FbTp.F"] {
+            let error = slug(symbol).unwrap_err();
+            assert!(
+                matches!(error, LseError::AmbiguousSlug { .. }),
+                "{symbol} should be ambiguous, got {error:?}"
+            );
+        }
+
+        // The bare spelling too, in every casing.
+        for symbol in ["fbtp", "FBTP", "FbTp"] {
+            assert!(
+                matches!(slug(symbol).unwrap_err(), LseError::AmbiguousSlug { .. }),
+                "{symbol} should be ambiguous"
+            );
+        }
     }
 
     #[test]

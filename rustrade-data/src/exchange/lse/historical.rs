@@ -165,6 +165,12 @@ impl LseVaultClient {
     /// inverted range is [`LseError::InvalidInput`]. Other failures surface as
     /// [`LseError::Api`] / [`Http`](LseError::Http) / [`Deserialize`](LseError::Deserialize).
     ///
+    /// A page carrying a bar that closes past `end` ends the stream with
+    /// [`LseError::UnexpectedCandleRange`] rather than trimming it away: the upper bound is exact
+    /// by construction, so such a bar means the range parameters were not honoured. Every in-range
+    /// bar on that page is yielded first. Note the lower bound is **not** symmetric — it is widened
+    /// deliberately, so bars closing before `start` are trimmed without comment.
+    ///
     /// # Request count
     /// Because the row cap is applied silently, a short page cannot be distinguished from the end
     /// of the data. Pagination therefore continues until a page comes back **empty** or the cursor
@@ -252,12 +258,12 @@ impl LseVaultClient {
 
                     // A bar past the upper bound ends the fetch — but only after the rest of this
                     // page has been examined. Ascending order is how the vault answers today, not
-                    // something it guarantees, and breaking here would silently drop any in-range
-                    // bar sitting behind an out-of-range one: the stream would end `Ok` on a
-                    // truncated series, which a caller cannot tell apart from a genuinely short
-                    // range. Continuing costs one pass over a page already in memory and changes
-                    // nothing else — `max_open` below already scans every row, so the cursor
-                    // arithmetic never depended on the order in the first place.
+                    // something it guarantees, and failing here immediately would discard any
+                    // in-range bar sitting behind an out-of-range one, so the error would arrive
+                    // having thrown away data the response actually carried. Continuing costs one
+                    // pass over a page already in memory and changes nothing else — `max_open`
+                    // below already scans every row, so the cursor arithmetic never depended on
+                    // the order in the first place.
                     if close_time > end {
                         reached_end = true;
                         continue;
@@ -272,7 +278,21 @@ impl LseVaultClient {
                 }
 
                 if reached_end {
-                    break;
+                    // Terminal, not trimmed-and-logged. `range_end` is derived as `end - step + 1s`
+                    // against an exclusive upper bound, so the newest bar a compliant page can carry
+                    // is the one closing exactly on `end`. A later one means the vault answered
+                    // outside the range it was asked for -- the same silently-ignored-parameter
+                    // failure as the cursor non-advance below, and so the same kind of typed error.
+                    // Trimming and continuing would hand back a series that looks complete; a caller
+                    // cannot assert on a log line, so a warning here would be observable to an
+                    // operator reading stderr and to nobody else. Every in-range bar on this page
+                    // was already yielded above, so nothing this response did contain is lost.
+                    Err(LseError::UnexpectedCandleRange {
+                        symbol: symbol.to_owned(),
+                        cursor,
+                        page,
+                        end,
+                    })?;
                 }
 
                 let Some(last_open) = max_open else {

@@ -47,6 +47,14 @@ pub mod request;
 /// the instrument's `contract_size` into the notional and the fee, so this ledger and the engine's
 /// position accounting cannot disagree by that multiplier.
 ///
+/// [`Perpetual`](InstrumentKind::Perpetual), [`Future`](InstrumentKind::Future) and
+/// [`Option`](InstrumentKind::Option) need funding, margin and expiry settlement, none of which this
+/// mock models. They are **rejected at [`open_order`](Self::open_order)** with
+/// [`ApiError::InstrumentInvalid`] rather than filled. The check lives here, not only in the
+/// `rustrade` builder, because this type and its `instruments` map are public: a consumer that
+/// constructs one directly bypasses every upstream gate, and the alternative to rejecting is filling
+/// a derivative as if it were deliverable stock.
+///
 /// # ⚠️ Caller obligations and known limitations
 /// - **Fund the quote asset of every instrument traded.** Every debit is quote-denominated except a
 ///   spot sell, which debits base. A missing balance is a **panic**, not an error: the balances are
@@ -334,11 +342,14 @@ impl MockExchange {
         // Cloned out before the `&mut self` balance borrow below.
         let (underlying, contract_size, cash_settled) =
             match self.find_instrument_data(&request.key.instrument) {
-                Ok(instrument) => (
-                    instrument.underlying.clone(),
-                    instrument.kind.contract_size(),
-                    matches!(instrument.kind, InstrumentKind::Cfd(_)),
-                ),
+                Ok(instrument) => match Self::settlement_of_supported_kind(instrument) {
+                    Ok(cash_settled) => (
+                        instrument.underlying.clone(),
+                        instrument.kind.contract_size(),
+                        cash_settled,
+                    ),
+                    Err(error) => return (build_open_order_err_response(request, error), None),
+                },
                 Err(error) => return (build_open_order_err_response(request, error), None),
             };
 
@@ -399,16 +410,19 @@ impl MockExchange {
                 .compute_fee(fill_price, request.state.quantity, contract_size);
 
         let balance_change_result = match (cash_settled, request.state.side) {
-            // A CFD is a cash-settled position on a price, not an exchange of the two underlying
-            // assets: there is nothing to deliver in either direction. A short is a margin position
-            // rather than a stock loan, so -- unlike a spot sell -- it requires no base inventory,
-            // which would otherwise force the caller to fund a phantom balance in an index or a
-            // commodity to open one. Both directions therefore post quote-denominated cash.
+            // Both directions of a CFD, and the buy side of a spot trade, post quote-denominated
+            // cash -- so they are one arm, not two identical ones.
             //
-            // The notional stands in for a margin requirement: this mock models no leverage, so
-            // "you must hold the full notional to open the position" is the conservative reading,
-            // and it matches what the spot buy path already requires.
-            (true, _) => {
+            // A CFD is a cash-settled position on a price, not an exchange of the two underlying
+            // assets: there is nothing to deliver in either direction. A CFD short is a margin
+            // position rather than a stock loan, so -- unlike a spot sell -- it requires no base
+            // inventory, which would otherwise force the caller to fund a phantom balance in an
+            // index or a commodity to open one.
+            //
+            // For a CFD the notional stands in for a margin requirement: this mock models no
+            // leverage, so "you must hold the full notional to open the position" is the
+            // conservative reading, and it is the same requirement a spot buy already carries.
+            (true, _) | (false, Side::Buy) => {
                 #[allow(clippy::expect_used)]
                 // Invariant: MockExchange - balances exist for all configured instruments
                 let current = self
@@ -420,45 +434,6 @@ impl MockExchange {
                 assert_eq!(current.balance.total, current.balance.free);
 
                 let quote_required = order_notional_quote + order_fees_quote;
-                let maybe_new_balance = current.balance.free - quote_required;
-
-                if maybe_new_balance >= Decimal::ZERO {
-                    current.balance.free = maybe_new_balance;
-                    current.balance.total = maybe_new_balance;
-                    current.time_exchange = time_exchange;
-
-                    Ok((
-                        current.clone(),
-                        AssetFees::new(
-                            underlying.quote.clone(),
-                            order_fees_quote,
-                            Some(order_fees_quote),
-                        ),
-                    ))
-                } else {
-                    Err(ApiError::BalanceInsufficient(
-                        underlying.quote.clone(),
-                        format!(
-                            "Available Balance: {}, Required Balance inc. fees: {}",
-                            current.balance.free, quote_required
-                        ),
-                    ))
-                }
-            }
-            (false, Side::Buy) => {
-                // Buying Instrument requires sufficient QuoteAsset Balance
-                #[allow(clippy::expect_used)]
-                // Invariant: MockExchange - balances exist for all configured instruments
-                let current = self
-                    .account
-                    .balance_mut(&underlying.quote)
-                    .expect("MockExchange has Balance for all configured Instrument assets");
-
-                // Currently we only supported MarketKind orders, so they should be identical
-                assert_eq!(current.balance.total, current.balance.free);
-
-                let quote_required = order_notional_quote + order_fees_quote;
-
                 let maybe_new_balance = current.balance.free - quote_required;
 
                 if maybe_new_balance >= Decimal::ZERO {
@@ -594,6 +569,43 @@ impl MockExchange {
             Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                 format!("MockExchange does not support OrderKind::{order_kind:?}"),
             )))
+        }
+    }
+
+    /// Returns whether `instrument` is cash-settled, rejecting kinds this exchange cannot model.
+    ///
+    /// # Why this is enforced here and not only upstream
+    /// [`MockExchange`] and its `instruments` map are both public, so a consumer can construct one
+    /// directly and never pass through the `rustrade` builder that screens kinds today. Without
+    /// this gate a [`InstrumentKind::Perpetual`], [`InstrumentKind::Future`] or
+    /// [`InstrumentKind::Option`] falls to the physically-settled spot path and is filled as if it
+    /// were deliverable stock — with its `contract_size` multiplier applied to a delivery that
+    /// cannot happen, and with no funding, margin or expiry settlement anywhere. That is a wrong
+    /// backtest, not a missing feature, and it is silent.
+    ///
+    /// # Errors
+    /// Returns [`ApiError::InstrumentInvalid`] for any kind other than [`InstrumentKind::Spot`] or
+    /// [`InstrumentKind::Cfd`].
+    fn settlement_of_supported_kind(
+        instrument: &Instrument<ExchangeId, AssetNameExchange>,
+    ) -> Result<bool, UnindexedApiError> {
+        match &instrument.kind {
+            InstrumentKind::Spot => Ok(false),
+            InstrumentKind::Cfd(_) => Ok(true),
+            unsupported => Err(ApiError::InstrumentInvalid(
+                instrument.name_exchange.clone(),
+                format!(
+                    "MockExchange does not support {}; only Spot and Cfd are modelled",
+                    match unsupported {
+                        InstrumentKind::Perpetual(_) => "InstrumentKind::Perpetual",
+                        InstrumentKind::Future(_) => "InstrumentKind::Future",
+                        InstrumentKind::Option(_) => "InstrumentKind::Option",
+                        // Unreachable: both are matched above. Spelled out rather than `_` so a new
+                        // kind is a compile error here instead of a mislabelled rejection.
+                        InstrumentKind::Spot | InstrumentKind::Cfd(_) => "InstrumentKind",
+                    }
+                ),
+            )),
         }
     }
 
@@ -1062,6 +1074,80 @@ mod tests {
             usdt.balance.free, initial_usdt,
             "quote balance should be unchanged on sell"
         );
+    }
+
+    /// A derivative must be rejected, not filled down the physically-settled spot path.
+    ///
+    /// The fixture is mutated through the public `instruments` map on purpose: that is exactly the
+    /// route a consumer takes when it builds a `MockExchange` itself rather than through the
+    /// `rustrade` builder, and it is the route that had no gate on it.
+    #[test]
+    fn unsupported_instrument_kinds_are_rejected_rather_than_filled_as_spot() {
+        use rustrade_instrument::instrument::kind::{
+            future::FutureContract,
+            option::{OptionContract, OptionExercise, OptionKind},
+            perpetual::PerpetualContract,
+        };
+
+        let settlement = AssetNameExchange::new("USDT");
+        let expiry = Utc::now();
+
+        let unsupported = [
+            InstrumentKind::Perpetual(PerpetualContract {
+                contract_size: d("10"),
+                settlement_asset: settlement.clone(),
+            }),
+            InstrumentKind::Future(FutureContract {
+                contract_size: d("10"),
+                settlement_asset: settlement.clone(),
+                expiry,
+            }),
+            InstrumentKind::Option(OptionContract {
+                contract_size: d("10"),
+                settlement_asset: settlement.clone(),
+                kind: OptionKind::Call,
+                exercise: OptionExercise::European,
+                expiry,
+                strike: d("50000"),
+            }),
+        ];
+
+        for kind in unsupported {
+            // Amply funded: the rejection must come from the kind, not from a balance shortfall.
+            let mut exchange = make_exchange("10", "10000000");
+            exchange
+                .instruments
+                .get_mut(&instrument_name())
+                .unwrap()
+                .kind = kind.clone();
+
+            let (response, notifications) =
+                exchange.open_order(buy_request("1.0"), market_prices("50000"));
+
+            assert!(
+                notifications.is_none(),
+                "{kind:?} must produce no notifications"
+            );
+            assert!(
+                matches!(
+                    response.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(
+                        UnindexedOrderError::Connectivity(_) | UnindexedOrderError::Rejected(_)
+                    ))
+                ),
+                "{kind:?} must be rejected, got {:?}",
+                response.state
+            );
+
+            // And the ledger must be untouched -- a rejected order that still moved cash would be
+            // worse than one that filled.
+            let usdt = exchange.account.balance_mut(&quote()).unwrap();
+            assert_eq!(
+                usdt.balance.free,
+                d("10000000"),
+                "{kind:?} must not move the quote balance"
+            );
+        }
     }
 
     #[test]

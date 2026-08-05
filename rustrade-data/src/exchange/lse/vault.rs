@@ -127,6 +127,15 @@ impl RequestGate {
 
     /// Wait for a slot. The returned permit must be held for the whole request, body included.
     ///
+    /// # The permit is acquired *before* the pacing wait, deliberately
+    /// A caller therefore holds a permit while sleeping to its slot, so `concurrency` bounds
+    /// **admitted** callers rather than requests actually in flight — with a `pace` of 300ms and a
+    /// concurrency of 2, the steady state is one request on the wire and one waiting, not two on
+    /// the wire. Acquiring in the other order would let an unbounded number of callers queue on
+    /// the pacing mutex and then release together, which is the burst the concurrency limit exists
+    /// to prevent. The cost is that `concurrency` reads as a slightly stricter limit than its name
+    /// suggests; the benefit is that neither bound can be exceeded.
+    ///
     /// `None` is returned only if the semaphore were closed, which cannot happen: it is private to
     /// this type and nothing closes it. Degrading to an unpaced-but-still-spaced request beats
     /// panicking a caller's run over an unreachable condition, and this crate denies
@@ -261,6 +270,16 @@ impl LseVaultClient {
     /// This replaces the authenticated client built by [`new`](Self::new), auth header included.
     /// It is intended for transport configuration (proxy, TLS, a shared connection pool) where the
     /// caller supplies credentials; a client without the header will see every request `401`.
+    ///
+    /// # ⚠️ It must also carry its own timeouts
+    /// [`new`](Self::new) configures a 30s total timeout and a 30s read timeout; `reqwest`'s
+    /// default is **neither**. Replacing the client drops both, and a timeout-less client
+    /// interacts badly with the [request gate](Self#request-rationing-is-per-client-not-per-call):
+    /// a permit is held for the whole request, so with the default concurrency of 2, two stalled
+    /// connections exhaust the gate *permanently* — for this client and every clone of it, with no
+    /// error, no log, and nothing to observe but a run that stops making progress. Set
+    /// [`timeout`](reqwest::ClientBuilder::timeout) and
+    /// [`read_timeout`](reqwest::ClientBuilder::read_timeout) on any client passed here.
     #[must_use]
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.http = client;
@@ -396,9 +415,16 @@ impl LseVaultClient {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             // Surfaced and terminal: pacing policy belongs to the caller, so this never sleeps and
             // retries on their behalf.
-            return Err(LseError::RateLimited {
-                retry_after: parse_retry_after(response.headers()),
-            });
+            let retry_after = parse_retry_after(response.headers());
+
+            // Drain before dropping, so the connection can go back to the pool. A 429 body is a
+            // short JSON detail; dropping the response unread closes the connection instead, and
+            // the caller's retry then pays a fresh TLS handshake for nothing. Discarded rather
+            // than reported -- `retry_after` is already the actionable part, and a read failure
+            // here must not mask the rate limit.
+            let _ = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await;
+
+            return Err(LseError::RateLimited { retry_after });
         }
 
         if !status.is_success() {

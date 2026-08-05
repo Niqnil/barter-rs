@@ -117,6 +117,33 @@ pub enum LseError {
     #[error("pagination cursor overflow: open time {last_open} + 1s is not representable")]
     CursorOverflow { last_open: DateTime<Utc> },
 
+    /// The vault served a candle closing past the requested `end`.
+    ///
+    /// The upper bound sent to the vault is exact by construction: it is `end - interval + 1s`
+    /// against a parameter that is *exclusive* on open time, so the newest bar a compliant page can
+    /// carry is the one whose close falls exactly on `end`. A later one means the range parameters
+    /// were not honoured — the same silently-ignored-parameter failure as a page that repeats the
+    /// cursor it was given, which is why both are terminal rather than quietly repaired.
+    ///
+    /// # Not symmetric with the lower bound, deliberately
+    /// The lower bound is widened by one interval *on purpose*, to readmit the bar whose close
+    /// equals `start`, so a page legitimately carries bars closing before `start` and those are
+    /// trimmed without comment. Nothing widens the upper bound, so there is no benign reading of a
+    /// bar past it.
+    ///
+    /// Every in-range bar on the offending page is yielded **before** this arrives: the page is
+    /// scanned to the end first, so failing here costs none of the data the response did contain.
+    #[error(
+        "page {page} for {symbol:?} returned a candle closing after {end} (cursor {cursor}): the \
+         range parameters appear to have been ignored"
+    )]
+    UnexpectedCandleRange {
+        symbol: String,
+        cursor: DateTime<Utc>,
+        page: usize,
+        end: DateTime<Utc>,
+    },
+
     /// The shared allowance is exhausted.
     ///
     /// Carries the allowance state at the point of rejection so the caller can decide how to pace.

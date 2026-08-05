@@ -57,6 +57,14 @@ jobs:
       - name: Run cargo check
         run: cargo check --locked --workspace --all-targets --all-features
 
+      # Every other job runs --all-features, so a missing `#[cfg(feature = ...)]` on an optional
+      # integration would ship green. These pin the claim that the integrations are genuinely
+      # optional: the default build must not require them.
+      - name: Run cargo check (no default features)
+        run: |
+          cargo check --locked -p rustrade-data --no-default-features
+          cargo check --locked -p rustrade-execution --no-default-features
+
   test:
     name: cargo test
     needs: [fmt, check]

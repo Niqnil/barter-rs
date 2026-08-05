@@ -432,6 +432,18 @@ mod tests {
         assert_eq!(data.price(), Some(dec!(300)));
     }
 
+    /// The mirror of the case above. L1 outranks a trade at an exact tie, so a stale book losing to
+    /// a fresh trade is specifically the recency comparison working rather than the rank order —
+    /// which is why it is worth pinning separately from the candle case.
+    #[test]
+    fn stale_l1_does_not_shadow_fresh_trade() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(100), l1(at(100), dec!(100))));
+        data.process(&event(at(86_500), trade(dec!(200))));
+
+        assert_eq!(data.price(), Some(dec!(200)));
+    }
+
     /// At equal recency L1 still wins, which is what keeps an L1-only feed behaving exactly as it
     /// did before the other two inputs were considered.
     #[test]

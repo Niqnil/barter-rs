@@ -12,6 +12,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 
 use chrono::{DateTime, TimeDelta, Utc};
+use futures::StreamExt;
 use rust_decimal_macros::dec;
 use rustrade_data::exchange::lse::error::LseError;
 use rustrade_data::exchange::lse::vault::LseVaultClient;
@@ -223,13 +224,15 @@ async fn trims_bars_outside_the_close_time_contract() {
 
     // The lower bound is widened to capture the bar whose close equals `start`, so the page can
     // legitimately contain a bar that closes before it. That one must not be yielded.
+    //
+    // Only the lower side is exercised here. A bar closing past `end` is not a trim but a range
+    // violation, and is covered by `a_candle_closing_past_the_requested_end_is_an_error` below.
     mount_page(
         &server,
         "2024-01-03 00:00:00",
         &[
             equity_row("2024-01-02 00:00:00.000000", "11.0"), // closes 01-03, before `start`
             equity_row("2024-01-03 00:00:00.000000", "12.0"), // closes 01-04, in range
-            equity_row("2024-01-04 00:00:00.000000", "13.0"), // closes 01-05, past `end`
         ],
     )
     .await;
@@ -247,6 +250,48 @@ async fn trims_bars_outside_the_close_time_contract() {
     assert_eq!(candles.len(), 1);
     assert_eq!(candles[0].close_time, utc("2024-01-04T00:00:00Z"));
     assert_eq!(candles[0].close, dec!(12.0));
+}
+
+#[tokio::test]
+async fn a_candle_closing_past_the_requested_end_is_an_error() {
+    let server = MockServer::start().await;
+
+    // The client asks for opens in `[01-03 00:00:00, 01-03 00:00:01)` — the upper bound is
+    // `end - interval + 1s` against an exclusive parameter, so the newest bar a compliant page can
+    // carry is the one closing exactly on `end`. The 01-04 open closes 01-05 and could only arrive
+    // from a vault that ignored the bound it was given.
+    mount_page(
+        &server,
+        "2024-01-03 00:00:00",
+        &[
+            equity_row("2024-01-03 00:00:00.000000", "12.0"), // closes 01-04, in range
+            equity_row("2024-01-04 00:00:00.000000", "13.0"), // closes 01-05, past `end`
+        ],
+    )
+    .await;
+
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-04T00:00:00Z"),
+            utc("2024-01-04T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    // Pinned on the fields, not just the variant: trimming the bar away and ending `Ok` was the
+    // previous behaviour, and it is unobservable in the returned candles by construction — a test
+    // that asserted only on the output could not tell the guard from its absence.
+    let LseError::UnexpectedCandleRange {
+        symbol, page, end, ..
+    } = &error
+    else {
+        panic!("expected LseError::UnexpectedCandleRange, got {error:?}");
+    };
+    assert_eq!(symbol, "AAPL");
+    assert_eq!(*page, 1);
+    assert_eq!(*end, utc("2024-01-04T00:00:00Z"));
 }
 
 #[tokio::test]
@@ -493,13 +538,15 @@ async fn a_malformed_timestamp_surfaces_rather_than_being_skipped() {
 }
 
 #[tokio::test]
-async fn an_out_of_order_page_does_not_truncate_the_series() {
+async fn an_out_of_order_page_yields_the_in_range_bar_before_failing() {
     let server = MockServer::start().await;
 
     // Ascending rows are what the vault serves, not what it promises. A bar past the upper bound
-    // listed BEFORE an in-range one must not end the page early: dropping the in-range bar would
-    // return a short series with an `Ok` result, which a caller cannot tell apart from a range that
-    // genuinely held one fewer bar.
+    // listed BEFORE an in-range one must not end the page early: the page is scanned to the end, so
+    // the in-range bar is yielded first and only then does the range violation terminate the stream.
+    //
+    // Driven as a stream rather than through `collect_candles`, which discards everything it
+    // collected the moment an item is `Err` — the ordering this guards is invisible through it.
     mount_page(
         &server,
         "2024-01-03 00:00:00",
@@ -510,19 +557,37 @@ async fn an_out_of_order_page_does_not_truncate_the_series() {
     )
     .await;
 
-    let candles = client(&server)
-        .collect_candles(
-            "AAPL",
-            CandleInterval::Day1,
-            utc("2024-01-04T00:00:00Z"),
-            utc("2024-01-04T00:00:00Z"),
-        )
-        .await
-        .unwrap();
+    let client = client(&server);
+    let stream = client.fetch_candles(
+        "AAPL",
+        CandleInterval::Day1,
+        utc("2024-01-04T00:00:00Z"),
+        utc("2024-01-04T00:00:00Z"),
+    );
+    futures::pin_mut!(stream);
 
-    assert_eq!(candles.len(), 1, "the in-range bar must survive the page");
-    assert_eq!(candles[0].close_time, utc("2024-01-04T00:00:00Z"));
-    assert_eq!(candles[0].close, dec!(12.0));
+    let candle = stream
+        .next()
+        .await
+        .expect("the in-range bar must be yielded before the range violation")
+        .expect("the in-range bar must arrive as Ok, not as the error");
+    assert_eq!(candle.close_time, utc("2024-01-04T00:00:00Z"));
+    assert_eq!(candle.close, dec!(12.0));
+
+    let error = stream
+        .next()
+        .await
+        .expect("the range violation must terminate the stream")
+        .unwrap_err();
+    assert!(
+        matches!(error, LseError::UnexpectedCandleRange { .. }),
+        "expected the range violation, got {error:?}"
+    );
+
+    assert!(
+        stream.next().await.is_none(),
+        "the stream must end at the range violation"
+    );
 }
 
 #[tokio::test]

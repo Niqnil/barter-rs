@@ -15,6 +15,10 @@
 //! - The tick schema **varies by dataset**: `fx` is `{ts, symbol, bid, ask}`, `stocks` is
 //!   `{ts, symbol, price, volume}`, and the synthetic classes are `{ts, symbol, price, volume,
 //!   ask}` with `volume`/`ask` nullable.
+//! - On those synthetic classes `volume` was measured as a literal `0.0` on **every** sampled row —
+//!   never null, despite the column being nullable. The layout discards the column and reports only
+//!   a value other than that zero, so keying the report on non-null instead would fire on every
+//!   real artifact.
 //! - The candle schema varies too: `etf` carries `volume`, `fx` omits the column entirely.
 //! - `price` is the **bid** (the provider's price endpoint returns `price == bid` on every symbol
 //!   tested), so `price` beside an `ask` is a quote.
@@ -44,6 +48,8 @@ use rustrade_instrument::instrument::InstrumentIndex;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing_subscriber::layer::SubscriberExt;
 
 /// A column of values to write: `None` entries become SQL nulls (OPTIONAL columns only).
 enum Col {
@@ -128,6 +134,39 @@ fn export(path: PathBuf, dataset: LseDataset, symbol: &str, tf: LseExportTimefra
 
 fn idx() -> InstrumentIndex {
     InstrumentIndex::new(0)
+}
+
+/// Run `decode`, returning its value and the number of `WARN` events it emitted on this thread.
+///
+/// Some decoder facts are reported *only* as a log line, because they are worth telling the caller
+/// about but must not fail the decode. Those are unobservable in the decoded output by
+/// construction, so a test that asserts only on output cannot tell a working report from a deleted
+/// one.
+fn count_warnings<T>(decode: impl FnOnce() -> T) -> (T, usize) {
+    #[derive(Default)]
+    struct CountWarnings(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let layer = CountWarnings::default();
+    let count = Arc::clone(&layer.0);
+
+    // Thread-local rather than global: the default subscriber can only be set once per process, and
+    // every other test in this binary must stay unaffected.
+    let value =
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), decode);
+
+    (value, count.load(Ordering::Relaxed))
 }
 
 // ── the three measured tick layouts ──────────────────────────────────────────
@@ -254,6 +293,8 @@ fn a_synth_tick_export_decodes_price_as_the_bid() {
             Col::Ts(vec![T0, T0 + HOUR]),
             Col::Sym(vec!["VIX/USD", "VIX/USD"]),
             Col::Dbl(vec![2.0, 2.5]),
+            // The measured state of this column: a literal `0.0`, not a null. The layout discards
+            // it and warns only on a real size — see the sibling test below.
             Col::OptDbl(vec![Some(0.0), None]),
             Col::OptDbl(vec![Some(2.1), None]),
         ],
@@ -283,6 +324,90 @@ fn a_synth_tick_export_decodes_price_as_the_bid() {
     };
     assert_eq!(book.best_bid.unwrap().price, dec!(2.5));
     assert!(book.best_ask.is_none());
+}
+
+/// Decode a synth tick artifact whose `volume` column holds `volumes`, returning the decoded
+/// events and how many `WARN`s the decode emitted.
+fn decode_synth_with_volumes(name: &str, volumes: Vec<Option<f64>>) -> (Vec<DataKind>, usize) {
+    let dir = dir();
+    let path = dir.path().join(name);
+    let rows = volumes.len();
+    write_parquet(
+        &path,
+        SYNTH_TICK,
+        vec![
+            Col::Ts((0..rows as i64).map(|row| T0 + row * HOUR).collect()),
+            Col::Sym(vec!["VIX/USD"; rows]),
+            Col::Dbl(vec![2.0; rows]),
+            Col::OptDbl(volumes),
+            Col::OptDbl(vec![Some(2.1); rows]),
+        ],
+    );
+
+    let export = export(
+        path,
+        LseDataset::Volatility,
+        "VIX/USD",
+        LseExportTimeframe::Tick,
+    );
+
+    let (events, warnings) = count_warnings(|| {
+        read_export(&export, idx())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    });
+
+    (
+        events.into_iter().map(|event| event.kind).collect(),
+        warnings,
+    )
+}
+
+/// A `volume` this layout has nowhere to put must not become a decode failure — and the drift
+/// report must fire on a real size, stay silent on the measured zero, and do so once per artifact.
+///
+/// The `warn!` is the *only* observable difference the check makes: it cannot alter the decoded
+/// quote, by design. So asserting on decoded output alone would pass identically whether the
+/// trigger keyed on non-zero, on non-null, or on nothing at all — which is exactly how this check
+/// could regress unnoticed. Counting the event is what pins it.
+#[test]
+fn a_populated_volume_warns_once_per_artifact_while_the_measured_zero_stays_silent() {
+    // Every fixture below writes the same bid and ask, so the quote is checked identically in all
+    // three: whatever `volume` holds, a column this layout discards must cost observability only.
+    let assert_quotes = |kinds: &[DataKind], rows: usize| {
+        assert_eq!(kinds.len(), rows);
+        for kind in kinds {
+            let DataKind::OrderBookL1(book) = kind else {
+                panic!("expected OrderBookL1, got {kind:?}");
+            };
+            assert_eq!(book.best_bid.unwrap().price, dec!(2.0));
+            assert_eq!(book.best_ask.unwrap().price, dec!(2.1));
+        }
+    };
+
+    // The measured state of the column. Reporting this would warn on every real artifact.
+    let (kinds, warnings) =
+        decode_synth_with_volumes("zero.parquet", vec![Some(0.0), Some(0.0), Some(0.0)]);
+    assert_eq!(
+        warnings, 0,
+        "a measured zero is not drift and must not warn"
+    );
+    assert_quotes(&kinds, 3);
+
+    // Absent entirely — also not drift.
+    let (kinds, warnings) = decode_synth_with_volumes("null.parquet", vec![None, None]);
+    assert_eq!(warnings, 0, "a null volume must not warn");
+    assert_quotes(&kinds, 2);
+
+    // Real sizes on every row: the provider started using a column this layout discards.
+    let (kinds, warnings) =
+        decode_synth_with_volumes("sized.parquet", vec![Some(500.0), Some(600.0), Some(700.0)]);
+    assert_eq!(
+        warnings, 1,
+        "drift is reported once per artifact, not once per row"
+    );
+    assert_quotes(&kinds, 3);
 }
 
 // ── candles ──────────────────────────────────────────────────────────────────

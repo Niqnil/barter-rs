@@ -365,6 +365,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Silent assumptions in the new LSE and streaming code are now observable.** None of these change
+  a decoded value; each replaces a quiet assumption with something a caller can see.
+  - `merge_time_sorted` trips a `debug_assert!` naming the offending input when one is not sorted
+    ascending (`rustrade-data`). Enforcing the obligation would need buffering, defeating the O(1)
+    memory the merge exists for; *detecting* it needs only the previous timestamp per input. The
+    check and its state are compiled out of release builds entirely.
+  - The Parquet decoder `warn!`s once per artifact when a `price`/`ask` tick export populates the
+    `volume` column, which that layout discards — an L1 quote has no undifferentiated size field.
+    The column was previously never opened, so a provider that started populating it would have been
+    dropped with zero observability (`rustrade-data`, `lse-parquet` feature).
+  - A `429` response now drains its body before being converted to `LseError::RateLimited`, so the
+    connection returns to the pool instead of being closed and re-handshaked on the caller's retry
+    (`rustrade-data`, `lse` feature).
+
+- **A candle page carrying a bar past the requested `end` is now a typed error, not a silent trim**
+  (`rustrade-data`, `lse` feature). `fetch_candles` trimmed such a bar away and ended the stream
+  `Ok`. The upper bound sent to the vault is `end - interval + 1s` against a parameter that is
+  *exclusive* on open time, so the newest bar a compliant page can carry is the one closing exactly
+  on `end` — a later one can only come from a vault that ignored the range it was given, which is
+  the same silently-ignored-parameter failure as a page repeating its cursor, already terminal.
+  Trimming and continuing returned a series that looked complete while the response that produced
+  it was untrustworthy. Now surfaced as `LseError::UnexpectedCandleRange`, carrying the symbol,
+  cursor, page and `end`. Every in-range bar on the offending page is yielded first, so nothing the
+  response did contain is lost. The lower bound is deliberately **not** symmetric: it is widened by
+  one interval on purpose, so bars closing before `start` are still trimmed without comment.
+  **⚠️ Behaviour change**: a fetch that previously returned a short-but-successful series against
+  such a provider now ends with an `Err` after the in-range bars.
+
 - **`ExchangeId`'s `Display` now renders the canonical `snake_case` name** (`rustrade-instrument`).
   It derived `derive_more::Display` with no format attribute, so `format!("{}", BinanceSpot)` was
   `"BinanceSpot"` while `as_str()`, serde and every configuration file said `"binance_spot"`. Two
@@ -693,6 +721,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **`lse::market::quote_asset` returned USD for a lowercase venue suffix, the 100× error it exists
+  to prevent** (`rustrade-data`, `lse` feature). The venue arms were exact string literals, so
+  `quote_asset("bp.l")` fell through to the USD default while `"BP.L"` correctly returned `GBX`.
+  London listings are quoted in **pence**: `BP.L` prints ~548 where BP trades around £5.48, so a
+  mis-cased symbol inflated notional, fees, unrealised PnL and every balance by 100×, silently and
+  with no log. All seven venues were affected (`.L`, `.T`, `.HK`, `.NS`, `.AX`, `.KS`, `.TW`). The
+  suffix is now case-normalised before matching, as the sibling pair-shaped and `underlying` paths
+  already were.
+
+- **`lse::market::slug` accepted an ambiguous symbol spelled with a lowercase `.f`**
+  (`rustrade-data`, `lse` feature). The `.F` strip ran *before* the lowercasing, so it never matched
+  `.f`: the stem stayed `fbtp.f`, matched no entry in the ambiguous-stem list, and was returned as a
+  slug instead of the documented `LseError::AmbiguousSlug`. The transformation now runs in the order
+  its rustdoc states — lowercase, then strip. The existing regression test only covered the
+  uppercase `.F` spelling, which is why it passed; it now covers every casing of both spellings.
+
+- **A panic on the blocking decode thread ended `stream_blocking_iter` as if the source had
+  finished** (`rustrade-data`). The `JoinHandle` was detached, so an `init` or iterator panic
+  dropped the sender and the stream yielded `None` — indistinguishable from clean end-of-stream.
+  Since this is the documented driver for the Parquet decoder, a corrupt artifact could truncate a
+  backtest and still produce a normal-looking summary, which is the exact failure mode the
+  `BacktestMarketData::stream()` change below was written to eliminate. The panic is now re-raised
+  on the task polling the stream, with its original payload, matching `futures::stream::iter` over
+  the same iterator. Items decoded before the panic are still yielded first.
+  **⚠️ Behaviour change**: a caller that previously saw a silent end now observes a panic. That is
+  the point; a source cannot report a panic as `Err` because the error type is unconstrained.
+
+- **`MockExchange` filled `Perpetual`, `Future` and `Option` instruments as physically-settled
+  spot** (`rustrade-execution`). `MockExchange` and its `instruments` map are both public, so a
+  consumer constructing one directly bypassed the `rustrade` builder that screens kinds — the
+  instrument then took the spot path, with its `contract_size` multiplier applied to a delivery that
+  cannot happen and no funding, margin or expiry settlement anywhere. `open_order` now rejects
+  unsupported kinds with `ApiError::InstrumentInvalid` rather than filling them.
+  **⚠️ Behaviour change**: a consumer constructing `MockExchange` directly and submitting a
+  `Perpetual`, `Future` or `Option` now receives a rejected order where one previously filled as
+  spot. Anything reaching `MockExchange` through the `rustrade` builder is unaffected — that path
+  already screened kinds.
 
 - **`PercentageFeeModel` ignored `contract_size`, understating fees by the multiplier**
   (`rustrade-execution`). The model computed `rate * price * quantity`, discarding the
