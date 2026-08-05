@@ -21,6 +21,16 @@ ignore = [
     # Drop this entry only once `cargo audit` against `Cargo.lock` stops reporting it.
     { id = "RUSTSEC-2026-0097", reason = "rand's log feature not enabled in this workspace (required for vulnerability)" },
 
+    # rkyv is an *unenabled optional* dependency of rust_decimal (gated behind its `rkyv` feature,
+    # which nothing here enables). It is in Cargo.lock only because the lockfile is feature-agnostic
+    # and records every optional dep; `cargo tree -i rkyv --workspace --all-features --target all`
+    # finds no path to it, and cargo deny's feature-aware graph does not flag it -- only cargo audit,
+    # which reads the lockfile directly. Same phantom-lockfile mechanism as RUSTSEC-2026-0097 above.
+    # No upgrade exists: rust_decimal 1.42.1 pins rkyv ^0.7.46 and upstream declared 0.7 unsupported
+    # (no backport, unlike RUSTSEC-2026-0001). Drop this entry once rust_decimal drops rkyv 0.7
+    # (paupino/rust-decimal#819) or moves to rkyv >=0.8.17.
+    { id = "RUSTSEC-2026-0235", reason = "rkyv is an unenabled optional dep of rust_decimal; never compiled in this workspace" },
+
     # hyperliquid_rust_sdk transitive dependencies (no direct control)
     { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive via hyperliquid_rust_sdk" },
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; transitive via hyperliquid_rust_sdk" },
