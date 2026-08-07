@@ -202,7 +202,7 @@ async fn test_historical_daily_bars() {
 
     for candle in candles.iter().take(5) {
         println!(
-            "  {} O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{:.0} T:{}",
+            "  {} O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{:?} T:{:?}",
             candle.close_time.format("%Y-%m-%d"),
             candle.open,
             candle.high,
@@ -246,8 +246,8 @@ async fn test_historical_daily_bars() {
         first.close
     );
     assert!(
-        !first.volume.is_sign_negative(),
-        "Volume {} should be non-negative",
+        first.volume.is_some_and(|v| !v.is_sign_negative()),
+        "Volume {:?} is absent or negative; a Trades bar always reports one",
         first.volume
     );
 }
@@ -378,8 +378,8 @@ async fn test_historical_midpoint_data() {
             first.close
         );
         assert_eq!(
-            first.trade_count, 0,
-            "Midpoint data should have no trade count"
+            first.trade_count, None,
+            "Midpoint data should have no trade count (unknown, not a fabricated 0)"
         );
     }
 }

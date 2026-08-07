@@ -64,8 +64,8 @@ mod tests {
             high,
             low,
             close,
-            volume,
-            trade_count,
+            volume: Some(volume),
+            trade_count: Some(trade_count),
         }
     }
 
@@ -196,10 +196,10 @@ mod tests {
     #[test]
     fn candle_interval_all_covers_every_variant_in_ascending_order() {
         // `ALL`'s length is pinned to the variant count by both the
-        // `[CandleInterval; 16]` type and this assertion. Full variant *coverage*
+        // `[CandleInterval; 19]` type and this assertion. Full variant *coverage*
         // is not compile-enforced (Rust has no stable variant_count), so keep
         // `ALL` in sync when adding a variant.
-        assert_eq!(CandleInterval::ALL.len(), 16);
+        assert_eq!(CandleInterval::ALL.len(), 19);
 
         // Verify the documented ascending-duration ordering directly via `to_step`.
         // Comparing against the derived `Ord` would be tautological — that order is
@@ -447,9 +447,9 @@ mod tests {
         let out = aggregate_candles(&bars, Duration::seconds(1), target).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].close_time, dt("2024-01-15T12:00:03Z"));
-        assert_eq!(out[0].volume, dec!(3));
+        assert_eq!(out[0].volume, Some(dec!(3)));
         assert_eq!(out[1].close_time, dt("2024-01-15T12:00:06Z"));
-        assert_eq!(out[1].volume, dec!(4));
+        assert_eq!(out[1].volume, Some(dec!(4)));
         // Every output boundary sits on the epoch-anchored target grid.
         for candle in &out {
             assert_eq!(
@@ -632,8 +632,8 @@ mod tests {
             high: dec!(1),
             low: dec!(1),
             close: dec!(1),
-            volume: dec!(1),
-            trade_count: 1,
+            volume: Some(dec!(1)),
+            trade_count: Some(1),
         }];
         assert_eq!(
             aggregate_candles(&bars, Duration::milliseconds(1), target).unwrap_err(),
@@ -651,8 +651,8 @@ mod tests {
                 high: Decimal::from(105 + i),
                 low: Decimal::from(95 + i),
                 close: Decimal::from(101 + i),
-                volume: Decimal::from(2),
-                trade_count: 3,
+                volume: Some(Decimal::from(2)),
+                trade_count: Some(3),
             })
             .collect::<Vec<_>>();
         let out = aggregate_candles(&bars, Duration::seconds(1), Duration::minutes(1)).unwrap();
@@ -665,10 +665,72 @@ mod tests {
                 high: Decimal::from(164),
                 low: Decimal::from(95),
                 close: Decimal::from(160),
-                volume: Decimal::from(120),
-                trade_count: 180,
+                volume: Some(Decimal::from(120)),
+                trade_count: Some(180),
             }]
         );
+    }
+
+    #[test]
+    fn aggregate_any_none_constituent_poisons_the_bucket() {
+        // Any sub-bar with unknown volume (or trade count) makes the whole
+        // aggregated bucket unknown — never a silent under-count of the known
+        // parts. This is the load-bearing invariant behind `Candle`'s optional
+        // volume: an unknown component makes the sum unknown.
+        let cell = |close: &str, v: Option<Decimal>, n: Option<u64>| Candle {
+            close_time: dt(close),
+            open: dec!(1),
+            high: dec!(1),
+            low: dec!(1),
+            close: dec!(1),
+            volume: v,
+            trade_count: n,
+        };
+        let bars = [
+            cell("2024-01-15T12:00:01Z", Some(dec!(1)), Some(1)),
+            cell("2024-01-15T12:00:02Z", None, Some(2)), // unknown volume
+            cell("2024-01-15T12:00:03Z", Some(dec!(3)), None), // unknown trade count
+        ];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].volume, None,
+            "one None-volume constituent poisons the summed volume"
+        );
+        assert_eq!(
+            out[0].trade_count, None,
+            "one None-trade_count constituent poisons the summed trade_count"
+        );
+    }
+
+    #[test]
+    fn aggregate_all_known_constituents_sum_normally() {
+        // Control for the poisoning test: when every constituent is known the
+        // bucket carries the plain totals.
+        let bars = [
+            bar(
+                "2024-01-15T12:00:01Z",
+                dec!(1),
+                dec!(1),
+                dec!(1),
+                dec!(1),
+                dec!(2),
+                5,
+            ),
+            bar(
+                "2024-01-15T12:00:02Z",
+                dec!(1),
+                dec!(1),
+                dec!(1),
+                dec!(1),
+                dec!(3),
+                7,
+            ),
+        ];
+        let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].volume, Some(dec!(5)));
+        assert_eq!(out[0].trade_count, Some(12));
     }
 
     #[test]
@@ -811,8 +873,8 @@ mod tests {
             high: dec!(1),
             low: dec!(1),
             close: dec!(1),
-            volume: dec!(1),
-            trade_count: 1,
+            volume: Some(dec!(1)),
+            trade_count: Some(1),
         }];
         assert_eq!(
             aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(3)).unwrap_err(),
@@ -833,8 +895,8 @@ mod tests {
             high: dec!(1),
             low: dec!(1),
             close: dec!(1),
-            volume: dec!(1),
-            trade_count: 1,
+            volume: Some(dec!(1)),
+            trade_count: Some(1),
         }];
         assert_eq!(
             aggregate_candles(&bars, base, Duration::days(3)).unwrap_err(),
@@ -897,6 +959,48 @@ mod tests {
         let out = aggregate_candles(&bars, Duration::seconds(1), Duration::seconds(1)).unwrap();
         assert_eq!(out, bars.to_vec());
     }
+
+    /// Pins the serde contract documented on [`Candle::volume`].
+    ///
+    /// The absent-key case is the one worth a test: making the field optional turned a `missing
+    /// field` rejection into a silent `None`, and nothing else in the codebase would notice if a
+    /// `#[serde(default)]`-style change or a rename reintroduced the old behaviour.
+    #[test]
+    fn an_absent_volume_or_trade_count_deserialises_as_unknown_and_a_zero_stays_a_zero() {
+        let without = serde_json::json!({
+            "close_time": "2024-01-15T12:00:00Z",
+            "open": "10", "high": "12", "low": "9", "close": "11",
+        });
+        let candle: Candle = serde_json::from_value(without).unwrap();
+        assert_eq!(candle.volume, None);
+        assert_eq!(candle.trade_count, None);
+
+        // A record written before the migration: the fabricated zero survives verbatim, so this
+        // type cannot recover the distinction it now expresses.
+        let pre_migration = serde_json::json!({
+            "close_time": "2024-01-15T12:00:00Z",
+            "open": "10", "high": "12", "low": "9", "close": "11",
+            "volume": "0", "trade_count": 0,
+        });
+        let candle: Candle = serde_json::from_value(pre_migration).unwrap();
+        assert_eq!(candle.volume, Some(Decimal::ZERO));
+        assert_eq!(candle.trade_count, Some(0));
+
+        // `None` round-trips as an explicit null rather than degrading to the absent-key case.
+        let unknown = Candle {
+            close_time: dt("2024-01-15T12:00:00Z"),
+            open: dec!(10),
+            high: dec!(12),
+            low: dec!(9),
+            close: dec!(11),
+            volume: None,
+            trade_count: None,
+        };
+        let encoded = serde_json::to_value(unknown).unwrap();
+        assert_eq!(encoded["volume"], serde_json::Value::Null);
+        assert_eq!(encoded["trade_count"], serde_json::Value::Null);
+        assert_eq!(serde_json::from_value::<Candle>(encoded).unwrap(), unknown);
+    }
 }
 
 /// Normalised Barter OHLCV [`Candle`] model.
@@ -948,15 +1052,49 @@ mod tests {
 ///
 /// [`Months`]: chrono::Months
 /// [`Duration`]: chrono::Duration
-#[derive(Copy, Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 pub struct Candle {
     pub close_time: DateTime<Utc>,
     pub open: Decimal,
     pub high: Decimal,
     pub low: Decimal,
     pub close: Decimal,
-    pub volume: Decimal,
-    pub trade_count: u64,
+    /// Consolidated trade volume over the candle period, or `None` when the
+    /// producer carries no volume for this instrument class.
+    ///
+    /// `None` is a first-class "volume is unknown" fact, **not** zero: some feeds
+    /// (e.g. spot FX candles) publish no consolidated volume at all. Encoding
+    /// that absence as `Some(0.0)` would be a silent lie — a volume-derived
+    /// feature would read a real, quiet zero rather than an explicit unknown.
+    /// [`aggregate_candles`] propagates the absence: any `None` constituent makes
+    /// the whole aggregated bucket `None`.
+    ///
+    /// # Serde contract
+    ///
+    /// Plain `Option` semantics, with two consequences worth stating because they
+    /// changed when this field became optional:
+    ///
+    /// - An **absent** `volume` key now deserialises to `None`. It was previously a
+    ///   hard `missing field` error, so a truncated or hand-written record that used
+    ///   to be rejected is now accepted as "volume unknown". Reject it explicitly if
+    ///   a producer of yours must always report one.
+    /// - A record persisted **before** the migration carries the fabricated
+    ///   `"volume": 0` verbatim, and reads back as `Some(0)` — indistinguishable
+    ///   from a genuine zero-volume bar. This type cannot recover the distinction;
+    ///   re-fetch, or track the affected range out-of-band.
+    ///
+    /// `None` serialises as `"volume": null` (the key is written, not skipped), so a
+    /// round trip through JSON preserves absence rather than degrading it into the
+    /// missing-key case above.
+    pub volume: Option<Decimal>,
+    /// Number of trades in the candle period, or `None` when the producer does
+    /// not report a trade count.
+    ///
+    /// Same contract as [`volume`](Self::volume) throughout, including serde:
+    /// `None` means "unknown", never zero; any `None` constituent makes an
+    /// aggregated bucket `None`; an absent key deserialises to `None`; and a
+    /// pre-migration `"trade_count": 0` still reads back as `Some(0)`.
+    pub trade_count: Option<u64>,
 }
 
 /// One step from a candle's open instant to its exclusive close boundary.
@@ -1255,8 +1393,11 @@ pub fn aggregate_candles(
         high: Decimal,
         low: Decimal,
         close: Decimal,
-        volume: Decimal,
-        trade_count: u64,
+        /// `None` if *any* sub-bar folded into this bucket had unknown volume —
+        /// an unknown component makes the sum unknown, never a silent under-count.
+        volume: Option<Decimal>,
+        /// `None` under the same any-`None`-poisons rule as [`volume`](Self::volume).
+        trade_count: Option<u64>,
     }
 
     /// Emit a completed bucket as an aggregated [`Candle`], deriving its
@@ -1321,18 +1462,26 @@ pub fn aggregate_candles(
                 current.high = current.high.max(candle.high);
                 current.low = current.low.min(candle.low);
                 current.close = candle.close;
-                current.volume += candle.volume;
+                // Any-`None`-poisons: a bucket with one unknown component sums to
+                // an unknown total, never a silent under-count of the known parts.
+                current.volume = match (current.volume, candle.volume) {
+                    (Some(acc), Some(v)) => Some(acc + v),
+                    _ => None,
+                };
                 // A raw u64 `+=` would wrap silently in release builds (no
                 // overflow-checks profile); a checked add keeps overflow loud
                 // on every profile. The `expect` is the deliberate documented
                 // panic of `# Panics`: overflow means corrupt input, not a
-                // recoverable state.
+                // recoverable state. `None` on either side propagates unknown.
                 #[allow(clippy::expect_used)]
                 {
-                    current.trade_count = current
-                        .trade_count
-                        .checked_add(candle.trade_count)
-                        .expect("bucket trade_count overflows u64");
+                    current.trade_count = match (current.trade_count, candle.trade_count) {
+                        (Some(acc), Some(n)) => Some(
+                            acc.checked_add(n)
+                                .expect("bucket trade_count overflows u64"),
+                        ),
+                        _ => None,
+                    };
                 }
             }
             _ => {
@@ -1373,8 +1522,10 @@ pub fn aggregate_candles(
 /// [`as_str`](Self::as_str) is the **single source of truth** for every string
 /// representation: [`Display`](std::fmt::Display), [`Serialize`], [`FromStr`] and [`Deserialize`] all
 /// delegate to it (or its inverse), so there is exactly one place mapping
-/// variant↔string. The strings match Binance's kline `interval` parameter exactly
-/// and are **case-sensitive** — note `Month1 → "1M"` (uppercase) vs `Min1 → "1m"`.
+/// variant↔string. The strings follow Binance's kline `interval` convention and are
+/// **case-sensitive** — note `Month1 → "1M"` (uppercase) vs `Min1 → "1m"`. The union
+/// is a superset of any one venue's menu: `Sec5`/`Sec15`/`Sec30` have no Binance
+/// kline equivalent, so a string round-trip is *not* proof a venue serves it.
 ///
 /// # Ordering
 ///
@@ -1388,6 +1539,12 @@ pub fn aggregate_candles(
 pub enum CandleInterval {
     /// 1 second
     Sec1,
+    /// 5 seconds
+    Sec5,
+    /// 15 seconds
+    Sec15,
+    /// 30 seconds
+    Sec30,
     /// 1 minute
     Min1,
     /// 3 minutes
@@ -1430,8 +1587,11 @@ impl CandleInterval {
     /// literal and the `candle_interval_all_covers_every_variant_in_ascending_order`
     /// test pin `ALL`'s length to the variant count, but full coverage is not
     /// compile-enforced — the exhaustive `match`es elsewhere are the compile gate.
-    pub const ALL: [CandleInterval; 16] = [
+    pub const ALL: [CandleInterval; 19] = [
         Self::Sec1,
+        Self::Sec5,
+        Self::Sec15,
+        Self::Sec30,
         Self::Min1,
         Self::Min3,
         Self::Min5,
@@ -1458,6 +1618,9 @@ impl CandleInterval {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Sec1 => "1s",
+            Self::Sec5 => "5s",
+            Self::Sec15 => "15s",
+            Self::Sec30 => "30s",
             Self::Min1 => "1m",
             Self::Min3 => "3m",
             Self::Min5 => "5m",
@@ -1483,6 +1646,9 @@ impl CandleInterval {
     pub fn to_step(self) -> IntervalStep {
         match self {
             Self::Sec1 => IntervalStep::Fixed(Duration::seconds(1)),
+            Self::Sec5 => IntervalStep::Fixed(Duration::seconds(5)),
+            Self::Sec15 => IntervalStep::Fixed(Duration::seconds(15)),
+            Self::Sec30 => IntervalStep::Fixed(Duration::seconds(30)),
             Self::Min1 => IntervalStep::Fixed(Duration::minutes(1)),
             Self::Min3 => IntervalStep::Fixed(Duration::minutes(3)),
             Self::Min5 => IntervalStep::Fixed(Duration::minutes(5)),
@@ -1542,6 +1708,9 @@ impl FromStr for CandleInterval {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "1s" => Ok(Self::Sec1),
+            "5s" => Ok(Self::Sec5),
+            "15s" => Ok(Self::Sec15),
+            "30s" => Ok(Self::Sec30),
             "1m" => Ok(Self::Min1),
             "3m" => Ok(Self::Min3),
             "5m" => Ok(Self::Min5),

@@ -1210,7 +1210,7 @@ impl ExecutionClient for BinanceMargin {
                 Some(live),
             ))
         } else {
-            // --- Cross: the live-validated account-wide manager (TG17, unchanged) ---
+            // --- Cross: the live-validated account-wide manager (unchanged by isolated) ---
             let instruments = instruments.to_vec();
             // All current Binance margin symbols are ≤22 bytes (within SmolStr's 23-byte inline
             // limit), making clone() a stack memcpy with no heap allocation. Guard this implicit
@@ -4875,7 +4875,7 @@ mod tests {
 
     #[test]
     fn listen_token_query_cross_vs_isolated() {
-        // Cross → no params (the signed POST sends an empty query, exactly as TG17).
+        // Cross → no params (the signed POST sends an empty query, as it did before isolated).
         assert!(build_listen_token_query(None).is_empty());
 
         // Isolated → isIsolated=TRUE & symbol=<sym> (the per-symbol scoping).

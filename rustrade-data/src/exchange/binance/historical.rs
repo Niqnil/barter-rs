@@ -237,8 +237,12 @@ impl BinanceHistoricalClient {
     /// # Arguments
     ///
     /// * `symbol` - Market symbol, e.g. `"BTCUSDT"` (uppercased for Binance).
-    /// * `interval` - Candle resolution. Both Binance surfaces support the full
-    ///   [`CandleInterval`] set, including [`Sec1`](CandleInterval::Sec1).
+    /// * `interval` - Candle resolution. Both Binance surfaces support every
+    ///   interval [`supports_candle_interval`](super::supports_candle_interval)
+    ///   reports, including [`Sec1`](CandleInterval::Sec1). The shared
+    ///   [`CandleInterval`] is a venue-agnostic union, so the resolutions Binance
+    ///   does not publish (`5s`/`15s`/`30s`) return `400 Invalid interval` as
+    ///   [`BinanceDataError::Api`] — check before requesting.
     /// * `start` / `end` - Inclusive `close_time` range bounds.
     ///
     /// # Errors
@@ -520,8 +524,10 @@ impl BinanceKlineRow {
             high: self.high,
             low: self.low,
             close: self.close,
-            volume: self.volume,
-            trade_count: self.trade_count,
+            // Binance REST klines carry real consolidated volume and trade count
+            // (a gap-filled bar reports a genuine `0`, not an absent value).
+            volume: Some(self.volume),
+            trade_count: Some(self.trade_count),
         })
     }
 }
@@ -640,8 +646,8 @@ mod tests {
         assert_eq!(candle.high, dec!(2));
         assert_eq!(candle.low, dec!(0.5));
         assert_eq!(candle.close, dec!(1.5));
-        assert_eq!(candle.volume, dec!(10));
-        assert_eq!(candle.trade_count, 42);
+        assert_eq!(candle.volume, Some(dec!(10)));
+        assert_eq!(candle.trade_count, Some(42));
     }
 
     #[test]
@@ -651,8 +657,9 @@ mod tests {
         let json = r#"[1780909046000,"63051.50","63051.50","63051.50","63051.50","0",1780909046999,"0",0]"#;
         let row: BinanceKlineRow = serde_json::from_str(json).unwrap();
         let candle = row.into_candle(CandleInterval::Sec1).unwrap();
-        assert_eq!(candle.volume, Decimal::ZERO);
-        assert_eq!(candle.trade_count, 0);
+        // A genuine venue-reported zero, so `Some(0)` — not an absent value.
+        assert_eq!(candle.volume, Some(Decimal::ZERO));
+        assert_eq!(candle.trade_count, Some(0));
         assert_eq!(candle.close_time.timestamp_millis(), 1_780_909_047_000);
     }
 

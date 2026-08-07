@@ -56,6 +56,12 @@ pub mod databento;
 #[cfg(feature = "massive")]
 pub mod massive;
 
+/// `London Strategic Edge` market data (behind `lse` feature).
+///
+/// ⚠️ The retrieved data is **not redistributable** — see the module documentation.
+#[cfg(feature = "lse")]
+pub mod lse;
+
 /// Defines the generic [`ExchangeSub`] containing a market and channel combination used by an
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;

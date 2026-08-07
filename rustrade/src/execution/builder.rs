@@ -29,7 +29,7 @@ use rustrade_instrument::{
     index::IndexedInstruments,
     instrument::{
         Instrument, InstrumentIndex,
-        kind::InstrumentKind,
+        kind::{InstrumentKind, cfd::CfdContract},
         name::InstrumentNameExchange,
         spec::{InstrumentSpec, InstrumentSpecQuantity, OrderQuantityUnits},
     },
@@ -38,7 +38,7 @@ use rustrade_integration::channel::{Channel, UnboundedTx, mpsc_unbounded};
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc},
-    task::{JoinError, JoinHandle},
+    task::{AbortHandle, JoinError, JoinHandle},
 };
 
 type ExecutionInitFuture =
@@ -59,6 +59,9 @@ type RunFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// - Building live execution managers, setting up an external connection to each exchange.
 /// - Constructs a [`MultiExchangeTxMap`] with an entry for each mock/live execution manager.
 /// - Combines all exchange account streams into a unified [`AccountStreamEvent`] `Stream`.
+// `mock_exchange_futures` and `execution_init_futures` hold `Pin<Box<dyn Future>>`, which has no
+// `Debug` to delegate to. A hand-written impl could only print a placeholder for the two fields
+// that carry the builder's actual pending work, so it would say less than the type's name already does.
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuilder<'a> {
     instruments: &'a IndexedInstruments,
@@ -85,6 +88,20 @@ impl<'a> ExecutionBuilder<'a> {
     ///
     /// The provided [`MockExecutionConfig`] is used to configure the [`MockExchange`] and provide
     /// the initial account state.
+    ///
+    /// # Panics
+    /// Despite returning a `Result`, this **panics** if any indexed instrument on `mocked_exchange`
+    /// has an [`InstrumentKind`] other than `Spot` or `Cfd`. `MockExchange` models no expiry,
+    /// funding or contract chain, so a `Perpetual`, `Future` or `Option` has no faithful
+    /// projection. The panic happens here, at build time, rather than at first order — an
+    /// unbacktestable instrument set is a configuration error, and deferring it would surface as a
+    /// rejected order mid-run.
+    ///
+    /// It also panics if an instrument references a settlement asset absent from the index, which
+    /// [`IndexedInstruments`] construction already rules out.
+    ///
+    /// [`InstrumentKind`]: rustrade_instrument::instrument::kind::InstrumentKind
+    /// [`IndexedInstruments`]: rustrade_instrument::index::IndexedInstruments
     pub fn add_mock<Clock>(
         mut self,
         config: MockExecutionConfig,
@@ -238,6 +255,7 @@ impl<'a> ExecutionBuilder<'a> {
 ///
 /// Call [`ExecutionBuild::init`] to run all the required execution component futures on tokio
 /// tasks - returns the [`MultiExchangeTxMap`] and multi-exchange [`AccountStreamEvent`] stream.
+// Holds an `ExecutionBuildFutures`, whose boxed futures have no `Debug` — see below.
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuild {
     pub execution_tx_map: MultiExchangeTxMap,
@@ -286,6 +304,7 @@ impl ExecutionBuild {
     }
 }
 
+// Both fields are collections of `Pin<Box<dyn Future>>`, which has no `Debug` to delegate to.
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuildFutures {
     pub mock_exchange_run_futures: Vec<RunFuture>,
@@ -350,7 +369,7 @@ impl ExecutionBuildFutures {
     }
 }
 
-#[allow(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct ExecutionHandles {
     pub mock_exchanges: Vec<JoinHandle<()>>,
     pub managers: Vec<JoinHandle<()>>,
@@ -372,6 +391,20 @@ impl AsyncShutdown for ExecutionHandles {
     }
 }
 
+impl ExecutionHandles {
+    /// [`AbortHandle`]s for every execution task, without consuming the handles.
+    ///
+    /// Enumerates the same task set as [`IntoIterator`] — a task added to this struct must be added
+    /// to both.
+    pub(crate) fn abort_handles(&self) -> impl Iterator<Item = AbortHandle> + '_ {
+        self.mock_exchanges
+            .iter()
+            .chain(&self.managers)
+            .chain(&self.account_to_engines)
+            .map(JoinHandle::abort_handle)
+    }
+}
+
 impl IntoIterator for ExecutionHandles {
     type Item = JoinHandle<()>;
     type IntoIter = std::vec::IntoIter<Self::Item>;
@@ -386,6 +419,22 @@ impl IntoIterator for ExecutionHandles {
     }
 }
 
+/// Project indexed instruments onto the `MockExchange`'s own instrument representation.
+///
+/// # Supported [`InstrumentKind`]s
+/// `MockExchange` models `Spot` and `Cfd`, and **panics** on any other kind. This is a capability
+/// limit of the mock — it fills at price × quantity with no expiry, settlement or contract chain —
+/// not a statement about which kinds are executable in general.
+///
+/// `Cfd` is supported because the mock accounts for a cash-settled position directly: it applies
+/// `contract_size` to the notional and the fee, and debits the **quote** asset in both directions.
+/// Without it every CFD-quoted dataset would panic at execution-build time and be unbacktestable.
+///
+/// `settlement_asset` is re-resolved to its exchange name so the projected instrument describes
+/// itself faithfully, but the mock does not settle in it — see [`MockExchange`]'s limitations for
+/// why, and for the balances a caller must fund.
+///
+/// [`MockExchange`]: rustrade_execution::exchange::mock::MockExchange
 #[allow(clippy::unwrap_used)] // Invariant: IndexedInstruments - all referenced assets exist; panics for unsupported InstrumentKind
 fn generate_mock_exchange_instruments(
     instruments: &IndexedInstruments,
@@ -415,6 +464,18 @@ fn generate_mock_exchange_instruments(
 
                 let kind = match kind {
                     InstrumentKind::Spot => InstrumentKind::Spot,
+                    // A CFD is cash-settled in an account currency that is routinely not the quote
+                    // asset, so the settlement asset is re-resolved to its exchange name here
+                    // rather than dropped.
+                    InstrumentKind::Cfd(contract) => InstrumentKind::Cfd(CfdContract {
+                        contract_size: contract.contract_size,
+                        settlement_asset: instruments
+                            .find_asset(contract.settlement_asset)
+                            .unwrap()
+                            .asset
+                            .name_exchange
+                            .clone(),
+                    }),
                     unsupported => {
                         panic!("MockExchange does not support: {unsupported:?}")
                     }
@@ -491,4 +552,143 @@ fn generate_mock_exchange_instruments(
             },
         )
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panicking on a bad fixture is acceptable
+mod tests {
+    use super::*;
+    use crate::engine::clock::HistoricalClock;
+    use chrono::{DateTime, Utc};
+    use rust_decimal_macros::dec;
+    use rustrade_execution::{AccountSnapshot, client::mock::MockExecutionConfig};
+    use rustrade_instrument::{
+        asset::Asset,
+        index::builder::IndexedInstrumentsBuilder,
+        instrument::{kind::future::FutureContract, quote::InstrumentQuoteAsset},
+        test_utils::asset,
+    };
+
+    const EXCHANGE: ExchangeId = ExchangeId::LseCfd;
+
+    fn at(raw: &str) -> DateTime<Utc> {
+        raw.parse().unwrap()
+    }
+
+    /// A single `spx500_usd` instrument of the given kind, registered on [`EXCHANGE`].
+    fn instruments(kind: InstrumentKind<Asset>) -> IndexedInstruments {
+        IndexedInstrumentsBuilder::default()
+            .add_instrument(Instrument::new(
+                EXCHANGE,
+                "spx500_usd",
+                "spx500_usd",
+                Underlying::new(asset("spx500"), asset("usd")),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                kind,
+                None,
+            ))
+            .build()
+    }
+
+    /// A CFD settling in an asset that is **not** the quote — a GBP-denominated account trading a
+    /// USD-quoted index CFD, which is the case that makes re-resolving the settlement asset
+    /// load-bearing rather than incidental.
+    fn cfd() -> InstrumentKind<Asset> {
+        InstrumentKind::Cfd(CfdContract {
+            contract_size: dec!(25),
+            settlement_asset: asset("gbp"),
+        })
+    }
+
+    fn mock_config() -> MockExecutionConfig {
+        MockExecutionConfig {
+            mocked_exchange: EXCHANGE,
+            initial_state: AccountSnapshot {
+                exchange: EXCHANGE,
+                balances: vec![],
+                instruments: vec![],
+            },
+            latency_ms: 0,
+            fee_model: Default::default(),
+            fill_model: Default::default(),
+        }
+    }
+
+    /// A CFD survives the projection with its multiplier intact and its settlement asset
+    /// re-resolved to the exchange-facing name — not dropped, and not silently replaced by the
+    /// quote asset.
+    #[test]
+    fn mock_instruments_map_a_cfd_preserving_contract_size_and_settlement_asset() {
+        let instruments = instruments(cfd());
+
+        let mocked = generate_mock_exchange_instruments(&instruments, EXCHANGE);
+
+        let instrument = mocked
+            .get(&InstrumentNameExchange::from("spx500_usd"))
+            .expect("the CFD instrument must be projected onto the mock exchange");
+
+        let InstrumentKind::Cfd(contract) = &instrument.kind else {
+            panic!("expected a Cfd kind, got {:?}", instrument.kind)
+        };
+        assert_eq!(contract.contract_size, dec!(25));
+        assert_eq!(
+            contract.settlement_asset,
+            AssetNameExchange::from("gbp"),
+            "settlement is the account currency, not the quote asset"
+        );
+        assert_eq!(instrument.underlying.quote, AssetNameExchange::from("usd"));
+    }
+
+    /// The regression that made CFD-quoted datasets unbacktestable: the projection ran during
+    /// `add_mock`, so a CFD instrument panicked at execution-build time — before a single event was
+    /// replayed. Asserting on `add_mock` rather than the private projection is deliberate; that is
+    /// the call site a backtest actually reaches.
+    #[test]
+    fn add_mock_accepts_a_cfd_instrument() {
+        let instruments = instruments(cfd());
+
+        ExecutionBuilder::new(&instruments)
+            .add_mock(
+                mock_config(),
+                HistoricalClock::new(at("2025-03-24T22:00:00Z")),
+            )
+            .expect("building mock execution over a CFD instrument must succeed");
+    }
+
+    #[test]
+    fn mock_instruments_map_spot_unchanged() {
+        let instruments = instruments(InstrumentKind::Spot);
+
+        let mocked = generate_mock_exchange_instruments(&instruments, EXCHANGE);
+
+        let instrument = mocked
+            .get(&InstrumentNameExchange::from("spx500_usd"))
+            .unwrap();
+        assert_eq!(instrument.kind, InstrumentKind::Spot);
+    }
+
+    /// The capability limit is real, not incidental: kinds the mock cannot fill still panic, so
+    /// adding `Cfd` did not quietly widen the mock to everything.
+    #[test]
+    #[should_panic(expected = "MockExchange does not support")]
+    fn mock_instruments_panic_on_an_unsupported_kind() {
+        let instruments = instruments(InstrumentKind::Future(FutureContract {
+            contract_size: dec!(1),
+            settlement_asset: asset("usd"),
+            expiry: at("2025-06-27T00:00:00Z"),
+        }));
+
+        let _ = generate_mock_exchange_instruments(&instruments, EXCHANGE);
+    }
+
+    /// Instruments on another venue are filtered out before the kind match, so an unsupported kind
+    /// elsewhere in the registry cannot panic a mock that does not serve it.
+    #[test]
+    fn mock_instruments_exclude_other_exchanges() {
+        let instruments = instruments(cfd());
+
+        let mocked = generate_mock_exchange_instruments(&instruments, ExchangeId::BinanceSpot);
+
+        assert!(mocked.is_empty());
+    }
 }

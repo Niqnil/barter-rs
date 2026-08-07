@@ -5,8 +5,8 @@
 use super::error::MassiveError;
 use super::pagination::PaginationGuard;
 use super::transformer::{
-    AggregatesResponse, QuotesResponse, TradesResponse, parse_aggregates_response,
-    parse_quotes_response, parse_trades_response, timespan_to_step,
+    AggregateProvenance, AggregatesResponse, QuotesResponse, TradesResponse,
+    parse_aggregates_response, parse_quotes_response, parse_trades_response, timespan_to_step,
 };
 use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped, truncate_str};
 use crate::subscription::{
@@ -361,6 +361,10 @@ impl MassiveRestClient {
             // for the whole stream would be wrong for month/quarter/year).
             let bar_step = timespan_to_step(multiplier, timespan);
 
+            // What `v` means on this ticker's market. Forex bars are aggregated from quoted
+            // bid/ask rather than a trade tape, so their `v` is quote activity, not volume.
+            let bar_volume = AggregateProvenance::for_ticker(ticker);
+
             // Range contract: yield candles whose `close_time ∈ [from, to]`. The
             // Massive (Polygon) endpoint filters by the bar's open-time, so widen
             // the lower bound by one interval to capture the candle whose
@@ -395,7 +399,7 @@ impl MassiveRestClient {
 
                 if let Some(results) = parsed.results {
                     for bar in results {
-                        let candle = bar.into_candle_with_step(bar_step)?;
+                        let candle = bar.into_candle_with_step(bar_step, bar_volume)?;
                         if candle.close_time >= from && candle.close_time <= to {
                             yield candle;
                         }

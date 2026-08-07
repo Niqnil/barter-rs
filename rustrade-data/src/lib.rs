@@ -134,6 +134,13 @@ use temp_env as _;
 // (exchange::ibkr::flex), which build synthetic `reqwest::Response`s without a socket.
 #[cfg(test)]
 use http as _;
+// tempfile, sha2 and hex are only referenced by the export-job integration tests under the `lse`
+// feature (tests/lse_export.rs), which compiles as a separate unit: tempfile supplies a scratch
+// directory for the download/resume cases, and sha2/hex compute the digest the synthetic job
+// records carry. (sha2 and hex are also non-dev dependencies under `lse`, so their stubs matter
+// only when that feature is off.)
+#[cfg(test)]
+use {hex as _, sha2 as _, tempfile as _};
 
 use crate::{
     error::DataError,

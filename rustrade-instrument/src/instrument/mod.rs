@@ -3,7 +3,7 @@ use crate::{
     asset::Asset,
     instrument::{
         kind::{
-            InstrumentKind, future::FutureContract, option::OptionContract,
+            InstrumentKind, cfd::CfdContract, future::FutureContract, option::OptionContract,
             perpetual::PerpetualContract,
         },
         market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
@@ -195,6 +195,10 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
                 exercise: contract.exercise,
                 expiry: contract.expiry,
                 strike: contract.strike,
+            }),
+            InstrumentKind::Cfd(contract) => InstrumentKind::Cfd(CfdContract {
+                contract_size: contract.contract_size,
+                settlement_asset: find_asset(&contract.settlement_asset)?,
             }),
         };
 

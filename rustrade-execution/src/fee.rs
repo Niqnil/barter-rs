@@ -43,11 +43,22 @@ impl FeeModel for PerContractFeeModel {
     }
 }
 
-/// Percentage-of-notional fee model for spot and futures exchanges.
+/// Percentage-of-notional fee model for spot, futures and CFD exchanges.
 ///
-/// `total_fee = rate * price * quantity.abs()`
+/// `total_fee = rate * price * quantity.abs() * contract_size`
 ///
 /// Common for crypto spot/futures exchanges (e.g. Binance 0.1% taker fee).
+///
+/// # Why `contract_size` is applied
+///
+/// The notional a percentage is charged on is the *underlying* exposure, not the contract count.
+/// For `Spot` the multiplier is `Decimal::ONE` and the term is inert, but a €25-per-point index
+/// CFD at 5000 has a notional of €125,000, not €5,000 — dropping the multiplier would understate
+/// the fee by exactly that factor, silently, on every fill. The same applies to any `Future` or
+/// `Perpetual` whose `contract_size` is not one.
+///
+/// Contrast [`PerContractFeeModel`], which ignores the multiplier because its fee genuinely is
+/// per contract rather than per underlying unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct PercentageFeeModel {
     /// Fee rate as a decimal fraction. Typical range is `[0, 1]`:
@@ -61,8 +72,8 @@ pub struct PercentageFeeModel {
 }
 
 impl FeeModel for PercentageFeeModel {
-    fn compute_fee(&self, price: Decimal, quantity: Decimal, _contract_size: Decimal) -> Decimal {
-        self.rate * price * quantity.abs()
+    fn compute_fee(&self, price: Decimal, quantity: Decimal, contract_size: Decimal) -> Decimal {
+        self.rate * price * quantity.abs() * contract_size
     }
 }
 
@@ -192,6 +203,35 @@ mod tests {
         assert_eq!(
             model.compute_fee(d("100"), d("-10"), d("1")),
             model.compute_fee(d("100"), d("10"), d("1")),
+        );
+    }
+
+    #[test]
+    fn percentage_fee_scales_by_contract_size() {
+        // A EUR25-per-point index CFD at 5000: the notional is 125_000, not 5_000, so 0.1% is 125.
+        // Charging 5 here would understate every CFD fill by the multiplier.
+        let model = PercentageFeeModel { rate: d("0.001") };
+        assert_eq!(model.compute_fee(d("5000"), d("1"), d("25")), d("125"));
+    }
+
+    #[test]
+    fn percentage_fee_is_unchanged_for_a_unit_contract_size() {
+        // Spot is the overwhelmingly common case and must be untouched by the multiplier.
+        let model = PercentageFeeModel { rate: d("0.001") };
+        assert_eq!(model.compute_fee(d("100"), d("10"), Decimal::ONE), d("1"));
+    }
+
+    #[test]
+    fn per_contract_fee_ignores_contract_size() {
+        // The counterpart to `percentage_fee_scales_by_contract_size`: this fee genuinely is per
+        // contract, so the multiplier must NOT apply. Pinned so the two models cannot drift into
+        // sharing one rule.
+        let model = PerContractFeeModel {
+            commission_per_contract: d("0.65"),
+        };
+        assert_eq!(
+            model.compute_fee(d("5000"), d("10"), d("25")),
+            model.compute_fee(d("5000"), d("10"), Decimal::ONE),
         );
     }
 

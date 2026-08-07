@@ -9,6 +9,208 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`InstrumentKind::Cfd` — contracts-for-difference are now modelled** (`rustrade-instrument`).
+  CFDs previously had no correct representation: `Spot` would pollute every downstream `Spot`
+  filter — including the corporate-action and option-settlement scans, which mean specifically
+  *the deliverable equity* — with instruments that are never deliverable, while `Future` requires
+  an expiry a CFD does not have, and a fabricated expiry is not inert (it becomes a
+  subscription-binding key and drives contract-expiry settlement). The variant carries a
+  `CfdContract { contract_size, settlement_asset }` rather than being a unit variant, because both
+  fields are load-bearing: `contract_size` feeds fee computation, unrealised PnL and risk notional
+  (real CFDs are commonly per-point multipliers, so a unit variant would hard-code `Decimal::ONE`
+  into the money path), and `IndexedInstrumentsBuilder` registers a settlement asset only for kinds
+  that report one, so a CFD reporting `None` could never have its account currency indexed. The
+  market-data twin `MarketDataInstrumentKind::Cfd` is a unit variant — it has no expiry or strike
+  to bind on — and is kept distinct from `Spot` because one connector can serve both a spot
+  instrument and a CFD on the same `(exchange, base, quote)`, where folding them would make
+  subscription binding resolve to whichever iterated first.
+  *Note:* neither enum is `#[non_exhaustive]`, so downstream exhaustive `match`es need a new arm.
+
+- **London Strategic Edge exchange identifiers** (`rustrade-instrument`): `LseFx`, `LseCrypto`,
+  `LseEquities`, `LseFutures` and `LseCfd`, one per dataset family, so `MarketEvent.exchange`
+  carries provenance and each dataset declares its own support. Appended at the end of `ExchangeId`
+  deliberately: the enum derives `Ord` from declaration order and `IndexedInstrumentsBuilder`
+  sorts by it, so inserting mid-enum renumbers `ExchangeIndex` and `InstrumentIndex` for existing
+  configurations — indices that are serialized into engine state, the audit replica and backtest
+  replay streams. **Instrument indices are stable across releases only while variants are
+  appended.**
+
+- **London Strategic Edge bulk export** (`rustrade-data`, `lse` feature): submit, poll and download
+  the provider's asynchronous export jobs. This is the **only** path to the raw tick tape — neither
+  REST nor WebSocket reaches it. Downloads resume via `Range`, verify the job's SHA-256, and rename
+  atomically. On a verification failure the destination is left absent and what happens to the
+  partial file follows from *which* check failed: one **shorter** than the artifact is a valid
+  prefix, so it is kept and a repeated call resumes from it, which for a multi-gigabyte artifact is
+  the difference between finishing and starting over. One that is **longer**, or that is already as
+  long as the artifact will ever get and still fails the digest, cannot be repaired by fetching
+  more, so it is discarded and a repeated call restarts — keeping it would fail identically forever.
+  `LseError::IntegrityMismatch` reports which happened via its `discarded` field. A resumed
+  transfer is checked at the seam: a `206` is accepted only when its `Content-Range` begins at the
+  requested byte (the job's `bytes`/`sha256` are both optional, so they cannot be relied on to catch
+  a mis-ranged response), and a `416` is read as "the partial file already holds the whole artifact"
+  rather than as a failure, so a run interrupted between the final write and the rename converges
+  instead of re-requesting an unsatisfiable range forever.
+  **⚠️ The export allowance is five per hour and a *rejected* submit still consumes one**, so an
+  export request validates everything checkable before anything is sent: unknown resolutions,
+  candle resolutions against the provider's tick-only dataset classes, blank symbols, and inverted
+  ranges are all rejected client-side. In particular `symbol: "all"` is **not** a request for every
+  symbol — it is a literal that matches nothing, and an export naming it returns a valid but
+  **empty** Parquet artifact with no error, so it is rejected outright. Measured on both the candle
+  and the tick path, and omitting the symbol is a hard error, so **every artifact this provider
+  produces is single-symbol**: combining instruments means merging several files. (The rejection is
+  case-sensitive — `ALL` is Allstate's real ticker.) An exhausted allowance is
+  reported as `LseError::QuotaExceeded` carrying the allowance position, distinct from the
+  per-minute `RateLimited`. Range `end` is **exclusive**, and the range is date-granular by type.
+  **⚠️ Exported data is not redistributable** — see <https://londonstrategicedge.com/terms>.
+
+- **London Strategic Edge export decoder** (`rustrade-data`, new `lse-parquet` feature, off by
+  default): decode a downloaded export artifact into an iterator of `MarketEvent`s. The Parquet
+  dependency is behind its own feature, so consumers who only want files on disk pay nothing for
+  it. **The event type is decided by the columns present, not by the caller**, because the
+  provider's tick schema varies by dataset: `bid`+`ask` and `price`+`ask` both decode to
+  `OrderBookL1` (`price` *is* the bid — the provider's own price endpoint returns `price == bid`
+  exactly, on every symbol tested), while `price`+`volume` with no ask decodes to a trade. An
+  unrecognised schema is a typed error rather than a mis-decode, and so is a recognised column of
+  the wrong type: the resolved layout's columns are type-checked up front (`LseError::
+  UnsupportedColumnType`), which is the only place a `ts` that is *not* UTC-adjusted is
+  distinguishable — read as epoch microseconds, a local-time column shifts every event by the
+  venue's offset with nothing downstream able to notice. A schema that is not flat is rejected
+  rather than mis-mapped, since columns are located by leaf index and one nested group shifts every
+  index after it. Decoding runs on Parquet's column-reader API in bounded batches rather than its
+  record API: the record API allocated a `Vec` of fields, a `String` per column *name* and a
+  `String` for the dictionary-encoded symbol on **every row** — a large fraction of decode time in
+  local profiling, though no in-tree benchmark pins the figure — and read
+  a whole row group at a time, which would have made the streaming source's bounded-memory
+  contract depend on how the provider chose to write the file. A candle's `time_exchange` is its
+  derived exclusive `close_time`, not the artifact's open-time `ts`, matching the candle replay
+  path — stamping the open would let a strategy act on a completed bar at the instant its period
+  began. Ascending timestamps are enforced by the decoder, since the streaming backtest source
+  delegates that obligation rather than checking it; the comparison permits ties, which are the
+  common case on an equity tape. `lse::market::instrument_index_for` derives the `InstrumentIndex`
+  from the registry the engine was built with, so a fabricated or typo'd index is unrepresentable
+  for callers who use it — `read_export` takes the index on trust and cannot check it itself — and
+  every row's symbol is checked against the descriptor. The iterator **ends at its first error**: the
+  symbol and ordering checks are verdicts on the whole file rather than per-row conditions, so
+  continuing would hand a caller who discards errors a silently truncated view of an artifact
+  already proven corrupt.
+  **⚠️ Known properties of the data, not of this decoder, that will silently mislead:** FX candles
+  are **bid** candles — reconciled against the tick tape, OHLC matched the bid series on 1421 of
+  1421 minutes and the mid or ask on none, so a backtest filling at the candle close fills at the
+  bid, favourable by a full spread on every buy. Candle `volume` is **not dependable**: a majority
+  of sampled one-minute equity bars report `0` in minutes the tick tape shows real trades, and a
+  daily series carried a contiguous band roughly 2,000× too large; a literal `0` is passed through
+  faithfully as `Some(0)` rather than rewritten to `None`, which would be inventing a fact.
+  Non-trading days are emitted as **flat** `o == h == l == c` bars rather than omitted, so daily
+  series are not sparse and a backtest sees a tradeable price on a closed market. And a decoded
+  trade may not be a print — that layout carries no ask, so a quote is not constructible, but the
+  price is likely a bid-side observation.
+  **⚠️ Decoded data is not redistributable** — see <https://londonstrategicedge.com/terms>.
+
+- **London Strategic Edge symbology** (`rustrade-data`, new `lse` feature, off by default):
+  dataset → `(ExchangeId, MarketDataInstrumentKind)` mapping, display-symbol → `(base, quote)`
+  resolution, and a fallible dataset-slug helper. **⚠️ London (`.L`) listings are quoted in pence**,
+  and the provider reports no unit for them, so they quote in **GBX** — an asset distinct from GBP,
+  with prices passed through unscaled. Quoting them in GBP would inflate notional, fees, unrealised
+  PnL and every balance by 100×, silently. `.A`/`.B` are US share classes rather than venue
+  suffixes. Slug derivation is `symbol -> Result<_, _>` rather than a string transformation because
+  the mapping is not injective — thirteen futures symbols resolve to a slug shared with a different
+  series, and the provider answers `200` for it.
+  **⚠️ Licensing:** this crate is MIT-licensed; **the data this integration retrieves is not
+  redistributable**. London Strategic Edge permits use for your own research, trading and model
+  training, including commercially, but prohibits redistributing, reselling or otherwise making the
+  data available to third parties in any form. See <https://londonstrategicedge.com/terms>.
+
+- **London Strategic Edge historical candles** (`rustrade-data`, `lse` feature): an authenticated
+  vault REST client (`LseVaultClient`, `x-api-key`, or `from_env` on `LSE_API_KEY`, whose errors
+  name the variable and never its value, so a mis-encoded key cannot reach a log line) with a paged
+  `fetch_candles` stream and a `collect_candles` convenience. Candles are keyed on the **display
+  symbol** (`EUR/USD`, `AAPL`, `ES.F`), not a dataset slug. The provider serves 14 of
+  `CandleInterval`'s variants — it publishes no `2h`/`6h`/`8h`/`12h`/`3d`, and spells one month
+  `1mo` rather than the shared enum's `1M` — and an unserved resolution is rejected before the
+  request is sent rather than relayed as a `400`.
+  `fetch_candles` follows the same range contract as the crate's other historical fetches: candles
+  whose exclusive `close_time` falls in `[start, end]`, both inclusive, matched on `close_time`.
+  This required mapping from the vault's own range, which is expressed on the bar's **open** time
+  with an **exclusive** upper bound. Several provider behaviours are handled that would otherwise
+  be silent: the resolution parameter is `timeframe` (the vault ignores unknown parameters and
+  defaults to 1-minute bars, returning a byte-identical shape, so a misspelling yields the wrong
+  resolution with a `200`); the reported timestamp is the bar's open, so `close_time` is derived
+  through the shared boundary helper rather than passed through; and the 5,000-row cap is applied
+  with no envelope, cursor or marker, so pagination continues to an empty page rather than treating
+  a short page as terminal. Each page is scanned in full rather than stopping at the first bar past
+  the upper bound — ascending rows are what the vault serves, not what it guarantees, and stopping
+  early would drop any in-range bar sitting behind an out-of-range one, ending the stream `Ok` on a
+  silently truncated series. Sparseness differs by resolution: **intraday**, zero-activity periods are
+  absent rather than gap-filled (unlike Binance's REST klines), while **daily** is not sparse and
+  emits non-trading days as *flat* bars (`open == high == low == close`), so "no bar" must not be read
+  as "the market was closed". FX candles report `volume: None` — the vault omits the field, and a
+  synthetic zero would aggregate into a legitimate-looking total at every derived resolution;
+  `trade_count` is `None` for every dataset, as the vault reports none.
+
+- **London Strategic Edge allowance reporting** (`rustrade-data`, `lse` feature): `QuotaStatus` and
+  `LseVaultClient::usage()`. Unlike every other provider here, London Strategic Edge meters
+  streaming **and** bulk export against a single shared allowance, so a consumer doing both must
+  budget against one pool. The type mirrors the provider's response, which is multi-dimensional
+  (bytes per month, bytes per week, exports per hour, plus static request-shaping limits) and
+  carries **no reset timestamp** — none is synthesised, because a plausible invented instant would
+  be worse than an absent one. Consistent with this crate's separation of concerns, the allowance
+  is *reported, never acted on*: nothing retries, sleeps or throttles on the caller's behalf, and a
+  `429` surfaces as a terminal `LseError::RateLimited` carrying `Retry-After` when present. Pacing
+  between pages is proactive courtesy only, defaulting to the provider's documented rate and
+  overridable via `with_pace` (including `Duration::ZERO` to disable).
+  **⚠️ Licensing:** as above — the retrieved data is **not redistributable**, whatever this crate's
+  own licence says. See <https://londonstrategicedge.com/terms>.
+
+- **`MarketDataStreamed` — a lazily streamed `BacktestMarketData` source** (`rustrade`,
+  `backtest::market_data`). The counterpart to `MarketDataInMemory` for datasets that cannot be
+  resident: a multi-gigabyte export, a compressed tick archive, a paginated provider fetch. It is
+  parameterised over a caller-supplied stream **factory**, which is where every source-specific
+  concern lives — opening files, decoding, resolving instrument keys, merging sources — so the
+  engine crate stays ignorant of file formats, compression and providers, and no provider feature
+  leaks into it. The first event's timestamp is resolved once at construction and cached, satisfying
+  the trait's coherence obligation without letting `time_first_event` consume the cursor `stream`
+  needs. **Cost model, documented on the type:** the factory runs once per `stream()` call, so
+  `run_backtests` with N configurations performs 1 + N full source reads — the deliberate price of
+  O(1) memory, and the wrong trade against a metered network source.
+
+- **`merge_time_sorted` and `tag_events` — replay N historical sources as one feed**
+  (`rustrade-data`, `streams::merge`). Historical data arrives one instrument or one file at a time,
+  while a backtest harness exposes exactly one stream. These lazily k-way merge N time-sorted market
+  streams into one, holding at most one buffered event per input, so memory is O(N) in the number of
+  inputs and O(1) in the size of the dataset. Nothing is emitted until every input has either
+  buffered an event or ended — an input that has not yet produced might be about to yield something
+  earlier, and an out-of-order stream is undetectable downstream. Ties resolve to the earliest-listed
+  input, so a given input ordering replays identically every time. Provider-agnostic: usable for
+  Databento, Binance and any other historical source.
+
+- **London Strategic Edge multi-instrument candle replay** (`rustrade-data`, `lse` feature):
+  `replay_candles` and `LseCandleSource`. Turns N per-symbol vault fetches into one time-ordered
+  `MarketStreamEvent` stream, each event tagged with the caller's own `InstrumentIndex` and
+  `ExchangeId` — the bridge between the per-symbol historical API and an engine that consumes a
+  single feed. `time_exchange` is the candle's `close_time`, never its open, since a completed bar
+  entering the timeline at the instant its period began is lookahead. A failed fetch on any source
+  surfaces immediately rather than silently shortening the replay. Paired with `MarketDataStreamed`,
+  this is a runnable multi-instrument backtest over a range far larger than memory
+  (`engine_backtest_with_lse_candles`, `--features lse`).
+  **⚠️ Licensing:** as above — the retrieved data is **not redistributable**, whatever this crate's
+  own licence says. See <https://londonstrategicedge.com/terms>.
+
+- **`CandleInterval` gains the sub-minute resolutions `Sec5`, `Sec15` and `Sec30`**
+  (`rustrade-data`, `subscription::candle`). `CandleInterval` is the venue-agnostic *union* of
+  every resolution any connector serves, and providers exist that publish `5s`/`15s`/`30s` bars
+  natively; the enum previously jumped straight from `Sec1` to `Min1`, so those resolutions were
+  inexpressible. `ALL`, `as_str`/`FromStr` (`"5s"`/`"15s"`/`"30s"`, and therefore `Display` and
+  the serde impls), and `to_step` all cover the new variants. Because the union is a superset of
+  any one venue's menu, each connector's interval guard was re-reviewed: Databento (whose OHLCV
+  schemas are `1s`/`1m`/`1h`/`1d` only) and Hyperliquid (whose `candleSnapshot` menu starts at
+  `1m`) reject all three with the existing `DataError::UnsupportedInterval`. Binance publishes no
+  `5s`/`15s`/`30s` kline either, and its channel-name mapping is infallible by the `Identifier`
+  contract, so the new `binance::supports_candle_interval` is the pre-flight gate;
+  `exchange_supports_instrument_kind_sub_kind` now consults it, checking `SubKind::Candles`
+  support **per interval** rather than treating every resolution alike.
+  *Note:* `CandleInterval` is not `#[non_exhaustive]`, so a downstream exhaustive `match` on it
+  must gain arms for the three new variants.
+
 - **`aggregate_candles` candle→candle OHLCV aggregation helper** (`rustrade-data`,
   `subscription::candle`). A pure, venue-agnostic batch primitive that rolls fixed-interval
   `Candle`s up into a coarser fixed interval (e.g. Binance-native `1s` bars → `3s` bars no venue
@@ -164,6 +366,239 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Silent assumptions in the new LSE and streaming code are now observable.** None of these change
+  a decoded value; each replaces a quiet assumption with something a caller can see.
+  - `merge_time_sorted` trips a `debug_assert!` naming the offending input when one is not sorted
+    ascending (`rustrade-data`). Enforcing the obligation would need buffering, defeating the O(1)
+    memory the merge exists for; *detecting* it needs only the previous timestamp per input. The
+    check and its state are compiled out of release builds entirely.
+  - The Parquet decoder `warn!`s once per artifact when a `price`/`ask` tick export populates the
+    `volume` column, which that layout discards — an L1 quote has no undifferentiated size field.
+    The column was previously never opened, so a provider that started populating it would have been
+    dropped with zero observability (`rustrade-data`, `lse-parquet` feature).
+  - A `429` response now drains its body before being converted to `LseError::RateLimited`, so the
+    connection returns to the pool instead of being closed and re-handshaked on the caller's retry
+    (`rustrade-data`, `lse` feature).
+
+- **A candle page carrying a bar past the requested `end` is now a typed error, not a silent trim**
+  (`rustrade-data`, `lse` feature). `fetch_candles` trimmed such a bar away and ended the stream
+  `Ok`. The upper bound sent to the vault is `end - interval + 1s` against a parameter that is
+  *exclusive* on open time, so the newest bar a compliant page can carry is the one closing exactly
+  on `end` — a later one can only come from a vault that ignored the range it was given, which is
+  the same silently-ignored-parameter failure as a page repeating its cursor, already terminal.
+  Trimming and continuing returned a series that looked complete while the response that produced
+  it was untrustworthy. Now surfaced as `LseError::UnexpectedCandleRange`, carrying the symbol,
+  cursor, page and `end`. Every in-range bar on the offending page is yielded first, so nothing the
+  response did contain is lost. The lower bound is deliberately **not** symmetric: it is widened by
+  one interval on purpose, so bars closing before `start` are still trimmed without comment.
+  **⚠️ Behaviour change**: a fetch that previously returned a short-but-successful series against
+  such a provider now ends with an `Err` after the in-range bars.
+
+- **`ExchangeId`'s `Display` now renders the canonical `snake_case` name** (`rustrade-instrument`).
+  It derived `derive_more::Display` with no format attribute, so `format!("{}", BinanceSpot)` was
+  `"BinanceSpot"` while `as_str()`, serde and every configuration file said `"binance_spot"`. Two
+  spellings for one identity is a defect rather than a formatting preference: it is the root cause
+  of the `InstrumentNameInternal` divergence fixed below, and it leaked into user-facing
+  diagnostics — `SocketError::Unsupported` and `IndexError::ExchangeIndex` named an exchange
+  matching nothing the user had written. `Display` now delegates to `as_str`, so the two cannot
+  drift again.
+  **⚠️ Behaviour change**: anything that formats an `ExchangeId` — log lines, error strings, and
+  any key or filename built by interpolating one — changes spelling. Code that needs the variant
+  name instead should use `{:?}`.
+
+- **`InstrumentConfig` now derives `name_internal` from `name_exchange`, not from the underlying
+  pair** (`rustrade`, `system::config`). `From<InstrumentConfig>` built the identity key from
+  `(exchange, base, quote)` and ignored both `kind` and `name_exchange`, so two configurations
+  differing only in `kind` produced the same `InstrumentNameInternal`. That is not hypothetical:
+  `ExchangeId::Okx` serves spot, futures, perpetuals and options under one variant, and an exchange
+  offering both a stock and a CFD on one symbol is the reason `InstrumentKind::Cfd` is distinct from
+  `Spot` at all. Since `IndexedInstrumentsBuilder` now rejects a duplicate `name_internal`, such a
+  pair was inexpressible through `SystemConfig` — it failed at startup with no way around it.
+  The exchange-side name is what the venue itself uses to tell the two apart (Okx `BTC-USDT` vs
+  `BTC-USDT-SWAP`; IBKR `AAPL` vs `AAPL.CFD`), so identity now derives from it and discriminates
+  wherever the venue does.
+  **⚠️ This renames every config-derived instrument**, e.g. `binance_spot-btc_usdt` →
+  `binance_spot-btcusdt` for a config whose `name_exchange` is `BTCUSDT`. The same persisted-state
+  migration applies as for the `InstrumentNameInternal` fix below — see that entry.
+  **⚠️ It also renumbers `InstrumentIndex`.** `IndexedInstrumentsBuilder` sorts instruments by
+  `name_internal`, so changing that key changes the sort order and therefore which instrument each
+  index denotes. Indices are read **positionally** into engine state, the audit replica and
+  backtest replay streams, so any state persisted under the old naming — snapshots, recorded
+  audit streams, serialized `InstrumentIndex` values — refers to different instruments after this
+  change and cannot be loaded against a new build. Rebuild it from the config rather than
+  migrating it in place. Ordering is unaffected only where a config's `name_exchange` happens to
+  sort identically to its old `base`/`quote` derivation, which is not something to rely on.
+
+- **`load_trades_from_dbn` / `load_quotes_from_dbn` now document a caller obligation**
+  (`rustrade-data`, `databento` feature; documentation only, no behaviour change). Both tag every
+  record with the caller-supplied instrument key and never read the per-record `instrument_id` from
+  the DBN header — which the live path *does* resolve, via `PitSymbolMap`. A multi-instrument file
+  therefore decodes silently with every event attributed to one instrument. The rustdoc now states
+  that these are correct only for single-instrument files.
+
+- **`DefaultInstrumentMarketData` now consumes `DataKind::Candle`** (`rustrade`). It previously
+  tracked only trades and L1 and ignored every other variant behind a catch-all `_ => {}`, so an
+  engine fed a candle-only feed was silently inert — `price()` returned `None`, no position could be
+  valued, and nothing reported a problem. Candle-first data sources therefore required a custom
+  `InstrumentDataState` that every user had to copy from an example.
+  **This changes behaviour for existing feeds.** An instrument receiving candles (or candles and
+  trades) with no L1 book now has a price where it previously had none, moving `pnl_unrealised` and
+  anything derived from it. An instrument with only an L1 book and trades — no candles — is
+  unaffected: the book still wins outright.
+  The rule ranks the two *regimes* differently, because the three stamps are not drawn from one
+  clock. **Within the tick regime, fixed precedence:** the L1 book wins over the last trade
+  whenever it has a mid to contribute (a one-sided or never-received book contributes nothing and
+  falls through to the trade, so the precedence never costs a price). `OrderBookL1::last_update_time`
+  is a *payload* field and several venues publish no book instant at all, so their connectors stamp
+  it from the host clock, while a trade's `time_exchange` is the venue's own — ranking those against
+  each other would let a host running a few hundred milliseconds behind the venue flip every mark
+  from the book mid to the last trade, and an NTP step flip it back, with no log and no error.
+  **Across regimes, recency:** a candle wins when its `close_time` is strictly later than the held
+  tick's stamp. A fixed order there would let a stale input shadow a fresh one indefinitely — on a
+  mixed feed one provider alone can produce, such as a session of quote ticks followed by a year of
+  daily bars, a year-old book would mark every position after it and the tear sheet would look
+  entirely normal. That gap is usually a regime change measured in days to years, which survives
+  clock skew of any realistic size — though subscribing to L1 and candles concurrently is supported,
+  and on a venue whose book instant is host-stamped that narrows it to the bar interval, leaving a
+  skew-sized window after each bar close. An exact tie goes to the tick, since `close_time` is the
+  exclusive period end and an observation stamped at that instant belongs to the next period.
+  *Known limitation, stated on the method:* the flip side of the fixed precedence is that an L1 book
+  which **freezes while trades keep arriving** shadows those trades until it resumes. A strategy
+  needing trade-led marks on such a feed should implement its own `InstrumentDataState`.
+  The struct gains a `candle: Option<Candle>` field, so its positional `new()` and its serialized
+  shape both change. `#[serde(default)]` is applied to **that field only, not to the container**, so
+  state written by a build predating the field still deserializes with `candle: None` instead of
+  failing on a missing key — serde requires an absent field to be declared defaultable even when its
+  type is `Option`, and deriving `Default` does not change that. Per field rather than
+  container-wide because `l1`'s `Default` is not a neutral value: a container-level default would
+  make a snapshot truncated before `l1` load as an epoch-stamped empty book, which `price()` reports
+  as "no price yet" — indistinguishable from an instrument that never ticked. Such a snapshot is
+  now rejected.
+  `OrderBook` (L2), `Liquidation` and `OptionGreeks` remain excluded, now with a
+  stated reason each in place of the catch-all; `Liquidation` in particular is a forced fill at a
+  potentially dislocated price and must never reach `price()`.
+
+- **`OrderBookL1::last_update_time` now documents a producer obligation, and names the in-tree
+  producers that cannot meet it** (`rustrade-data`). It should carry the venue's own instant and
+  match the wrapping `MarketEvent::time_exchange`. Downstream state orders L1 updates on this field
+  rather than on the event's, so a connector stamping it from a local clock gets a staleness guard
+  keyed on it that can reject legitimately newer updates and freeze the held book.
+  **Not every in-tree producer satisfies it, and the docs now say so.** Binance Spot's `bookTicker`
+  payload carries no venue timestamp (the deserializer defaults the field to `Utc::now()`), and the
+  IBKR quote path stamps it from a host-clock parameter. Both are venue limitations rather than
+  connector defects — there is no instant to carry — so the field is documented as best-effort with
+  the two exceptions named at the site. `DefaultInstrumentMarketData::price` was changed to stop
+  ranking this stamp against a venue trade stamp for exactly this reason; see that entry.
+
+- **`BacktestMarketData::stream()` items are now `Result<_, BarterError>`, and a source failure
+  aborts the backtest** (`rustrade`). The item type was infallible, which was adequate only while
+  the sole implementation was fully in-memory. A source that reads incrementally — a file, a
+  decoder, a paginated fetch — can fail after the stream has opened, and with no error channel the
+  only options were to truncate the stream or panic. Truncating is the dangerous one: the run would
+  complete and return a perfectly normal-looking `BacktestSummary` computed over however much of the
+  dataset happened to be read, with nothing to distinguish it from a complete run.
+  `backtest` now returns that error instead of a result, and never produces a summary over a
+  partially-read dataset. `MarketDataInMemory` is unaffected behaviourally (it yields `Ok`) and its
+  constructor is unchanged, so callers that only *use* it need no edit; custom implementations of
+  the trait must wrap their items.
+
+- **`MockExchange` now supports `InstrumentKind::Cfd`** (`rustrade`). `generate_mock_exchange_instruments`
+  panicked on any non-`Spot` kind via a catch-all, so backtesting or paper-trading a CFD instrument
+  failed at execution-build time — making CFD-quoted datasets unusable despite being correctly
+  modelled. A CFD fill is the same price × quantity arithmetic as spot (the `contract_size`
+  multiplier is applied engine-side), so the mock now maps it through, re-resolving the CFD's
+  settlement asset to its exchange name. Other kinds still panic; that is a capability limit of the
+  mock, not a statement about which kinds are executable.
+
+- **`IndexedInstrumentsBuilder` now rejects duplicate `InstrumentNameInternal`s**
+  (`rustrade-instrument`). `InstrumentStates` is keyed on `InstrumentNameInternal` but read
+  *positionally* by `InstrumentIndex`, and nothing enforced that the two agreed. The existing
+  `Instrument` dedup does not cover it — it removes only instruments equal in *every* field, so two
+  genuinely different instruments sharing a name survived it, then collapsed into one map entry.
+  Every `InstrumentIndex` past the collision then resolved to the wrong instrument's state, with
+  positions, unrealised PnL, orders and tear sheets attaching to the wrong instrument and only the
+  final index panicking. The invariant is now checked at build time: `build`/`new` panic naming the
+  duplicate, and the new fallible `IndexedInstrumentsBuilder::try_build` /
+  `IndexedInstruments::try_new` return `IndexError::DuplicateInstrumentNameInternal` instead.
+  `IndexError` is now `#[non_exhaustive]`; downstream exhaustive `match`es need a wildcard arm.
+
+- **`InstrumentKind::eq_market_data_instrument_kind` is exhaustive on `self`**
+  (`rustrade-instrument`). Its `_ => false` fallthrough meant a new `InstrumentKind` variant
+  compiled clean and then silently failed to bind its market-data subscription — an instrument
+  configured, indexed, and permanently dataless, invisible to both `cargo build` and clippy. A
+  missing arm is now a compile error. Behaviour for existing variants is unchanged.
+
+- **Corporate-action split eligibility is single-sourced as `InstrumentKind::is_split_eligible`**
+  (`rustrade`). The live handler and its audit replica previously carried hand-mirrored
+  `matches!(kind, InstrumentKind::Spot)` guards whose drift was caught only after the fact by a
+  parity test. The rule being pinned is *the deliverable equity*; `Spot` is only its current
+  spelling. No behaviour change.
+
+- **BREAKING: `Candle.volume` and `Candle.trade_count` are now `Option` (`Option<Decimal>` /
+  `Option<u64>`)** (`rustrade-data`, `subscription::candle`). A candle producer that carries no
+  consolidated volume or no trade count must now say so with `None` — an un-ignorable "unknown" —
+  rather than fabricating a `0` a consumer cannot distinguish from a genuine zero-volume /
+  zero-trade bar (the direct precedent is `PublicTrade.side: Option<Side>`). Per-producer: Binance
+  klines/REST and Hyperliquid carry real values (`Some`, including a venue-reported `Some(0)` on a
+  gap-filled bar); Databento OHLCV has no trade-count field, now `trade_count: None` (was `0`); IBKR
+  maps its `-1` "not available" sentinel on volume/count to `None` (was a clamped `0`); Massive now
+  passes its already-optional trade count through unchanged (was `unwrap_or(0)`); the two London
+  Strategic Edge producers report `volume` only where the dataset carries it (the FX quote tape
+  reports neither field) and never synthesise a count. `aggregate_candles`
+  propagates absence: any `None` constituent makes the aggregated bucket's `volume`/`trade_count`
+  `None` (an unknown component makes the sum unknown, never a silent under-count). `Candle` also now
+  derives `Eq` and `Hash` (all fields qualify), so it can be embedded in `Eq`/`Hash` engine state.
+  Migration: **match on the `Option` and decide per call site.**
+  ```rust
+  match candle.volume {
+      Some(volume) => /* a real, venue-reported figure */,
+      None => /* the venue reports none; propagate the unknown, do not substitute */,
+  }
+  ```
+  The hazard to check first is **aggregation**. `unwrap_or_default()` compiles everywhere and is
+  the wrong answer precisely where this change matters: summing, averaging or ratio-ing volume
+  across bars, where a substituted `0` silently under-counts the total and reads as a real result.
+  If a total must stay meaningful, propagate the absence the way `aggregate_candles` does — any
+  `None` constituent makes the aggregate `None`. Reach for `unwrap_or_default()` only for display
+  or for a call site where a fabricated zero is genuinely indistinguishable from the truth.
+  The **serde contract** moves with the type: an absent `volume` / `trade_count` key now
+  deserializes to `None` where it used to be a hard error, so a payload this crate previously
+  rejected is now accepted as "unknown"; a pre-migration `{"volume": 0}` still reads back as
+  `Some(0)`, and `None` serializes as an explicit `null` rather than being skipped.
+
+- **BREAKING: Massive aggregates now declare what they were built from, and forex bars report
+  `volume: None` *and* `trade_count: None`** (`rustrade-data`, `massive` feature). Two provider
+  facts were being read as if they said something else, and both produced numbers that look
+  ordinary:
+  - A forex aggregate's `v` and `n` are **not traded volume and not a transaction count**. The
+    provider generates forex bars "from quoted bid/ask prices rather than executed trades", so `v`
+    counts quote updates — a quantity with no units in common with a share count, which a VWAP, a
+    volume filter or a liquidity screen would consume as though it had. `n` is documented just as
+    generically ("the number of transactions in the aggregate window"), and the same fact overrides
+    it: a bar generated from quotes contains no transactions, so `n` is a quote-update count too —
+    the same quantity as `v`, differing only in units. Gating one and passing the other through
+    would leave `candle.trade_count` reporting quote ticks in the hundreds per minute regardless of
+    liquidity, so a `trade_count >= 50` liquidity filter would pass on every forex bar and look like
+    it was working — bit-for-bit the defect gating `v` removes. Forex bars now report **both** as
+    `None`, the crate's existing "the venue reports none" signal, on the REST and the WebSocket
+    path alike.
+  - The WebSocket aggregate's `z` is documented verbatim as *"The average trade size for this
+    aggregate window"* and was being decoded as a trade **count**. `WsAggregateMsg.trade_count:
+    Option<u64>` is therefore renamed `average_trade_size: Option<Decimal>`. The `u64` was also a
+    latent parse failure: `z` is normally fractional, so the field failed to deserialize and
+    `parse_ws_message` discarded **the entire aggregate** as an unknown event type. WebSocket
+    aggregates now report `trade_count: None`; REST keeps its `n`.
+
+  `AggregateBar::into_candle`, `AggregateBar::into_candle_with_step` and
+  `WsAggregateMsg::into_candle` gain a leading `AggregateProvenance` parameter (`TradeTape` /
+  `QuoteTape`) so the classification is made once, at the call site that knows the ticker, rather
+  than re-derived per bar. The type names the bar's **source**, not one of its fields, because that
+  is what the provider fact is about and what decides the meaning of every activity count on the
+  bar. `AggregateProvenance::for_ticker` applies the provider's own `C:` prefix convention, matched
+  ASCII case-insensitively since nothing upstream normalises a caller-supplied ticker. Migration:
+  pass `AggregateProvenance::for_ticker(ticker)`, or `AggregateProvenance::TradeTape` if the ticker
+  is known to be an equity.
+
 - **BREAKING: `IbkrHistoricalData::fetch_option_chain` now returns `OptionChainResult`, and no
   longer discards already-decoded entries on a mid-stream IB error** (`rustrade-data`, `ibkr`
   feature). The method previously failed fast on the first error yielded mid-enumeration,
@@ -303,6 +738,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Field/read access is unchanged (auto-derefs through the box: `order.key`, `order.state`).
   **No wire change**: `Box<T>` serializes identically to `T`.
 
+- **BREAKING: `DataError::Lse` carries a machine-readable `kind`** (`rustrade-data`, `lse`
+  feature). The variant was `Lse(String)`, so a consumer could not tell a resumable
+  `LseError::RateLimited` from a terminal `LseError::Deserialize` without substring-matching a
+  `Display` — a classification that changes on any wording edit. It is now
+  `Lse { kind: LseErrorKind, message: String }`, matching the shape the sibling `DataError::Databento`
+  already uses. `LseError` itself cannot be nested structurally (it wraps a `reqwest::Error`, which
+  is neither `Clone` nor serialisable), so the flattening stays — but the classification now
+  survives it. The new public `LseErrorKind` is `#[non_exhaustive]` with eight variants
+  (`Authentication`, `RateLimit`, `Network`, `Timeout`, `Api`, `Decode`, `InvalidInput`, `Io`) and
+  an `is_resumable()` predicate; `LseError::kind()` derives it through an **exhaustive** match, so a
+  new `LseError` variant is a compile error here rather than a silent fall-through to a default.
+  Migration: `DataError::Lse(message)` → `DataError::Lse { message, .. }`, or match `kind` where the
+  distinction matters.
+
+- **BREAKING: `DataError` is now `#[non_exhaustive]`** (`rustrade-data`). Variants are added as
+  integrations land, and two of them (`Databento`, `Lse`) exist only under their own feature — so
+  the variant set a downstream `match` sees already depended on the feature selection it built with,
+  and a wildcard arm was already required in practice. The attribute makes that a compile-time
+  contract instead of something a consumer discovers when a feature flag or a release moves, and
+  matches the sibling `LseError`, `IndexError` and the new `LseErrorKind`. Matches inside
+  `rustrade-data` stay exhaustively checked, so a new variant is still a compile error at every
+  in-crate site. Bundled with the `DataError::Lse` reshape above so downstream matchers absorb one
+  breaking window rather than two. Migration: add a `_ => ...` arm to any exhaustive `match` on
+  `DataError`.
+
+- **BREAKING: `IndexedInstruments` now rejects a non-positive `contract_size`** (`rustrade-instrument`).
+  `contract_size` multiplies every money quantity derived from an instrument — quote notional,
+  realised and unrealised PnL, and any notional-scaled fee model — and neither degenerate value
+  failed anywhere downstream. Zero makes all three zero, so a backtest trades freely, is charged
+  nothing, never moves, and reads as a strategy that found no edge; a negative value inverts the
+  sign of PnL, so a losing strategy reports a profit. `try_build`/`try_new` now return the new
+  `IndexError::InvalidContractSize` (and `build`/`new` panic with it, as they already do for a
+  duplicate name). Checked through `InstrumentKind::contract_size`, so it covers `Perpetual`,
+  `Future`, `Option` and `Cfd` uniformly — `Spot` reports a hard `Decimal::ONE` and can never trip
+  it. **Breaking** for any configuration that was silently carrying a zero or negative multiplier;
+  such a collection now fails at build time rather than producing a meaningless run.
+  `IndexError` is `#[non_exhaustive]`, so the variant itself is additive.
+
+- **`LseVaultClient::submit_export` rejects a wholly-future range** (`rustrade-data`, `lse`
+  feature). The export allowance is five per hour and a rejected submit still consumes one, so a
+  fat-fingered year burned an export and returned a valid, complete-schema, **zero-row** artifact
+  with no error at any layer — the provider's silent-empty trap. The new pure predicate
+  `LseExportRange::is_wholly_after(today)` is checked at submit against `Utc::now().date_naive()`,
+  leaving the constructor pure and testable. It allows **one full day of slack**: the maximum real
+  UTC offset is +14, so a caller's local "today" can be at most UTC's tomorrow. It therefore cannot
+  false-positive on a legitimately-today range while still catching a wrong year.
+
+- **The `"ALL"` export rejection is now scoped to the equity datasets** (`rustrade-data`, `lse`
+  feature). `"ALL"` is a literal that matches nothing rather than a request for every symbol, so an
+  export naming it spends one of five hourly exports on an empty artifact — but `ALL` is also
+  Allstate's real ticker, which is why the rejection is case-sensitive. It now applies only to
+  `LseDataset::Stocks | Etf`, the classes that share the venue and symbology where that listing
+  exists; on any other dataset `"ALL"` is rejected without the Allstate caveat in the message. The
+  error text is dataset-aware for the same reason.
+
+- **`QuotaStatus::is_exhausted` split into two predicates** (`rustrade-data`, `lse` feature).
+  London Strategic Edge meters streaming and bulk export against one shared allowance, but they are
+  separate dimensions: a consumer gating a candle backfill on the combined answer stopped fetching
+  for up to an hour after five exports, with terabytes of byte allowance left. `is_byte_allowance_exhausted()`
+  and `is_export_allowance_exhausted()` are the ones to branch on; `is_exhausted()` remains as their
+  union, now documented as usually the wrong question.
+
+- **`take_market` rejects a backwards `time_exchange` in release, not only under `debug_assert`**
+  (`rustrade`, `backtest`). `MarketDataInMemory::new` hard-asserts ascending order in release,
+  commented that an unsorted stream "would silently produce a non-monotonic clock and wrong
+  simulation results in release". `MarketDataStreamed` pushed that obligation to the caller's
+  factory, where the only check was a `debug_assert` inside `merge_time_sorted` — compiled out of
+  release, and present at all only if the factory happened to use that helper. An out-of-order event
+  is now recorded as `BarterError::BacktestMarketData` and ends the stream through the existing
+  source-failure path, so a wrong run fails rather than returning `Ok` with a normal-looking
+  summary. The message names both instants. Repeated timestamps are still accepted (ties are the
+  common case on a tape) and `MarketStreamEvent::Reconnecting` is not treated as out-of-order.
+  `TimedMergeStream` is now **fused** and implements `FusedStream`, without which the abort was not
+  an abort: the next poll fell through to draining the aux stream, emitting events at instants the
+  market data never reached.
+
 ### Removed
 
 - **`EngineOutput::OptionPositionsUnadjustedForSplit`** (`rustrade`). The placeholder option-split
@@ -321,6 +832,385 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **LSE candle pages are now checked for ordering and resolution instead of assumed correct**
+  (`rustrade-data`, `lse` feature). Two provider behaviours the module compensates for were pinned
+  by documentation only. Each page is now scanned in a **pre-pass** before any bar is yielded, and
+  two new `LseError` variants reject the whole page:
+  - `NonMonotonicCandlePage` — ascending order is how the vault answers today, not something it
+    guarantees, and the pagination cursor depends on it: the cursor advances past the newest open a
+    page carried, so a page served newest-first would advance it to the end of the range, make the
+    next page empty (the documented end-of-data signal), and return `Ok` with 5,000 of 3,000,000
+    bars. `previous_open` is carried **across** pages, so the check spans the seam.
+  - `UnexpectedCandleResolution` — the vault answers `200` to a misspelled `timeframe` and silently
+    defaults to 1-minute bars in a byte-identical response shape. A `Day1` request would then
+    receive 1,440 one-minute rows per day, each stamped `close_time = open + 24h` by this module's
+    own boundary arithmetic: overlapping, wrong, and invisible to every other check, since the range
+    bounds are still satisfied and the series still ascends. Spacing is the one property that
+    distinguishes it — consecutive bars of a compliant fixed-interval series are exactly one
+    interval apart, and a gap only ever makes spacing *wider*. Checked for
+    `IntervalStep::Fixed` resolutions only: a calendar step (`month`, `quarter`, `year`) has no
+    single width to compare against, and February would false-positive against a 31-day one.
+  Structural properties of a page reject the whole page; the per-row *range* trim stays in the yield
+  loop, so a well-formed page still yields its in-range bars before failing. `LseError` is
+  `#[non_exhaustive]`, so both variants are additive.
+
+- **The Parquet decoder's monotonicity rule is now layout-dependent** (`rustrade-data`,
+  `lse-parquet` feature). The rule was `<=` for every layout — correct for a tick or quote tape,
+  where several prints routinely share a microsecond, and wrong for a **candle** artifact, where two
+  bars of one series cannot share an open and therefore cannot share the close derived from it. A
+  tie there means the file holds more than one series, or repeats a row. Candle artifacts at a fixed
+  resolution are now required to be strictly ascending; tapes still permit ties, and so do calendar
+  intervals — month arithmetic clamps day-of-month, so `2024-01-30` and `2024-01-31` both close on
+  `2024-02-29` and strictness would reject a valid file.
+  Ordering alone cannot catch a mis-declared `interval` — a fixed interval is a constant shift from
+  open to close, so it cancels out of that comparison and a file of 1-minute bars declared `Day1`
+  still ascends strictly. That is now a separate check; see below.
+
+- **⚠️ The Parquet decoder now rejects a candle artifact finer than the resolution it was decoded
+  at** (`rustrade-data`, `lse-parquet` feature). Nothing in a Parquet artifact records the
+  resolution it was written at, so `read_export` derives every `close_time` from a
+  caller-supplied `interval` — cross-checked only by `verify_job_covers_request`, which is skipped
+  when the job echoes no timeframe and absent altogether for `LseExport::new`, the documented entry
+  point for a file obtained out of band. Declaring `Day1` over a file of 1-minute bars therefore
+  produced 390 "daily" bars per trading day, each claiming a 24-hour period overlapping the next
+  1,439, ascending and without error.
+  `read_export` now measures **bar spacing** against the declared interval — the same detector the
+  vault path runs, raising the same `LseError::UnexpectedCandleResolution`. Consecutive bars of a
+  compliant fixed-interval series are exactly one interval apart, and a gap only ever makes spacing
+  *wider*, so spacing narrower than the declared interval means the file is finer than it was said
+  to be. Compared on the opens the `ts` column carries rather than the closes the decoder derives,
+  so the error names instants a caller can find in their own file.
+  **This is a new rejection path on a public decode API**: an artifact that previously decoded may
+  now yield an error mid-iteration.
+  Its reach, which the rustdoc now states rather than leaving implied: it catches **finer than
+  declared**, and cannot catch **coarser** than declared — daily bars decoded as `Min1` are spaced
+  wider than 60 seconds, indistinguishable from a genuine gap, and each bar then enters the timeline
+  a minute after its day opened rather than at the end of it, a full day of lookahead. It also
+  cannot fire on a single-row artifact, and calendar intervals (`Month1`) are exempt for the same
+  reason they are exempt from strict ascent.
+
+- **The LSE GBX protection now runs on the candle-replay path, and is stated as the export path's
+  caller obligation**
+  (`rustrade-data`, `lse` feature). `lse::market::quote_asset` computed the right answer but had no
+  caller outside its own tests, so a user registering `BP.L` with quote asset `gbp` got pence booked
+  as pounds — `BP.L` prints ~548 where BP trades around £5.48, so every notional, fee, unrealised
+  PnL and balance was 100× wrong with nothing downstream able to notice. The check now runs inside
+  `instrument_index_for`, where the provider's view of a symbol and the caller's registry meet, and
+  a disagreement is the new `LseError::QuoteAssetMismatch`. It compares the instrument's **pricing**
+  asset (honouring `InstrumentQuoteAsset::UnderlyingBase`) on `AssetNameInternal`, the identity the
+  engine keys assets by — so `GBX` and `gbx` are one asset and `GBP` is caught.
+  The check reaches exactly as far as its callers: the new `LseCandleSource::resolve` routes through
+  it on the candle-replay path, while `read_export` takes its `instrument` argument on trust — its
+  rustdoc now directs callers to obtain that argument here. Both shipped examples resolve rather
+  than writing an `InstrumentIndex` literal. `LseCandleSource::new` remains for callers with no registry to check against, and its
+  rustdoc says plainly that it carries no protection.
+
+- **⚠️ BREAKING: `instrument_index_for` moved from `lse::parquet` to `lse::market`**
+  (`rustrade-data`, `lse` feature). It is registry symbology rather than artifact decoding, and its
+  old home is gated behind `lse-parquet` — so a consumer building with `--features lse` got the
+  entire candle-replay API and **could not compile a call to the guard at all**, which is why the
+  candle path had no protection to route through. Update imports from
+  `exchange::lse::parquet::instrument_index_for` to `exchange::lse::market::instrument_index_for`;
+  the signature and behaviour are unchanged.
+
+- **`LseVaultClient::await_export` could panic on a large `poll_interval`** (`rustrade-data`, `lse`
+  feature). The deadline was computed with `checked_add`, commented that `Instant + Duration` panics
+  on overflow and that `Duration::MAX` is a plausible "no timeout" sentinel — and the next line then
+  used a bare `+` on the caller's `poll_interval`. `.min(deadline)` could not protect it, because
+  the addition is evaluated first. A public library method therefore aborted the caller's task on an
+  argument its own docs called plausible. Now `checked_add(...).map_or(deadline, |i| deadline.min(i))`,
+  with both sentinels covered by the rustdoc and by tests.
+
+- **Two per-row costs removed from the LSE Parquet decode loop** (`rustrade-data`, `lse-parquet`
+  feature). The `price`+`ask` layout opened and decoded an entire extra `DOUBLE` column — around
+  400 MB uncompressed on a 50M-row artifact — solely to check that `volume` stayed `0.0` for a
+  one-shot `warn!`, and the check latched off after the first hit while the column kept being read.
+  That check now reads the row group's column-chunk **statistics** instead of decoding per row. And
+  the symbol column was cloned per row: `ByteArray` wraps `Option<bytes::Bytes>`, so a
+  dictionary-backed clone plus its drop is two atomic read-modify-writes — roughly 100M of them on a
+  50M-row export — for a value that was only compared against the expected symbol's bytes and
+  dropped. `BatchedColumn::take` is now a `peek`/`advance` split, which removes the clone
+  (`symbols_in_export` uses it too). The same rows decode to the same events. One behaviour change,
+  recorded on the method: the statistics-based check cannot see a row group whose writer emitted no
+  column statistics, nor a NaN — writers exclude NaN from `min`/`max` by spec, where the old per-row
+  `value != 0.0` caught it. Both are accepted losses on an observability aid for a column the layout
+  discards either way.
+
+- **`transfer_export` no longer writes an unbounded body when the job reports its size**
+  (`rustrade-data`, `lse` feature). A misbehaving proxy streaming 500 GB against a job declaring
+  1 MB filled the disk before the integrity check could fire, and on `ENOSPC` the oversized `.part`
+  was *retained*. The write loop now stops once the download exceeds `job.bytes`. The offending
+  chunk is written **before** the break deliberately, so the caller observes `downloaded > expected`
+  and takes the existing "longer than the artifact → corrupt → discard" branch rather than reporting
+  a misleading digest mismatch.
+
+- **`lse::market::quote_asset` returned USD for a lowercase venue suffix, the 100× error it exists
+  to prevent** (`rustrade-data`, `lse` feature). The venue arms were exact string literals, so
+  `quote_asset("bp.l")` fell through to the USD default while `"BP.L"` correctly returned `GBX`.
+  London listings are quoted in **pence**: `BP.L` prints ~548 where BP trades around £5.48, so a
+  mis-cased symbol inflated notional, fees, unrealised PnL and every balance by 100×, silently and
+  with no log. All seven venues were affected (`.L`, `.T`, `.HK`, `.NS`, `.AX`, `.KS`, `.TW`). The
+  suffix is now case-normalised before matching, as the sibling pair-shaped and `underlying` paths
+  already were.
+
+- **`lse::market::slug` accepted an ambiguous symbol spelled with a lowercase `.f`**
+  (`rustrade-data`, `lse` feature). The `.F` strip ran *before* the lowercasing, so it never matched
+  `.f`: the stem stayed `fbtp.f`, matched no entry in the ambiguous-stem list, and was returned as a
+  slug instead of the documented `LseError::AmbiguousSlug`. The transformation now runs in the order
+  its rustdoc states — lowercase, then strip. The existing regression test only covered the
+  uppercase `.F` spelling, which is why it passed; it now covers every casing of both spellings.
+
+- **A panic on the blocking decode thread ended `stream_blocking_iter` as if the source had
+  finished** (`rustrade-data`). The `JoinHandle` was detached, so an `init` or iterator panic
+  dropped the sender and the stream yielded `None` — indistinguishable from clean end-of-stream.
+  Since this is the documented driver for the Parquet decoder, a corrupt artifact could truncate a
+  backtest and still produce a normal-looking summary, which is the exact failure mode the
+  `BacktestMarketData::stream()` change below was written to eliminate. The panic is now re-raised
+  on the task polling the stream, with its original payload, matching `futures::stream::iter` over
+  the same iterator. Items decoded before the panic are still yielded first.
+  **⚠️ Behaviour change**: a caller that previously saw a silent end now observes a panic. That is
+  the point; a source cannot report a panic as `Err` because the error type is unconstrained.
+
+- **`MockExchange` filled `Perpetual`, `Future` and `Option` instruments as physically-settled
+  spot** (`rustrade-execution`). `MockExchange` and its `instruments` map are both public, so a
+  consumer constructing one directly bypassed the `rustrade` builder that screens kinds — the
+  instrument then took the spot path, with its `contract_size` multiplier applied to a delivery that
+  cannot happen and no funding, margin or expiry settlement anywhere. `open_order` now rejects
+  unsupported kinds with `ApiError::InstrumentInvalid` rather than filling them.
+  **⚠️ Behaviour change**: a consumer constructing `MockExchange` directly and submitting a
+  `Perpetual`, `Future` or `Option` now receives a rejected order where one previously filled as
+  spot. Anything reaching `MockExchange` through the `rustrade` builder is unaffected — that path
+  already screened kinds.
+
+- **`PercentageFeeModel` ignored `contract_size`, understating fees by the multiplier**
+  (`rustrade-execution`). The model computed `rate * price * quantity`, discarding the
+  `contract_size` argument both call sites pass it. Percentage-of-notional is *the* natural fee
+  model for a CFD, and a CFD's notional is the per-point multiplier times the price: a €25/point
+  index CFD at 5000, quantity 1, at 0.1% was charged **€5 instead of €125** — silently, on every
+  fill, in the direction that flatters a backtest. The formula is now
+  `rate * price * quantity.abs() * contract_size`.
+  **⚠️ Behaviour change**: fees increase by `contract_size` for any instrument whose multiplier is
+  not one — every `Cfd`, and any `Future`/`Perpetual` configured with a real contract size. `Spot`
+  is unaffected (its multiplier is `Decimal::ONE`), and `PerContractFeeModel` still deliberately
+  ignores the multiplier, because that fee genuinely is per contract rather than per underlying
+  unit. Backtest results for affected instruments will change; that difference is the error being
+  removed.
+
+- **A failed download could leave a corrupt artifact at the file's true length**
+  (`rustrade-data`, `lse` feature). `download_export` derived "there is nothing left to fetch" only
+  from a `416` on a resume request, so a *fresh* transfer that produced the whole artifact was still
+  treated as resumable. When the server answered with the right number of bytes and the wrong
+  content — a provider regenerating the artifact between the status poll and the download — the
+  length check passed, the digest check failed, and the `.part` was **kept**: a corrupt file sitting
+  at exactly the artifact's length, indistinguishable at rest from a legitimate one, for any caller
+  that treats the hard `IntegrityMismatch` as terminal. It now also counts the transfer complete
+  when the job's reported `bytes` have been received, so that file is discarded and a re-call starts
+  clean. No corrupt bytes ever reached the destination — the rename does not run — so this was a
+  disk-hygiene and contract defect rather than data corruption.
+
+- **A candle whose `close_time` was after its own `time_exchange` injected lookahead into the
+  engine** (`rustrade`). `DefaultInstrumentMarketData` keys everything candle-shaped on
+  `close_time`, while the merge and the `HistoricalClock` key on `MarketEvent::time_exchange`. The
+  two are the same instant for every producer in this crate, which stamps a bar with its derived
+  close — but nothing enforced it, and a producer stamping the bar *open* would have delivered a
+  completed bar's high, low and close at the moment its period began, priced positions from them,
+  and left no trace: simulated time never moves backwards, so no monotonicity check fires. Such a
+  candle is now **dropped** with a `tracing::warn!` and the previously stored candle is left intact,
+  rather than being admitted and quietly biasing every downstream statistic. A candle closing
+  *before* its `time_exchange` (a late-delivered bar) is unaffected — that direction is ordinary.
+  The drop is unconditional; the warning is rate-limited to the 1st, 2nd, 4th, 8th … occurrence,
+  because a producer that mis-stamps one bar mis-stamps all of them, and one line per candle is
+  millions of lines on a large backtest. Each line carries the running total.
+
+- **The LSE vault's pacing was a per-fetch claim, so a multi-instrument replay multiplied it**
+  (`rustrade-data`, `lse` feature). `LseVaultClient`'s 300 ms pace was applied between the pages of
+  one fetch, derived from the provider's documented 200 calls/minute. `replay_candles` drives N of
+  those fetches at once — guaranteed, not incidental, since the k-way merge polls every source on
+  every `poll_next` — so the aggregate rate was N × the budget against a measured
+  `vault_concurrency` of **2**, and `LseError::RateLimited` is terminal by design: a ten-instrument
+  replay would likely abort partway through. Both bounds now live on the client, behind a gate
+  **shared by its clones**, and every request passes through it — candle page, export submit, status
+  poll and artifact download alike. New `with_concurrency` sets the in-flight ceiling (default 2,
+  matching the provider's reported `vault_concurrency`); `with_pace` now spaces the starts of *all*
+  requests rather than only successive pages, so the "200 calls per minute" derivation holds however
+  many sources a caller passes. A large N therefore makes a replay slower rather than louder.
+  New `with_page_limit` completes the set, overriding the rows requested per page (default 5,000,
+  matching the provider's reported `max_rows_per_request`) for a key on a plan allowing more, or to
+  bound per-page memory. It takes a `NonZeroU32` where `with_concurrency` clamps: a concurrency of
+  `0` parks every request and is visibly broken, whereas a page limit of `0` returns an empty page
+  that pagination reads as end-of-data — a fetch that *succeeds* having returned nothing.
+
+- **A pagination cursor overflow named an addend the code never used** (`rustrade-data`, `lse`
+  feature). Advancing the cursor past a page's newest bar steps forward one second; when that
+  overflowed, `fetch_candles` reported `LseError::TimestampOverflow { open, interval }`, which
+  displays as `candle boundary overflow: open time {open} + {interval} is not representable`. Two
+  things in that sentence were wrong: the overflow is not a candle boundary, and the interval is
+  not the addend — it is the *candle's* period length, which that variant legitimately names at its
+  other call sites, where `close_time == open + interval` really is the arithmetic performed. A
+  reader diagnosing this was pointed at a calculation the code never ran. New
+  `LseError::CursorOverflow { last_open }` names the one-second cursor step that actually overflowed.
+  Only reachable within one second of `DateTime::MAX_UTC`; `LseError` is `#[non_exhaustive]`, so
+  the added variant is not a breaking change, but code matching on `TimestampOverflow` to catch
+  this specific case will no longer see it.
+
+- **The aux-seam benchmark's baseline arm did work the production arm does not** (`rustrade`,
+  benches only). `Backtest AuxSeam` compares `backtest()` (arm A) against `backtest_market_only`
+  (arm B) to price the `TimedMergeStream` seam at a few ns/event. Once the market stream became
+  fallible, arm B unwrapped each item with a `filter_map` combinator plus a `Ready` future per
+  event, while arm A unwraps inline inside `poll_next` — so the *baseline* was slowed by the
+  comparison, understating the seam cost the group exists to guard, possibly to zero. Arm B now
+  replays the fixture's own `Arc<Vec<_>>` through an infallible stream, leaving the merge as the
+  single difference between the arms. Benchmark-only; no library behaviour changes. Absolute figures
+  still are not comparable across the fallible-stream change — re-baseline.
+
+- **The duplicate-`name_internal` error printed nothing that distinguished the colliding
+  instruments** (`rustrade-instrument`). Both names it interpolated were `name_exchange`, which the
+  two instruments frequently share — a spot and a CFD on one symbol reported as *"ibkr-aapl is
+  shared by the distinct instruments AAPL and AAPL on ibkr"*, asserting they are distinct while
+  showing nothing that says how. The message now carries each instrument's `kind` alongside its
+  name, which for the expiring kinds also surfaces the differing expiry.
+
+- **A two-sided order book carrying no sizes panicked the engine** (`rustrade-data`, `rustrade`).
+  `volume_weighted_mid_price` divides by the two amounts summed, and `Decimal`'s `Div` **panics** on
+  a zero divisor — so any book quoting prices without sizes took down whatever polled it.
+  `DefaultInstrumentMarketData::price` calls it first and unconditionally, and
+  `InstrumentState::update_from_market` calls `price()` on every market event, so the panic landed in
+  the engine task; the graceful shutdown then panicked a second time on its own
+  `expect("Engine cannot drop Feed receiver")`, reporting an unrelated message and hiding the cause.
+  Reachable from three producers that publish prices without sizes — an LSE tick export, and the
+  Massive and IBKR quote paths, which substitute a zero amount when the venue omits one — the first
+  of which makes it deterministic rather than venue-dependent. **`volume_weighted_mid_price` now
+  returns `Option<Decimal>`** (`None` when the amounts sum to zero: the weighting is genuinely
+  undefined there, and a size-less book is a real feed shape rather than a degenerate input), and
+  `price()` falls back to the plain mid, which *is* well defined — so such a feed marks positions
+  instead of either panicking or silently never producing a price. A one-sided book still contributes
+  nothing: half a book has no mid, and picking whichever side is quoted is not a judgement the
+  library makes for the caller. **Breaking:** the return type changed from `Decimal` to
+  `Option<Decimal>`; callers must handle `None`.
+
+- **The documented O(1) backtest memory guarantee did not hold for a blocking source**
+  (`rustrade-data`, `rustrade`). `BacktestMarketData` and `MarketDataStreamed` both stated memory
+  overhead was O(1) in the dataset size on the grounds that the harness never collects the stream.
+  Laziness is not sufficient: the harness forwards the stream into the engine's **unbounded** feed
+  channel with a synchronous send, so peak memory tracks how far the source runs ahead of the engine
+  — and a blocking iterator wrapped in `futures::stream::iter` never returns `Poll::Pending`, so it
+  runs ahead by the *entire dataset* before the engine handles one event. That is precisely the shape
+  the Parquet decoder's own rustdoc example recommended: a 10M-row artifact parks its whole decoded
+  self in the channel. Both doc blocks now state that bounding read-ahead is the implementation's
+  obligation, that the obligation can only be discharged as far as the merge — the feed channel is
+  harness-side and still unbounded — and the decoder example is repointed at the bridge below.
+
+- **Added: `streams::blocking::stream_blocking_iter`** (`rustrade-data`) — bridges a blocking,
+  fallible iterator into a bounded `Stream`. The source is opened and driven on a
+  `spawn_blocking` thread, and a bounded channel parks it whenever it gets ahead of the consumer.
+  This fixes two things for a local decoder: the blocking decode leaves the async runtime's workers
+  (a hazard the Parquet module warned about while the adjacent example walked into it), and decoding
+  overlaps engine processing instead of preceding it in one uninterruptible burst. It does **not** on
+  its own bound a backtest's peak memory — the harness still forwards the merged stream into the
+  engine's unbounded feed channel with a synchronous, non-waiting send, so events accumulate there
+  whenever the engine is the slower side. The guarantee is that the decoder stays within `capacity`
+  items of *its own* consumer; making it end-to-end needs the feed channel to apply back-pressure,
+  tracked in [#220](https://github.com/Niqnil/rustrade/issues/220). A failure to open the source
+  arrives as the stream's first `Err`, so open and mid-stream failures are handled on one path.
+
+- **`MockExchange` accounted a CFD fill as if `contract_size` were 1** (`rustrade-execution`,
+  `rustrade`). Admitting `InstrumentKind::Cfd` to the mock's instrument projection broke an invariant
+  its arithmetic silently relied on: every kind it accepted before was `Spot`, where
+  `contract_size == 1`. Four consequences, all silent. The notional was `fill_price × quantity` with
+  no multiplier, so a 1-contract fill of a `contract_size = 25` CFD debited 1/25 of the true notional
+  while the engine's position accounting applied the full 25 — every balance-derived return, drawdown
+  and Sharpe wrong by that factor, with no failure point. A CFD **short** debited the base asset by
+  the quantity, as though shorting an index required borrowing it, so opening one returned
+  `BalanceInsufficient` unless the caller funded a phantom balance in an instrument that cannot be
+  held. The fee call hard-coded `Decimal::ONE` for the multiplier. And the `debug_assert` excluding
+  `PerContract` fees rested on the mock being spot-only, which it no longer was.
+  The mock now models a CFD as what it is: a cash-settled position on a price, carrying
+  `contract_size` into both the notional and the fee, debiting the **quote** asset in both
+  directions, and requiring no base inventory to short. Five tests drive fills through it — the gap
+  that let this land was that nothing did.
+  **`CfdContract::settlement_asset` is deliberately not settled in**: a CFD routinely settles in an
+  account currency that is not the quote asset, which needs a conversion rate this mock has no source
+  for and will not invent. Callers must fund the **quote** asset of every instrument traded; the
+  limitation, and the panic that an unfunded quote balance still produces, are now stated on
+  `MockExchange` itself.
+
+- **A stale L1 book shadowed every later candle and trade** (`rustrade`).
+  `DefaultInstrumentMarketData::price` gave L1 an unconditional win, and `process` never clears it,
+  so once any L1 arrived it decided the price forever. On a mixed feed — a session of quote ticks
+  followed by a long run of bars, which one provider alone can produce — open positions marked to a
+  book that had stopped updating, `pnl_unrealised` stopped moving, and the tear sheet looked normal.
+  This is the same failure the candle-vs-trade rule was already recency-based to prevent, applied to
+  the third input. A candle now wins whenever it closed strictly later than the input the tick regime
+  holds, so a book that has stopped updating no longer decides the price forever; within that regime
+  L1 keeps a fixed precedence over the last trade, so an L1-only feed behaves exactly as before. See
+  the `Changed` entry on `DefaultInstrumentMarketData` above for why the two regimes are ranked
+  differently. The L1 staleness guard keys on the payload's `last_update_time` — the same instant
+  `price()` orders on — so the two cannot disagree.
+
+- **A failing run in `run_backtests` leaked every cancelled sibling's task tree** (`rustrade`).
+  `run_backtests` short-circuits on the first `Err`, dropping the other runs' futures — and dropping
+  a `JoinHandle` *detaches* its task rather than cancelling it. The cancelled run's engine,
+  execution-manager, mock-exchange and account-forwarding tasks therefore survived the drop, and
+  could not finish on their own: the engine ends only on the explicit `Shutdown` that the graceful
+  shutdown sends, and the account-forwarding task only on the explicit abort it performs, both of
+  which the drop skips. What was left was a permanently parked task group per cancelled run, still
+  holding its `EngineState`, plus a market source that kept fetching — and, on a metered provider,
+  kept spending — for a result no caller could ever read. Each failing sweep in a long-lived process
+  added another set. `backtest` now holds an abort guard over its `System`'s task tree for the
+  duration of the run, so a cancelled run is torn down where it stands. Reachable only since the
+  market stream became fallible: with an in-memory source a run could not fail mid-stream, so the
+  short-circuit was unreachable.
+
+- **`cargo doc` failed for `rustrade-data`, so the crate would have published no documentation**
+  (`rustrade-data`). The crate denies `rustdoc::private_intra_doc_links`, and two public items
+  linked to private ones (`fetch_candles` → `PAGE_LIMIT`, `slug` → `AMBIGUOUS_SLUG_STEMS`), which
+  is a hard error rather than a warning. Both now state the fact inline, or link the public item
+  the private one mirrors. Fixed alongside every remaining broken intra-doc link in the crate: a
+  module that carried **both** an outer `///` on its `pub mod` declaration and its own `//!`
+  documentation had the file's links resolved in the *parent's* scope, so each one rendered as dead
+  text instead of a hyperlink. The redundant outer doc is removed wherever the module documents
+  itself, and the convention is stated at the declaration site. `cargo doc` is now clean — no
+  errors and no warnings — under `--features lse`, `--features lse-parquet` and `--all-features`.
+
+- **`InstrumentNameInternal`'s two constructors produced different names for the same instrument**
+  (`rustrade-instrument`). `new_from_exchange_underlying` interpolated the `ExchangeId` directly,
+  which renders the bare *variant* name (`BinanceSpot` → `binancespot-btc_usdt`), while
+  `new_from_exchange` used the canonical `ExchangeId::as_str` (`binance_spot-btc_usdt`).
+  `InstrumentNameInternal` is an identity key — it keys the engine's instrument state map and is
+  the lookup argument of `InstrumentStates::instrument`, which panics when absent — so an
+  instrument declared through a JSON configuration and the same instrument built in-library never
+  resolved to each other. Both constructors now use `as_str`. The divergence was invisible because
+  every existing test constructed names through the second constructor.
+  **⚠️ Migration — persisted state built before this release will not load cleanly.** The name is
+  part of the on-disk identity of an instrument, so any `EngineState` snapshot, audit replica or
+  replay stream taken against a multi-word exchange (`BinanceSpot`, `GateioSpot`, `BybitSpot`,
+  `AlpacaBroker`, …) carries the old `binancespot-btc_usdt` spelling. Restoring one against an
+  index rebuilt on this release resolves nothing for those instruments: `InstrumentStates::instrument`
+  **panics** on the missing key, and any path that instead defaults the state silently attaches
+  live positions to freshly-zeroed state. There is no in-library upgrade step — rewrite the
+  exchange segment of every persisted `name_internal` from the concatenated variant name to the
+  `snake_case` spelling, or rebuild the state from scratch.
+
+- **Three undocumented caller obligations are now stated at the API boundary** (`rustrade-data`;
+  documentation only, no behaviour change).
+  - `download_export` names the `<destination>.<job id>.part` glob and states that abandoned partial
+    files are never reclaimed. `.part` is scoped to the job id — a sound invariant, and the reason a
+    resumed transfer cannot pick up a stale file — but the only deletion path is a discarding
+    integrity failure, so a killed process or a re-export (new job id, new `.part`) orphans the old
+    one permanently. A 7 GB export killed at 6 GB leaves 6 GB. No cleanup API is offered, because
+    enumerating and deleting files a caller chose the location of is the caller's decision.
+  - `stream_blocking_iter` states that it holds **one blocking thread per call for the whole
+    decode**, and `merge_time_sorted` states that its inputs must be able to progress independently.
+    Composed, N artifacts start N blocking tasks at call time (not first poll), and `blocking_send`
+    parks the OS thread without returning it to the pool. Past tokio's default `max_blocking_threads`
+    of 512, tasks 513+ never get a thread, their streams stay `Pending`, the merge — which requires
+    every input to buffer or end — returns `Pending` forever, nothing drains, and no thread is
+    released: a permanent stall with no error and no log. A 512-instrument universe is not exotic.
+    Both ways out are documented (raise `max_blocking_threads`, or batch the inputs).
+  - `stream_blocking_iter`'s claim that "every consumer reaches this stream through
+    `merge_time_sorted`" is removed: it has no in-tree production caller, so the `FusedStream`
+    choice is a design judgement rather than an observation, and is now described as one.
 
 - **Published rustdoc no longer points at items readers cannot open** (`rustrade-data`). Twelve
   public items across the IBKR Flex, Massive and Alpaca surfaces linked to private items, which
@@ -380,6 +1270,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never completed). Benchmark-only; no library behaviour changes.
 
 ### Security
+
+- **The London Strategic Edge vault client no longer follows redirects, so `x-api-key` cannot be
+  forwarded to another host** (`rustrade-data`, `lse` feature). The client was built with no
+  `.redirect(...)`, so `reqwest` applied its default `Policy::limited(10)`. On a cross-host
+  redirect reqwest strips only `Authorization`, `Cookie`, `Cookie2`, `Proxy-Authorization` and
+  `WWW-Authenticate` — a custom `x-api-key` installed via `default_headers` is not in that set and
+  survives the hop. (`set_sensitive` affects `Debug` redaction only, not redirect behaviour.) The
+  exposure is concrete: `GET /vault/export/{id}/download` is the multi-gigabyte endpoint, exactly
+  the kind that hands off to object storage with a `302`, and reqwest would have re-issued the GET
+  carrying the live key. It also broke an invariant the module states twice in its own docs — that
+  this client only ever requests URLs it builds itself, which is why the provider's own
+  `download_url` is deliberately ignored — since a followed redirect *is* a server-supplied URL.
+  `LseVaultClient::new` now sets `redirect::Policy::none()`, matching the two sibling API-key-bearing
+  clients in this crate (`massive::rest` and `ibkr::flex`), and both `new` and `with_client` document
+  it. **Behaviour change:** a `3xx` from the vault now surfaces as an `LseError::Api` carrying that
+  status instead of being followed silently.
 
 - **Fixed a bearer-token leak in Massive REST pagination** (`rustrade-data`). The client attaches its
   API key as an `Authorization: Bearer` default header sent with every request, and validated each

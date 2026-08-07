@@ -1279,8 +1279,25 @@ fn bar_to_candle(
         Decimal::try_from(bar.low).map_err(|e| DataError::Socket(format!("parse low: {e}")))?;
     let close =
         Decimal::try_from(bar.close).map_err(|e| DataError::Socket(format!("parse close: {e}")))?;
-    let volume = Decimal::try_from(bar.volume)
-        .map_err(|e| DataError::Socket(format!("parse volume: {e}")))?;
+    // IB uses `-1` as the "not available" sentinel for both volume and trade
+    // count (e.g. on MIDPOINT/BID/ASK bars). Map the sentinel to `None` (unknown)
+    // rather than fabricating a zero — or, worse, a negative volume — that a
+    // consumer could not distinguish from a genuine value.
+    let volume = if bar.volume < 0.0 {
+        None
+    } else {
+        Some(
+            Decimal::try_from(bar.volume)
+                .map_err(|e| DataError::Socket(format!("parse volume: {e}")))?,
+        )
+    };
+    let trade_count = if bar.count < 0 {
+        None
+    } else {
+        // Non-negative by the guard above.
+        #[allow(clippy::cast_sign_loss)] // guarded: bar.count >= 0 in this branch
+        Some(bar.count as u64)
+    };
 
     Ok(Candle {
         close_time,
@@ -1289,8 +1306,7 @@ fn bar_to_candle(
         low,
         close,
         volume,
-        #[allow(clippy::cast_sign_loss)] // IB returns -1 when unavailable; .max(0) guarantees non-negative
-        trade_count: bar.count.max(0) as u64,
+        trade_count,
     })
 }
 
@@ -1332,8 +1348,8 @@ mod tests {
         assert_eq!(candle.high, dec!(155));
         assert_eq!(candle.low, dec!(149));
         assert_eq!(candle.close, dec!(153.5));
-        assert_eq!(candle.volume, dec!(1_000_000));
-        assert_eq!(candle.trade_count, 50_000);
+        assert_eq!(candle.volume, Some(dec!(1_000_000)));
+        assert_eq!(candle.trade_count, Some(50_000));
 
         // close_time is the exclusive boundary: open + 1 hour.
         assert_eq!(
@@ -1344,14 +1360,17 @@ mod tests {
     }
 
     #[test]
-    fn bar_to_candle_handles_negative_count() {
+    fn bar_to_candle_maps_unavailable_sentinel_to_none() {
         let mut bar = bar_at(datetime!(2024-01-15 16:00 UTC).into());
-        bar.count = -1; // IB sometimes returns -1 for "not available"
+        bar.count = -1; // IB returns -1 for "not available"
+        bar.volume = -1.0; // same sentinel on volume-less bar types
 
         let candle = bar_to_candle(&bar, BarSize::Hour).unwrap();
 
-        // Negative count should clamp to 0
-        assert_eq!(candle.trade_count, 0);
+        // The -1 sentinel is "unknown", reported as `None` — never a fabricated
+        // zero (trade count) or a nonsensical negative (volume).
+        assert_eq!(candle.trade_count, None);
+        assert_eq!(candle.volume, None);
     }
 
     #[test]

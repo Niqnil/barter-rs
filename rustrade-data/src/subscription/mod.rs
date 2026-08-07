@@ -205,6 +205,10 @@ where
 
 /// Determines whether the [`Connector`] associated with this [`ExchangeId`] supports the
 /// ingestion of market data for the provided [`MarketDataInstrumentKind`].
+// The arms are grouped by `MarketDataInstrumentKind`, each group ending in a default whose
+// open-vs-closed choice is documented in place (see the `Spot` note below). Collapsing to
+// `matches!` would fold every group into one boolean expression, leaving nowhere to record which
+// defaults are deliberate and which exchange lists were verified against what.
 #[allow(clippy::match_like_matches_macro)]
 pub fn exchange_supports_instrument_kind(
     exchange: ExchangeId,
@@ -221,6 +225,13 @@ pub fn exchange_supports_instrument_kind(
             | GateioPerpetualsBtc,
             Spot,
         ) => false,
+        (LseFx | LseCrypto | LseEquities, Spot) => true,
+        (LseCfd | LseFutures, Spot) => false,
+        // NOTE: this default is OPEN -- an exchange that serves no spot market claims spot support
+        // unless it is denied above, with no compile error to prompt the edit. It is left open
+        // deliberately: closing it means writing an explicit arm for every existing variant and
+        // re-verifying each one's spot coverage, which is tracked separately rather than smuggled
+        // in here. Deny explicitly above when adding a non-spot exchange.
         (_, Spot) => true,
 
         // Future
@@ -238,6 +249,10 @@ pub fn exchange_supports_instrument_kind(
         // Option
         (GateioOptions | Okx, Option { .. }) => true,
         (_, Option { .. }) => false,
+
+        // Cfd
+        (LseCfd | LseFutures, Cfd) => true,
+        (_, Cfd) => false,
     }
 }
 
@@ -269,6 +284,10 @@ where
 
 /// Determines whether the [`Connector`] associated with this [`ExchangeId`] supports the
 /// ingestion of market data for the provided [`MarketDataInstrumentKind`] and [`SubKind`] combination.
+///
+/// [`SubKind::Candles`] carries its resolution, so support is checked **per interval**:
+/// [`CandleInterval`] is the venue-agnostic union of every resolution any connector
+/// serves, and no venue serves all of it (Binance publishes no `5s`/`15s`/`30s` kline).
 pub fn exchange_supports_instrument_kind_sub_kind(
     exchange_id: &ExchangeId,
     instrument_kind: &MarketDataInstrumentKind,
@@ -279,12 +298,18 @@ pub fn exchange_supports_instrument_kind_sub_kind(
     use SubKind::*;
 
     match (exchange_id, instrument_kind, sub_kind) {
-        (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2 | Candles { .. }) => true,
+        (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
+        (BinanceSpot, Spot, Candles { interval }) => {
+            crate::exchange::binance::supports_candle_interval(interval)
+        }
         (
             BinanceFuturesUsd,
             Perpetual,
-            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations | Candles { .. },
+            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations,
         ) => true,
+        (BinanceFuturesUsd, Perpetual, Candles { interval }) => {
+            crate::exchange::binance::supports_candle_interval(interval)
+        }
         (Bitfinex, Spot, PublicTrades) => true,
         (Bitmex, Perpetual, PublicTrades) => true,
         (BybitSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
@@ -359,6 +384,64 @@ impl<T> Map<T> {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+
+    mod supports {
+        use super::*;
+        use rustrade_instrument::exchange::ExchangeId;
+
+        /// The London Strategic Edge datasets, paired with the single
+        /// [`MarketDataInstrumentKind`] each one serves.
+        const LSE: [(ExchangeId, MarketDataInstrumentKind); 5] = [
+            (ExchangeId::LseFx, MarketDataInstrumentKind::Spot),
+            (ExchangeId::LseCrypto, MarketDataInstrumentKind::Spot),
+            (ExchangeId::LseEquities, MarketDataInstrumentKind::Spot),
+            (ExchangeId::LseFutures, MarketDataInstrumentKind::Cfd),
+            (ExchangeId::LseCfd, MarketDataInstrumentKind::Cfd),
+        ];
+
+        #[test]
+        fn test_lse_supports_exactly_its_own_kind() {
+            // Each dataset serves one kind and must deny the others. The denials matter as much as
+            // the grants: `exchange_supports_instrument_kind`'s `(_, Spot) => true` default means
+            // a CFD-only dataset would otherwise claim spot support with no edit and no error.
+            for (exchange, supported) in LSE {
+                assert!(
+                    exchange_supports_instrument_kind(exchange, &supported),
+                    "{exchange:?} should support {supported:?}"
+                );
+
+                for denied in [
+                    MarketDataInstrumentKind::Spot,
+                    MarketDataInstrumentKind::Cfd,
+                    MarketDataInstrumentKind::Perpetual,
+                ] {
+                    if denied == supported {
+                        continue;
+                    }
+                    assert!(
+                        !exchange_supports_instrument_kind(exchange, &denied),
+                        "{exchange:?} should not support {denied:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_cfd_denied_for_non_cfd_exchanges() {
+            for exchange in [
+                ExchangeId::BinanceSpot,
+                ExchangeId::Coinbase,
+                ExchangeId::Okx,
+                ExchangeId::GateioOptions,
+                ExchangeId::Mock,
+            ] {
+                assert!(
+                    !exchange_supports_instrument_kind(exchange, &MarketDataInstrumentKind::Cfd),
+                    "{exchange:?} should not support Cfd"
+                );
+            }
+        }
+    }
 
     mod subscription {
         use super::*;
@@ -625,25 +708,29 @@ mod tests {
         }
 
         #[test]
-        fn candles_supported_on_both_binance_venues_for_every_interval() {
-            // Both Binance venues serve the full interval set on the dynamic path; no interval
-            // is rejected (the Hyperliquid interval guard lives only in its typed historical path).
+        fn candles_supported_per_interval_on_both_binance_venues() {
+            // `CandleInterval` is a venue-agnostic union, so candle support is decided
+            // per interval, not per `SubKind`: both Binance venues serve every interval
+            // Binance publishes a kline for, and neither serves `5s`/`15s`/`30s`.
             for interval in CandleInterval::ALL {
-                assert!(
+                let expected = crate::exchange::binance::supports_candle_interval(interval);
+                assert_eq!(
                     exchange_supports_instrument_kind_sub_kind(
                         &ExchangeId::BinanceSpot,
                         &MarketDataInstrumentKind::Spot,
                         SubKind::Candles { interval },
                     ),
-                    "BinanceSpot/Spot must support Candles {interval:?}"
+                    expected,
+                    "BinanceSpot/Spot Candles {interval:?}"
                 );
-                assert!(
+                assert_eq!(
                     exchange_supports_instrument_kind_sub_kind(
                         &ExchangeId::BinanceFuturesUsd,
                         &MarketDataInstrumentKind::Perpetual,
                         SubKind::Candles { interval },
                     ),
-                    "BinanceFuturesUsd/Perpetual must support Candles {interval:?}"
+                    expected,
+                    "BinanceFuturesUsd/Perpetual Candles {interval:?}"
                 );
             }
         }

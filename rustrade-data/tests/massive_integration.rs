@@ -145,9 +145,13 @@ async fn test_rest_aggregates_crypto() {
         let candle = result.expect("Failed to fetch candle");
         assert!(candle.open > Decimal::ZERO, "Open should be positive");
         assert!(candle.high >= candle.low, "High should be >= low");
+        // `is_some_and`, not `is_none_or`: crypto aggregates carry a real traded volume (unlike
+        // the forex tape, whose `v` is a tick count and is therefore reported as `None`), so
+        // accepting `None` here would pass a decoder that had stopped populating the field.
         assert!(
-            candle.volume >= Decimal::ZERO,
-            "Volume should be non-negative"
+            candle.volume.is_some_and(|v| v >= Decimal::ZERO),
+            "Volume {:?} is absent or negative; crypto aggregates always carry one",
+            candle.volume
         );
         count += 1;
 
@@ -157,7 +161,7 @@ async fn test_rest_aggregates_crypto() {
                 high = %candle.high,
                 low = %candle.low,
                 close = %candle.close,
-                volume = %candle.volume,
+                volume = ?candle.volume,
                 "First crypto candle"
             );
         }
@@ -228,7 +232,7 @@ async fn test_rest_aggregates_stocks() {
                 high = %candle.high,
                 low = %candle.low,
                 close = %candle.close,
-                volume = %candle.volume,
+                volume = ?candle.volume,
                 "First stock candle"
             );
         }
@@ -286,7 +290,7 @@ async fn test_rest_aggregates_options() {
                 if count == 1 {
                     tracing::info!(
                         open = %candle.open,
-                        volume = %candle.volume,
+                        volume = ?candle.volume,
                         "First options candle"
                     );
                 }
@@ -379,7 +383,7 @@ async fn test_rest_aggregates_futures() {
                 if count == 1 {
                     tracing::info!(
                         open = %candle.open,
-                        volume = %candle.volume,
+                        volume = ?candle.volume,
                         "First futures candle"
                     );
                 }
