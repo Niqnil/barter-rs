@@ -98,9 +98,7 @@ use rustrade_data::{
     },
     subscription::candle::CandleInterval,
 };
-use rustrade_instrument::{
-    exchange::ExchangeId, index::IndexedInstruments, instrument::InstrumentIndex,
-};
+use rustrade_instrument::{exchange::ExchangeId, index::IndexedInstruments};
 use serde::Deserialize;
 use std::{fs::File, io::BufReader, sync::Arc};
 
@@ -136,12 +134,18 @@ async fn main() {
     );
 
     // Each source pairs a vault display symbol with the index and exchange its instrument was
-    // registered under. These must match the config above: a wrong index would silently attribute
-    // one symbol's prices to a different instrument, and an unregistered exchange panics the engine.
-    let sources = vec![
-        LseCandleSource::new("AAPL", InstrumentIndex::new(0), ExchangeId::LseEquities),
-        LseCandleSource::new("MSFT", InstrumentIndex::new(1), ExchangeId::LseEquities),
-    ];
+    // registered under. `resolve` derives the index from the registry above rather than taking a
+    // literal, which is what you want: a wrong index would silently attribute one symbol's prices
+    // to a different instrument, and an unregistered exchange panics the engine. It also checks the
+    // quote asset, so a `.L` listing registered in `gbp` rather than `gbx` -- pence booked as
+    // pounds, every notional 100x wrong -- is rejected here instead of running to completion.
+    let sources = ["AAPL", "MSFT"]
+        .into_iter()
+        .map(|symbol| {
+            LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, symbol)
+                .expect("each symbol to be registered in the config above, priced in its own unit")
+        })
+        .collect::<Vec<_>>();
 
     let start: DateTime<Utc> = "2024-01-02T00:00:00Z".parse().unwrap();
     let end: DateTime<Utc> = "2024-03-01T00:00:00Z".parse().unwrap();

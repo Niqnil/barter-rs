@@ -117,7 +117,8 @@ pub struct AggregateBar {
     pub trade_count: Option<u64>,
 }
 
-/// What a Massive aggregate's `v` field actually counts, which is **market-dependent**.
+/// What a Massive aggregate bar was **built from**, which is market-dependent and decides the
+/// meaning of every activity count on the bar.
 ///
 /// Massive documents `v` identically across asset classes ("the trading volume of the symbol in
 /// the given time period"), but forex aggregates are not built from a trade tape: spot FX has no
@@ -129,48 +130,70 @@ pub struct AggregateBar {
 /// a liquidity filter would read a real number where the venue reports nothing about size at all.
 /// Spot FX is the motivating example named in `Candle::volume`'s own docs.
 ///
+/// # Why this classifies the bar rather than one field
+/// `n` ("the number of transactions in the aggregate window") is documented just as generically as
+/// `v`, and the same fact overrides both: a bar generated from quotes contains **no transactions**,
+/// so `n` cannot be a transaction count on it either. It is a quote-update count — the same
+/// quantity as `v`, differing only in units. Gating `v` while passing `n` through would leave
+/// `candle.trade_count` reporting quote ticks in the hundreds per minute regardless of liquidity,
+/// so a `trade_count >= 50` liquidity filter would pass on every forex bar and look like it was
+/// working. That is bit-for-bit the defect gating `v` removes.
+///
 /// Refs: <https://massive.com/docs/rest/forex/aggregates/custom-bars> (forex aggregates are
 /// "generated from quoted bid/ask prices rather than executed trades").
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum AggregateVolume {
-    /// `v` is a real traded volume — stocks, options and crypto, which all have a trade tape.
-    Traded,
-    /// `v` counts quote updates rather than trades, so the candle reports `volume: None`.
-    QuoteTicks,
+pub enum AggregateProvenance {
+    /// Built from a trade tape — stocks, options and crypto. `v` and `n` mean what they say.
+    TradeTape,
+    /// Built from quoted bid/ask updates, so neither `v` nor `n` describes any transaction and the
+    /// candle reports `volume: None` and `trade_count: None`.
+    QuoteTape,
 }
 
-impl AggregateVolume {
+impl AggregateProvenance {
     /// Classify a Massive REST ticker by its asset-class prefix.
     ///
     /// `C:` is forex (`C:EURUSD`); everything else — `X:` crypto, `O:` options, bare stock
     /// symbols — has a trade tape. A ticker whose class Massive adds later defaults to
-    /// [`Traded`](Self::Traded), matching the pre-existing behaviour for anything unrecognised.
+    /// [`TradeTape`](Self::TradeTape), matching the pre-existing behaviour for anything
+    /// unrecognised.
     ///
     /// The prefix match is **ASCII case-insensitive**. Massive's own tickers are uppercase, but
     /// nothing upstream of here normalises one: `validate_ticker` rejects empty strings and
     /// URL-breaking characters only. A case-sensitive match would classify `c:eurusd` as
-    /// [`Traded`](Self::Traded) and report a quote-update count as real traded volume — precisely
-    /// the silent lie this type exists to prevent.
+    /// [`TradeTape`](Self::TradeTape) and report quote-update counts as real trading activity —
+    /// precisely the silent lie this type exists to prevent.
     #[must_use]
     pub fn for_ticker(ticker: &str) -> Self {
         // `get` rather than slicing: a leading character 3 or 4 bytes wide puts byte 2 *inside* it,
         // and `&ticker[..2]` panics on a non-char boundary. `get` returns `None` there, falling
-        // through to `Traded` like any other ticker that is not `C:`-prefixed.
+        // through to `TradeTape` like any other ticker that is not `C:`-prefixed.
         if ticker
             .get(..2)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("C:"))
         {
-            Self::QuoteTicks
+            Self::QuoteTape
         } else {
-            Self::Traded
+            Self::TradeTape
         }
     }
 
     /// Apply these semantics to a wire `v`.
-    fn apply(self, volume: Decimal) -> Option<Decimal> {
+    fn volume(self, volume: Decimal) -> Option<Decimal> {
         match self {
-            Self::Traded => Some(volume),
-            Self::QuoteTicks => None,
+            Self::TradeTape => Some(volume),
+            Self::QuoteTape => None,
+        }
+    }
+
+    /// Apply these semantics to a wire `n`.
+    ///
+    /// `None` in, `None` out: the provider already models an absent count, and that absence is
+    /// carried through as "unknown" rather than flattened to a fabricated `0`.
+    fn trade_count(self, trade_count: Option<u64>) -> Option<u64> {
+        match self {
+            Self::TradeTape => trade_count,
+            Self::QuoteTape => None,
         }
     }
 }
@@ -184,8 +207,8 @@ impl AggregateBar {
     /// (`month`/`quarter`/`year`) therefore use leap-year-correct month
     /// arithmetic, not an approximate fixed `Duration`.
     ///
-    /// `volume` says what this market's `v` means — see [`AggregateVolume`], and
-    /// [`AggregateVolume::for_ticker`] to derive it from the ticker you requested.
+    /// `provenance` says what this market's `v` and `n` mean — see [`AggregateProvenance`], and
+    /// [`AggregateProvenance::for_ticker`] to derive it from the ticker you requested.
     ///
     /// Test-only. `mod transformer` is `pub(crate)` and this type is not re-exported, so a `pub fn`
     /// here would not actually be reachable by a downstream user however it were annotated —
@@ -197,9 +220,9 @@ impl AggregateBar {
         self,
         multiplier: u32,
         timespan: &str,
-        volume: AggregateVolume,
+        provenance: AggregateProvenance,
     ) -> Result<Candle, MassiveError> {
-        self.into_candle_with_step(timespan_to_step(multiplier, timespan), volume)
+        self.into_candle_with_step(timespan_to_step(multiplier, timespan), provenance)
     }
 
     /// Convert to rustrade [`Candle`] with a pre-computed [`IntervalStep`].
@@ -210,7 +233,7 @@ impl AggregateBar {
     /// are variable-length — a single pre-computed `Duration` for the whole
     /// stream would be wrong for `month`/`quarter`/`year`.
     ///
-    /// `volume` says what this market's `v` means — see [`AggregateVolume`].
+    /// `provenance` says what this market's `v` and `n` mean — see [`AggregateProvenance`].
     ///
     /// # Errors
     ///
@@ -222,7 +245,7 @@ impl AggregateBar {
     pub fn into_candle_with_step(
         self,
         step: IntervalStep,
-        volume: AggregateVolume,
+        provenance: AggregateProvenance,
     ) -> Result<Candle, MassiveError> {
         let start_time = Utc
             .timestamp_millis_opt(self.timestamp)
@@ -245,16 +268,16 @@ impl AggregateBar {
             high: self.high,
             low: self.low,
             close: self.close,
-            // Not unconditionally `Some`: on the forex tape `v` counts quote updates rather than
-            // trades, and reporting that as a traded volume would be indistinguishable from a real
-            // one downstream. See `AggregateVolume`.
-            volume: volume.apply(self.volume),
-            // Massive already models an absent trade count; carry the `None`
-            // through as "unknown" rather than the old lossy `unwrap_or(0)`.
-            // REST is the surface that genuinely has one: `n` is documented as "the number of
-            // transactions in the aggregate window". (The WS aggregate's `z` is not — see
-            // `WsAggregateMsg::average_trade_size`.)
-            trade_count: self.trade_count,
+            // Neither field is unconditionally `Some`: a quote-derived bar contains no transactions,
+            // so `v` counts quote updates and `n` counts the same events in different units.
+            // Reporting either as trading activity would be indistinguishable downstream from the
+            // real thing. See `AggregateProvenance`.
+            //
+            // `n` is also absent on some trade-tape bars, and that `None` is carried through as
+            // "unknown" rather than the old lossy `unwrap_or(0)`. (The WS aggregate has no count at
+            // all: its `z` is an average trade *size* — see `WsAggregateMsg::average_trade_size`.)
+            volume: provenance.volume(self.volume),
+            trade_count: provenance.trade_count(self.trade_count),
         })
     }
 }
@@ -772,10 +795,11 @@ impl WsAggregateMsg {
     /// carried a coarser-than-minute interval, this trust assumption must be
     /// revisited.)
     ///
-    /// `volume` says what this market's `v` means — see [`AggregateVolume`]. The `trade_count` is
-    /// always `None`: this stream carries no trade count at all (see
-    /// [`average_trade_size`](Self::average_trade_size)).
-    pub fn into_candle(self, volume: AggregateVolume) -> (DateTime<Utc>, Candle) {
+    /// `provenance` says what this market's `v` means — see [`AggregateProvenance`]. The
+    /// `trade_count` is always `None` regardless: this stream carries no trade count at all (see
+    /// [`average_trade_size`](Self::average_trade_size)), so there is nothing for the provenance to
+    /// gate on that field.
+    pub fn into_candle(self, provenance: AggregateProvenance) -> (DateTime<Utc>, Candle) {
         let time = millis_to_datetime(self.end_timestamp);
 
         let candle = Candle {
@@ -784,8 +808,8 @@ impl WsAggregateMsg {
             high: self.high,
             low: self.low,
             close: self.close,
-            // See `AggregateVolume`: the forex aggregate's `v` counts quote updates, not trades.
-            volume: volume.apply(self.volume),
+            // See `AggregateProvenance`: the forex aggregate's `v` counts quote updates, not trades.
+            volume: provenance.volume(self.volume),
             // The WS aggregate carries NO trade count. `z`, the field previously read as one, is
             // the average trade *size*. An explicit unknown is the only honest answer here; the
             // REST aggregate's `n` is where a real count comes from.
@@ -962,7 +986,7 @@ mod tests {
         };
 
         let candle = bar
-            .into_candle(1, "minute", AggregateVolume::Traded)
+            .into_candle(1, "minute", AggregateProvenance::TradeTape)
             .unwrap();
 
         assert_eq!(candle.open, dec!(65000.0));
@@ -994,7 +1018,7 @@ mod tests {
         // Month: Jan 1 -> Feb 1 (not 1704067200000 + 30d = 2024-01-31).
         assert_eq!(
             bar_at()
-                .into_candle(1, "month", AggregateVolume::Traded)
+                .into_candle(1, "month", AggregateProvenance::TradeTape)
                 .unwrap()
                 .close_time
                 .timestamp_millis(),
@@ -1003,7 +1027,7 @@ mod tests {
         // Quarter: Jan 1 -> Apr 1.
         assert_eq!(
             bar_at()
-                .into_candle(1, "quarter", AggregateVolume::Traded)
+                .into_candle(1, "quarter", AggregateProvenance::TradeTape)
                 .unwrap()
                 .close_time
                 .timestamp_millis(),
@@ -1012,7 +1036,7 @@ mod tests {
         // Year: Jan 1 -> next Jan 1.
         assert_eq!(
             bar_at()
-                .into_candle(1, "year", AggregateVolume::Traded)
+                .into_candle(1, "year", AggregateProvenance::TradeTape)
                 .unwrap()
                 .close_time
                 .timestamp_millis(),
@@ -1373,7 +1397,7 @@ mod tests {
         };
 
         let start_ms = agg.start_timestamp;
-        let (time, candle) = agg.into_candle(AggregateVolume::Traded);
+        let (time, candle) = agg.into_candle(AggregateProvenance::TradeTape);
 
         assert_eq!(candle.open, dec!(45200.0));
         assert_eq!(candle.high, dec!(45250.0));
@@ -1415,19 +1439,26 @@ mod tests {
             average_trade_size: None,
         };
 
-        let (_, forex) = agg().into_candle(AggregateVolume::QuoteTicks);
+        let (_, forex) = agg().into_candle(AggregateProvenance::QuoteTape);
         assert_eq!(forex.volume, None);
         assert_eq!(forex.trade_count, None);
 
         // Same wire shape on a market that does have a tape still reports the volume, so this is
         // a per-market decision rather than a blanket drop.
-        let (_, traded) = agg().into_candle(AggregateVolume::Traded);
+        let (_, traded) = agg().into_candle(AggregateProvenance::TradeTape);
         assert_eq!(traded.volume, Some(dec!(4321)));
     }
 
-    /// The REST path derives the same distinction from the ticker's asset-class prefix.
+    /// The REST path derives the same distinction from the ticker's asset-class prefix, and applies
+    /// it to **both** activity counts.
+    ///
+    /// `n` is documented as "the number of transactions in the aggregate window" — exactly as
+    /// generically as `v` is documented as trading volume, and overridden by exactly the same fact:
+    /// a bar Massive generated from quoted bid/ask updates contains no transactions to count. A
+    /// quote-tick count arriving in `candle.trade_count` reads as liquidity that is not there, so a
+    /// `trade_count >= 50` filter would pass on every forex bar and look like it was working.
     #[test]
-    fn a_forex_rest_bar_reports_no_volume_but_keeps_its_real_trade_count() {
+    fn a_forex_rest_bar_reports_neither_volume_nor_trade_count() {
         let bar = || AggregateBar {
             open: dec!(1.1),
             high: dec!(1.2),
@@ -1440,28 +1471,30 @@ mod tests {
         };
 
         let forex = bar()
-            .into_candle(1, "minute", AggregateVolume::for_ticker("C:EURUSD"))
+            .into_candle(1, "minute", AggregateProvenance::for_ticker("C:EURUSD"))
             .unwrap();
         assert_eq!(forex.volume, None);
-        // `n` IS documented as a transaction count on every market, so it survives.
-        assert_eq!(forex.trade_count, Some(150));
+        assert_eq!(forex.trade_count, None);
 
+        // The identical wire shape on a market that does have a tape keeps both, so this is a
+        // per-market decision rather than a blanket drop.
         let crypto = bar()
-            .into_candle(1, "minute", AggregateVolume::for_ticker("X:BTCUSD"))
+            .into_candle(1, "minute", AggregateProvenance::for_ticker("X:BTCUSD"))
             .unwrap();
         assert_eq!(crypto.volume, Some(dec!(4321)));
+        assert_eq!(crypto.trade_count, Some(150));
     }
 
     #[test]
-    fn aggregate_volume_classifies_only_the_forex_prefix_as_quote_ticks() {
+    fn aggregate_provenance_classifies_only_the_forex_prefix_as_a_quote_tape() {
         assert_eq!(
-            AggregateVolume::for_ticker("C:EURUSD"),
-            AggregateVolume::QuoteTicks
+            AggregateProvenance::for_ticker("C:EURUSD"),
+            AggregateProvenance::QuoteTape
         );
         for traded in ["X:BTCUSD", "AAPL", "O:SPY251219C00650000", "I:SPX"] {
             assert_eq!(
-                AggregateVolume::for_ticker(traded),
-                AggregateVolume::Traded,
+                AggregateProvenance::for_ticker(traded),
+                AggregateProvenance::TradeTape,
                 "{traded}"
             );
         }
@@ -1470,11 +1503,11 @@ mod tests {
     /// Nothing upstream normalises a caller-supplied ticker, so a case-sensitive prefix match
     /// would report a forex quote-update count as real traded volume.
     #[test]
-    fn aggregate_volume_classifies_the_forex_prefix_regardless_of_case() {
+    fn aggregate_provenance_classifies_the_forex_prefix_regardless_of_case() {
         for forex in ["c:eurusd", "c:EURUSD", "C:eurusd"] {
             assert_eq!(
-                AggregateVolume::for_ticker(forex),
-                AggregateVolume::QuoteTicks,
+                AggregateProvenance::for_ticker(forex),
+                AggregateProvenance::QuoteTape,
                 "{forex}"
             );
         }
@@ -1483,13 +1516,13 @@ mod tests {
     /// `..2` is a byte range, and `€:EURUSD` is the case that matters: a 3-byte leading character
     /// puts byte 2 mid-character, which slicing would panic on. The rest do not straddle a
     /// boundary — `é` is exactly 2 bytes, and the short strings stop before index 2 — and are here
-    /// to pin that every non-`C:` shape reaches `Traded`, not only the ones `get` rejects.
+    /// to pin that every non-`C:` shape reaches `TradeTape`, not only the ones `get` rejects.
     #[test]
-    fn aggregate_volume_does_not_panic_on_a_short_or_non_ascii_ticker() {
+    fn aggregate_provenance_does_not_panic_on_a_short_or_non_ascii_ticker() {
         for ticker in ["", "C", "€:EURUSD", "é"] {
             assert_eq!(
-                AggregateVolume::for_ticker(ticker),
-                AggregateVolume::Traded,
+                AggregateProvenance::for_ticker(ticker),
+                AggregateProvenance::TradeTape,
                 "{ticker}"
             );
         }

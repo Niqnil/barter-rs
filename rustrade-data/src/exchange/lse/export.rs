@@ -161,6 +161,27 @@ impl LseExportRange {
     pub fn end(&self) -> NaiveDate {
         self.end
     }
+
+    /// Whether this range starts more than one day after `today`, and so is guaranteed to hold no
+    /// data.
+    ///
+    /// Separate from [`new`](Self::new), and pure, deliberately: "is this range in the future"
+    /// depends on when the question is asked, so a constructor answering it would bake one reading
+    /// of the clock into a value that outlives it — and would make the type untestable without one.
+    /// [`submit_export`](super::vault::LseVaultClient::submit_export) asks it at the point the
+    /// export is actually spent, which is the instant the answer matters.
+    ///
+    /// # Why a whole day of slack
+    /// `today` is read in UTC while the caller may be thinking in local time, and the widest real
+    /// offset is UTC+14 — so a caller's "today" can legitimately be UTC's tomorrow, and never more.
+    /// Comparing against `today + 1` therefore cannot reject a range someone meant, while still
+    /// catching the failure this exists for: a fat-fingered year, which misses by hundreds of days.
+    #[must_use]
+    pub fn is_wholly_after(&self, today: NaiveDate) -> bool {
+        self.start
+            .checked_sub_days(chrono::Days::new(1))
+            .is_some_and(|slack| slack > today)
+    }
 }
 
 /// A validated export request.
@@ -188,7 +209,10 @@ impl LseExportRequest {
     ///   sent verbatim into a `400` that would cost an export.
     /// - [`LseError::InvalidInput`] if `symbol` is `"all"`, on **either** timeframe — measured on
     ///   both to produce a valid, **empty** artifact with no error (see the
-    ///   [module documentation](self)).
+    ///   [module documentation](self)). The exact spelling `"ALL"` is admitted on
+    ///   [`Stocks`](LseDataset::Stocks) and [`Etf`](LseDataset::Etf) only, where it is Allstate's
+    ///   real ticker; on every other dataset a symbol is a pair or a contract slug, so no casing of
+    ///   it names anything.
     /// - [`LseError::InvalidInput`] if a candle resolution is requested for one of the provider's
     ///   synthetic classes. Those serve candles over REST but are **tick-only on the export path**
     ///   — measured: `{dataset: volatility, timeframe: 1d}` → `400 … it is tick-only`.
@@ -217,22 +241,48 @@ impl LseExportRequest {
         // Rejecting the resolution before the request is sent, not after being billed for a 400.
         let _ = timeframe.as_lse_str()?;
 
-        // Case-insensitive with one exact-match escape hatch: `ALL` is Allstate's real ticker
-        // (verified live against the provider's own price endpoint), so rejecting *that* spelling
-        // would forbid a correct export with no way around it. Every other casing -- `all`, `All`,
-        // `aLL` -- is nobody's real symbol, because the provider publishes symbols uppercase, and
-        // title case is exactly what a spreadsheet produces. Each one costs a billed export to
-        // discover it matched nothing, so the guard covers them rather than only the lowercase form.
-        if symbol != "ALL" && symbol.eq_ignore_ascii_case(ALL_SYMBOLS_LITERAL) {
+        // Case-insensitive with one narrow escape hatch: `ALL` is Allstate's real ticker (verified
+        // live against the provider's own price endpoint), so rejecting *that* spelling on an
+        // equity dataset would forbid a correct export with no way around it. Every other casing --
+        // `all`, `All`, `aLL` -- is nobody's real symbol, because the provider publishes symbols
+        // uppercase, and title case is exactly what a spreadsheet produces. Each one costs a billed
+        // export to discover it matched nothing, so the guard covers them rather than only the
+        // lowercase form.
+        //
+        // The escape hatch is scoped to the datasets where a bare equity ticker is even
+        // representable. "Matches nothing" is a property of the (dataset, symbol) PAIR, and
+        // `dataset` is right here: on `Fx` a symbol is pair-shaped (`EUR/USD`), on the index,
+        // commodity, rates, volatility and futures classes it is a contract slug, and on `Crypto`
+        // it is a pair -- so `ALL` is not Allstate on any of them, it is the same zero-row artifact
+        // as `all`, and letting it through spends a billed export to learn that. `Stocks` and `Etf`
+        // share one venue and one symbology (see `LseDataset::exchange_id`), so the hatch covers
+        // both rather than assuming Allstate is the only uppercase-`ALL` listing.
+        let equity_symbology = matches!(dataset, LseDataset::Stocks | LseDataset::Etf);
+        if !(equity_symbology && symbol == "ALL")
+            && symbol.eq_ignore_ascii_case(ALL_SYMBOLS_LITERAL)
+        {
+            // Only the equity classes get told about Allstate; naming it on `fx` would send the
+            // reader after a listing that dataset does not carry.
+            let hint = if equity_symbology {
+                format!(
+                    " (If you meant Allstate, its symbol is exactly {:?}, uppercase.)",
+                    ALL_SYMBOLS_LITERAL.to_uppercase()
+                )
+            } else {
+                format!(
+                    " No casing of it is a symbol on dataset {:?}, whose symbols are not bare \
+                     equity tickers.",
+                    dataset.as_catalog_str()
+                )
+            };
+
             return Err(LseError::InvalidInput {
                 message: format!(
                     "symbol {symbol:?} is a literal the provider matches against the symbol \
                      column, not a request for every symbol: an export naming it returns a valid \
                      but EMPTY artifact, with no error, and still consumes one of five hourly \
                      exports - name a real symbol instead. Measured on both the candle and the \
-                     tick path; every artifact this provider will produce is single-symbol. (If \
-                     you meant Allstate, its symbol is exactly {:?}, uppercase.)",
-                    ALL_SYMBOLS_LITERAL.to_uppercase()
+                     tick path; every artifact this provider will produce is single-symbol.{hint}"
                 ),
             });
         }
@@ -498,6 +548,16 @@ impl LseExport {
     /// Use this for a file obtained out of band — and note that the dataset you name here is what
     /// every decoded event's [`ExchangeId`] will be derived from, while `symbol` is what the
     /// decoder checks every row against.
+    ///
+    /// `timeframe` is taken on the caller's word, because nothing in a Parquet artifact records the
+    /// resolution it was written at. The decoder measures bar spacing against it and rejects a file
+    /// **finer** than declared — 1-minute bars declared `Day1`, where every derived `close_time`
+    /// would stretch over the next 1,439 bars. The opposite mistake is undetectable and the worse
+    /// of the two: daily bars declared `Min1` are spaced far wider than 60 seconds, so they pass,
+    /// and each bar then enters the timeline a minute after its day opened rather than at the end
+    /// of it — a full day of lookahead. See `parquet::read_export`, whose rustdoc states the reach
+    /// of the check in full. (Not linked: that module is behind its own feature, so the link would
+    /// be dead in a build without it.)
     pub fn new(
         path: impl Into<PathBuf>,
         dataset: LseDataset,
@@ -562,6 +622,13 @@ impl LseVaultClient {
     /// fetched here, since that would add a network round trip to every submission.
     ///
     /// # Errors
+    /// - [`LseError::InvalidInput`] if the range lies wholly in the future. The provider answers
+    ///   such a request with a valid, **empty** artifact and no error, so it spends an export to
+    ///   learn nothing — the same economics as the empty range [`LseExportRange::new`] rejects,
+    ///   which is why it is rejected too. Checked here rather than at construction because the
+    ///   answer depends on when the question is asked; see
+    ///   [`LseExportRange::is_wholly_after`] for the day of slack that keeps a caller's local
+    ///   "today" from tripping it.
     /// - [`LseError::QuotaExceeded`] when the export allowance is exhausted, carrying the
     ///   allowance position at the point of rejection.
     /// - [`LseError::Api`] for any other non-success status, with the provider's diagnostic
@@ -571,6 +638,19 @@ impl LseVaultClient {
         &self,
         request: &LseExportRequest,
     ) -> Result<LseExportJob, LseError> {
+        let today = chrono::Utc::now().date_naive();
+        if request.range().is_wholly_after(today) {
+            return Err(LseError::InvalidInput {
+                message: format!(
+                    "export range {} to {} (end exclusive) lies wholly in the future, and today is \
+                     {today}: the provider would answer with a valid but EMPTY artifact, with no \
+                     error, and still consume one of five hourly exports - check the year",
+                    request.range().start(),
+                    request.range().end()
+                ),
+            });
+        }
+
         let body = request.to_body()?;
 
         info!(
@@ -616,8 +696,9 @@ impl LseVaultClient {
     /// rather than run in full — so a long interval paired with a short timeout reports
     /// [`LseError::ExportTimeout`] promptly instead of blocking for an interval first. One status
     /// request is still in flight when the deadline passes, so the call can overrun it by that
-    /// request's duration. A `timeout` so large that it would overflow the clock (`Duration::MAX`,
-    /// used as a "no timeout" sentinel) saturates rather than panicking.
+    /// request's duration. A `poll_interval` or `timeout` so large that it would overflow the clock
+    /// (`Duration::MAX`, used as a "no timeout" / "wait for the deadline" sentinel) saturates rather
+    /// than panicking.
     ///
     /// # Errors
     /// - [`LseError::ExportFailed`] if the job reaches `failed` or `expired`.
@@ -666,8 +747,18 @@ impl LseVaultClient {
             // Never sleeps past the deadline, so `timeout` bounds the call whatever `poll_interval`
             // is. Sleeping the full interval first would let `poll_interval = 60s, timeout = 5s`
             // block for a minute before reporting a timeout it had already passed.
-            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll_interval))
-                .await;
+            //
+            // `checked_add` for the same reason as `deadline` above, and it is NOT covered by that
+            // one: `.min(deadline)` clamps the result, but the addition producing it is evaluated
+            // first, so a bare `+` here would abort the caller's task on a `Duration::MAX`
+            // `poll_interval` — the "poll once, then wait for the deadline" spelling, and no less
+            // plausible than the same sentinel for `timeout`. An interval that cannot be
+            // represented is longer than any deadline, so falling back to the deadline is what it
+            // means.
+            let next_poll = tokio::time::Instant::now()
+                .checked_add(poll_interval)
+                .map_or(deadline, |instant| deadline.min(instant));
+            tokio::time::sleep_until(next_poll).await;
         }
     }
 
@@ -720,6 +811,25 @@ impl LseVaultClient {
     /// at the wrong digest with nothing left to fetch, means corrupt: the file is removed so a
     /// re-call restarts rather than failing identically forever. [`LseError::IntegrityMismatch`]
     /// reports which happened via `discarded`.
+    ///
+    /// # ⚠️ Caller obligation: reclaiming abandoned `.part` files
+    /// **Nothing here ever deletes a `.part` except the corrupt-file path above.** A `.part` is
+    /// named for its job (see the resume section), which is what makes resuming safe — and what
+    /// makes an abandoned one unreachable: a process killed mid-transfer leaves its `.part` behind,
+    /// and a *re-export* of the same range gets a new job id, so the next call writes a new file
+    /// and never looks at the old one. A 7 GB export killed at 6 GB occupies 6 GB indefinitely.
+    ///
+    /// This integration deliberately offers no cleanup or enumeration API: deleting files it did
+    /// not write this call is a policy decision, and "which of these is still wanted" depends on
+    /// whether the caller intends to resume — which only the caller knows. Reclaiming them is
+    /// therefore yours. They are identifiable without help: they sit next to the destination, so a
+    /// glob of `<destination>.*.part` finds every candidate. Matching a *specific* job needs one
+    /// step of care — the id embedded in the name is the job id with every character outside
+    /// `[A-Za-z0-9._-]` replaced by `_`, since a provider-supplied id is not assumed path-safe — so
+    /// apply the same substitution before deciding which ids to spare.
+    ///
+    /// Downloads consume no export allowance, so discarding a `.part` you no longer want costs
+    /// bandwidth on the next attempt and nothing else.
     ///
     /// The URL is built from the client's base URL and the job id rather than from the job's
     /// `download_url`, preserving this client's invariant that it only ever requests URLs it
@@ -1007,6 +1117,31 @@ impl LseVaultClient {
                     message: format!("writing {}", part.display()),
                     source,
                 })?;
+
+            // Stop as soon as the response outruns the length the job reported. Without this the
+            // only bound on the body is the six-hour deadline: a misbehaving proxy streaming
+            // 500 GB against a `bytes: 1_000_000` job fills the disk before the length check in
+            // `download_export` ever runs, and on `ENOSPC` the write fails with the oversized
+            // `.part` RETAINED — the one state that is neither resumable nor cleaned up.
+            //
+            // The overshoot is bounded by one chunk, and the chunk is written before the break on
+            // purpose: `downloaded` then matches the file's real length, so the caller sees
+            // `downloaded > expected` and takes its "longer than the artifact, therefore corrupt"
+            // branch, which discards the `.part` and says so. Breaking before the write would land
+            // on exactly `expected` bytes and report a digest mismatch instead — the same outcome
+            // under a diagnosis that sends the reader after the wrong problem.
+            //
+            // A job reporting no `bytes` has nothing to bound against; that path stays as it was.
+            if job.bytes.is_some_and(|total| downloaded > total) {
+                warn!(
+                    job_id = job.id,
+                    downloaded,
+                    expected = job.bytes,
+                    "export download exceeded the length the job reports; abandoning the transfer \
+                     rather than writing an unbounded body to disk"
+                );
+                break;
+            }
         }
 
         file.flush().await.map_err(|source| LseError::Io {

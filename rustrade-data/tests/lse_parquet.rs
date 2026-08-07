@@ -23,7 +23,10 @@
 //! - `price` is the **bid** (the provider's price endpoint returns `price == bid` on every symbol
 //!   tested), so `price` beside an `ask` is a quote.
 //! - `ts` is the bar's **open** time, and timestamps are **non-decreasing**, not strictly
-//!   ascending.
+//!   ascending — measured on the *tick* tapes, where several prints routinely share a microsecond.
+//!   Candle artifacts are a different shape: two bars of one series can share neither an open nor
+//!   the close derived from it, and their spacing is the only evidence of the resolution the file
+//!   was written at, since nothing in an artifact records it.
 //!
 //! Run with: `cargo test --test lse_parquet --features lse-parquet`
 
@@ -31,7 +34,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 
 use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use rust_decimal::Decimal;
@@ -39,8 +42,8 @@ use rust_decimal_macros::dec;
 use rustrade_data::event::DataKind;
 use rustrade_data::exchange::lse::error::LseError;
 use rustrade_data::exchange::lse::export::{LseExport, LseExportRange, LseExportTimeframe};
-use rustrade_data::exchange::lse::market::LseDataset;
-use rustrade_data::exchange::lse::parquet::{instrument_index_for, read_export, symbols_in_export};
+use rustrade_data::exchange::lse::market::{LseDataset, instrument_index_for};
+use rustrade_data::exchange::lse::parquet::{read_export, symbols_in_export};
 use rustrade_data::subscription::candle::CandleInterval;
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_instrument::index::builder::IndexedInstrumentsBuilder;
@@ -70,8 +73,26 @@ fn write_parquet(path: &Path, message: &str, columns: Vec<Col>) {
 /// not a guarantee of the format, so the decoder walks groups — and something has to exercise the
 /// walk.
 fn write_parquet_row_groups(path: &Path, message: &str, groups: Vec<Vec<Col>>) {
+    write_parquet_row_groups_with(path, message, groups, EnabledStatistics::Page);
+}
+
+/// As [`write_parquet_row_groups`], but choosing whether the writer emits column statistics.
+///
+/// The discarded-`volume` check reads column-chunk statistics rather than decoding the column, so
+/// the branch where a writer emits none is reachable only through here. Every other fixture takes
+/// the default, which does emit them.
+fn write_parquet_row_groups_with(
+    path: &Path,
+    message: &str,
+    groups: Vec<Vec<Col>>,
+    statistics: EnabledStatistics,
+) {
     let schema = Arc::new(parse_message_type(message).unwrap());
-    let props = Arc::new(WriterProperties::builder().build());
+    let props = Arc::new(
+        WriterProperties::builder()
+            .set_statistics_enabled(statistics)
+            .build(),
+    );
     let mut writer = SerializedFileWriter::new(File::create(path).unwrap(), schema, props).unwrap();
 
     for columns in groups {
@@ -125,8 +146,17 @@ fn range() -> LseExportRange {
 
 /// 2026-07-01T00:00:00Z in microseconds — the first day of [`range`].
 const T0: i64 = 1_782_864_000_000_000;
+const MINUTE: i64 = 60_000_000;
 const HOUR: i64 = 3_600_000_000;
 const DAY: i64 = 86_400_000_000;
+
+/// 2026-01-30T00:00:00Z in microseconds.
+///
+/// January, not July, because the calendar-interval exemptions are only visible across a short
+/// month: `2026-01-30 + 1mo` and `2026-01-31 + 1mo` both clamp to `2026-02-28`. The decoder does
+/// not check rows against the descriptor's range, so a fixture outside [`range`] is decoded the
+/// same as one inside it.
+const JAN_30: i64 = 1_769_731_200_000_000;
 
 fn export(path: PathBuf, dataset: LseDataset, symbol: &str, tf: LseExportTimeframe) -> LseExport {
     LseExport::new(path, dataset, symbol, tf, range())
@@ -329,19 +359,28 @@ fn a_synth_tick_export_decodes_price_as_the_bid() {
 /// Decode a synth tick artifact whose `volume` column holds `volumes`, returning the decoded
 /// events and how many `WARN`s the decode emitted.
 fn decode_synth_with_volumes(name: &str, volumes: Vec<Option<f64>>) -> (Vec<DataKind>, usize) {
+    decode_synth_with_volumes_stats(name, volumes, EnabledStatistics::Page)
+}
+
+fn decode_synth_with_volumes_stats(
+    name: &str,
+    volumes: Vec<Option<f64>>,
+    statistics: EnabledStatistics,
+) -> (Vec<DataKind>, usize) {
     let dir = dir();
     let path = dir.path().join(name);
     let rows = volumes.len();
-    write_parquet(
+    write_parquet_row_groups_with(
         &path,
         SYNTH_TICK,
-        vec![
+        vec![vec![
             Col::Ts((0..rows as i64).map(|row| T0 + row * HOUR).collect()),
             Col::Sym(vec!["VIX/USD"; rows]),
             Col::Dbl(vec![2.0; rows]),
             Col::OptDbl(volumes),
             Col::OptDbl(vec![Some(2.1); rows]),
-        ],
+        ]],
+        statistics,
     );
 
     let export = export(
@@ -408,6 +447,35 @@ fn a_populated_volume_warns_once_per_artifact_while_the_measured_zero_stays_sile
         "drift is reported once per artifact, not once per row"
     );
     assert_quotes(&kinds, 3);
+}
+
+/// The check reads column-chunk statistics, so a writer that emits none turns it off entirely.
+///
+/// That is a deliberate trade — decoding the column to recover the warning would reinstate the whole
+/// cost the statistics path exists to avoid — but it is also the one way this check can silently
+/// degrade to "keys on nothing at all" while every fixture above stays green, since they all take
+/// the writer default, which does emit statistics. Pinned so the silence stays deliberate, and so
+/// the decoded quote is still asserted correct on the path where the observability is gone.
+#[test]
+fn a_populated_volume_stays_silent_when_the_writer_emitted_no_statistics() {
+    let (kinds, warnings) = decode_synth_with_volumes_stats(
+        "no_stats.parquet",
+        vec![Some(500.0), Some(600.0), Some(700.0)],
+        EnabledStatistics::None,
+    );
+
+    assert_eq!(
+        warnings, 0,
+        "with no statistics to read, the drift check cannot fire — documented on the method"
+    );
+    assert_eq!(kinds.len(), 3);
+    for kind in &kinds {
+        let DataKind::OrderBookL1(book) = kind else {
+            panic!("expected OrderBookL1, got {kind:?}");
+        };
+        assert_eq!(book.best_bid.unwrap().price, dec!(2.0));
+        assert_eq!(book.best_ask.unwrap().price, dec!(2.1));
+    }
 }
 
 // ── candles ──────────────────────────────────────────────────────────────────
@@ -694,6 +762,178 @@ fn tied_timestamps_are_accepted_because_they_are_the_common_case() {
         .unwrap();
 
     assert_eq!(events.len(), 4);
+}
+
+#[test]
+fn tied_timestamps_on_a_candle_artifact_are_rejected_because_two_bars_cannot_share_an_open() {
+    // The mirror of the test above, and the reason the rule is layout-dependent rather than one
+    // constant. Two bars of one series cannot share an open, so a tie here is not the common case:
+    // it means the file holds more than one series, or repeats a row.
+    //
+    // It does NOT mean the declared resolution is wrong — a fixed interval is a constant shift from
+    // open to close, so it cancels out of this comparison entirely. That is a separate check on bar
+    // spacing, covered below.
+    let dir = dir();
+    let path = dir.path().join("candleties.parquet");
+    write_parquet(
+        &path,
+        CANDLE_WITH_VOLUME,
+        vec![
+            Col::Ts(vec![T0, T0]),
+            Col::Sym(vec!["AAPL", "AAPL"]),
+            Col::Dbl(vec![100.0, 100.0]),
+            Col::Dbl(vec![110.0, 110.0]),
+            Col::Dbl(vec![90.0, 90.0]),
+            Col::Dbl(vec![105.0, 105.0]),
+            Col::Dbl(vec![1000.0, 1000.0]),
+        ],
+    );
+
+    let export = export(
+        path,
+        LseDataset::Stocks,
+        "AAPL",
+        LseExportTimeframe::Candle(CandleInterval::Day1),
+    );
+    let error = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_err();
+
+    assert!(matches!(error, LseError::NonMonotonicTimestamps { .. }));
+}
+
+#[test]
+fn a_candle_artifact_finer_than_the_declared_interval_is_rejected() {
+    // Nothing in a Parquet artifact records the resolution it was written at, so `close_time` is
+    // derived from the caller's word. Declaring `Day1` over a file of 1-minute bars used to decode
+    // cleanly: the bars ascend, the closes are distinct, and each one silently claims a 24-hour
+    // period overlapping the next 1,439. Spacing is the only property that gives it away.
+    let dir = dir();
+    let path = dir.path().join("finer.parquet");
+    write_parquet(
+        &path,
+        CANDLE_WITH_VOLUME,
+        vec![
+            Col::Ts(vec![T0, T0 + MINUTE]),
+            Col::Sym(vec!["AAPL", "AAPL"]),
+            Col::Dbl(vec![100.0, 101.0]),
+            Col::Dbl(vec![110.0, 111.0]),
+            Col::Dbl(vec![90.0, 91.0]),
+            Col::Dbl(vec![105.0, 106.0]),
+            Col::Dbl(vec![1000.0, 1000.0]),
+        ],
+    );
+
+    let export = export(
+        path,
+        LseDataset::Stocks,
+        "AAPL",
+        LseExportTimeframe::Candle(CandleInterval::Day1),
+    );
+    let error = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_err();
+
+    let LseError::UnexpectedCandleResolution {
+        interval,
+        previous_open,
+        open,
+        actual,
+        ..
+    } = error
+    else {
+        panic!("expected UnexpectedCandleResolution, got {error:?}");
+    };
+    assert_eq!(interval, CandleInterval::Day1);
+    assert_eq!(actual, chrono::TimeDelta::minutes(1));
+    // Reported in terms of the `ts` column the artifact actually carries, NOT the closes the
+    // decoder derived from it: only the opens are values a caller can find in their own file.
+    assert_eq!(previous_open.to_rfc3339(), "2026-07-01T00:00:00+00:00");
+    assert_eq!(open.to_rfc3339(), "2026-07-01T00:01:00+00:00");
+}
+
+#[test]
+fn bars_spaced_exactly_the_declared_interval_or_wider_decode() {
+    // The other side of the boundary, and the reason the comparison is `<` rather than `<=`.
+    // Consecutive bars of a compliant series are spaced EXACTLY one interval apart, so a rule that
+    // rejected equality would reject every well-formed candle artifact there is.
+    //
+    // The third bar opens three days after the second: a weekend, a holiday or a quiet symbol only
+    // ever makes spacing WIDER, which is why a gap cannot false-positive here.
+    let dir = dir();
+    let path = dir.path().join("spacing.parquet");
+    write_parquet(
+        &path,
+        CANDLE_WITH_VOLUME,
+        vec![
+            Col::Ts(vec![T0, T0 + DAY, T0 + 4 * DAY]),
+            Col::Sym(vec!["AAPL", "AAPL", "AAPL"]),
+            Col::Dbl(vec![100.0, 101.0, 102.0]),
+            Col::Dbl(vec![110.0, 111.0, 112.0]),
+            Col::Dbl(vec![90.0, 91.0, 92.0]),
+            Col::Dbl(vec![105.0, 106.0, 107.0]),
+            Col::Dbl(vec![1000.0, 1000.0, 1000.0]),
+        ],
+    );
+
+    let export = export(
+        path,
+        LseDataset::Stocks,
+        "AAPL",
+        LseExportTimeframe::Candle(CandleInterval::Day1),
+    );
+    let events: Vec<_> = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert_eq!(events.len(), 3);
+}
+
+#[test]
+fn a_calendar_interval_is_exempt_from_both_the_spacing_and_the_strictness_rules() {
+    // `Month1` has no single width, so there is nothing to compare a spacing against — February
+    // would false-positive against a 31-day one. Both bars here open one day apart, far inside any
+    // month, and must still decode.
+    //
+    // They also close on the SAME instant, which is legitimate rather than a repeated row: month
+    // arithmetic clamps day-of-month, so `2026-01-30 + 1mo` and `2026-01-31 + 1mo` both land on
+    // `2026-02-28`. Strict ascent would reject a valid file, which is why it too is skipped here.
+    let dir = dir();
+    let path = dir.path().join("monthly.parquet");
+    write_parquet(
+        &path,
+        CANDLE_WITH_VOLUME,
+        vec![
+            Col::Ts(vec![JAN_30, JAN_30 + DAY]),
+            Col::Sym(vec!["AAPL", "AAPL"]),
+            Col::Dbl(vec![100.0, 101.0]),
+            Col::Dbl(vec![110.0, 111.0]),
+            Col::Dbl(vec![90.0, 91.0]),
+            Col::Dbl(vec![105.0, 106.0]),
+            Col::Dbl(vec![1000.0, 1000.0]),
+        ],
+    );
+
+    let export = export(
+        path,
+        LseDataset::Stocks,
+        "AAPL",
+        LseExportTimeframe::Candle(CandleInterval::Month1),
+    );
+    let events: Vec<_> = read_export(&export, idx())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0].time_exchange.to_rfc3339(),
+        "2026-02-28T00:00:00+00:00"
+    );
+    assert_eq!(events[1].time_exchange, events[0].time_exchange);
 }
 
 #[test]
@@ -1163,4 +1403,76 @@ fn instrument_index_is_derived_from_the_registry_so_a_typo_cannot_be_silent() {
     assert!(matches!(error, LseError::UnknownInstrument { .. }));
     // The message names what IS registered, so the fix is obvious.
     assert!(error.to_string().contains("BP.L"));
+}
+
+#[test]
+fn a_london_listing_registered_in_pounds_is_rejected_rather_than_booked_100x_wrong() {
+    use rustrade_instrument::Underlying;
+    use rustrade_instrument::instrument::name::{InstrumentNameExchange, InstrumentNameInternal};
+    use rustrade_instrument::instrument::quote::InstrumentQuoteAsset;
+    use rustrade_instrument::instrument::{Instrument, kind::InstrumentKind};
+    use rustrade_instrument::test_utils::asset;
+
+    // `BP.L` prints ~548 where BP trades around £5.48. The provider sends no unit, so the
+    // registered asset IS the unit: booking that 548 as GBP inflates notional, fees, unrealised
+    // PnL and every balance by 100×, and no later layer can tell. This registry boundary is the
+    // only place the provider's view of the symbol and the caller's registry meet.
+    let register = |quote: &str| {
+        let name = InstrumentNameExchange::from("BP.L");
+        IndexedInstrumentsBuilder::default()
+            .add_instrument(Instrument::new(
+                ExchangeId::LseEquities,
+                InstrumentNameInternal::new_from_exchange(ExchangeId::LseEquities, name.clone()),
+                name,
+                Underlying::new(asset("bp.l"), asset(quote)),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Spot,
+                None,
+            ))
+            .build()
+    };
+
+    let instruments = register("gbp");
+    let error = instrument_index_for(&instruments, ExchangeId::LseEquities, "BP.L").unwrap_err();
+    let LseError::QuoteAssetMismatch {
+        expected,
+        registered,
+        ..
+    } = &error
+    else {
+        panic!("expected QuoteAssetMismatch, got {error:?}");
+    };
+    // Both sides are named: "wrong quote asset" alone leaves the reader guessing which way.
+    assert_eq!(expected, "gbx");
+    assert_eq!(registered, "gbp");
+
+    // Case is not the distinction — asset identity is lowercased internally, so `GBX` and `gbx`
+    // are one asset. Rejecting the correct registration on spelling would be the worse failure.
+    for spelling in ["gbx", "GBX"] {
+        let instruments = register(spelling);
+        assert_eq!(
+            instrument_index_for(&instruments, ExchangeId::LseEquities, "BP.L").unwrap(),
+            InstrumentIndex::new(0),
+            "{spelling} names the same asset as gbx"
+        );
+    }
+
+    // A US listing carries no venue suffix and is quoted in USD, so the same check must pass
+    // there rather than only ever firing on London.
+    let name = InstrumentNameExchange::from("AAPL");
+    let instruments = IndexedInstrumentsBuilder::default()
+        .add_instrument(Instrument::new(
+            ExchangeId::LseEquities,
+            InstrumentNameInternal::new_from_exchange(ExchangeId::LseEquities, name.clone()),
+            name,
+            Underlying::new(asset("aapl"), asset("usd")),
+            InstrumentQuoteAsset::UnderlyingQuote,
+            InstrumentKind::Spot,
+            None,
+        ))
+        .build();
+    assert_eq!(
+        instrument_index_for(&instruments, ExchangeId::LseEquities, "AAPL").unwrap(),
+        InstrumentIndex::new(0)
+    );
 }

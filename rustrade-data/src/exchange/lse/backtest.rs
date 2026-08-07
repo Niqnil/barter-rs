@@ -1,7 +1,7 @@
 use crate::{
     error::DataError,
     event::DataKind,
-    exchange::lse::vault::LseVaultClient,
+    exchange::lse::{error::LseError, market, vault::LseVaultClient},
     streams::{
         consumer::MarketStreamEvent,
         merge::{merge_time_sorted, tag_events},
@@ -11,15 +11,24 @@ use crate::{
 use async_stream::try_stream;
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
-use rustrade_instrument::{exchange::ExchangeId, instrument::InstrumentIndex};
+use rustrade_instrument::{
+    exchange::ExchangeId, index::IndexedInstruments, instrument::InstrumentIndex,
+};
 use smol_str::SmolStr;
 use std::sync::Arc;
 
 /// One instrument's candle source: which vault symbol to fetch, and what to tag it as.
 ///
+/// # Prefer [`resolve`](Self::resolve)
+/// It derives both keys from the registry the engine was built with and checks the quote asset,
+/// which is the only place a `.L` listing registered in `gbp` rather than `gbx` — pence booked as
+/// pounds, every notional 100× wrong — is visible. [`new`](Self::new) takes the caller's word for
+/// both and carries no protection; it exists for callers who have no registry to check against.
+///
 /// # The keys must match the instruments the engine was built with
-/// `instrument` and `exchange` are **not** derived from the symbol, because only the caller knows
-/// how they registered the instrument. Both must match that registration:
+/// With [`new`](Self::new), `instrument` and `exchange` are **not** derived from the symbol,
+/// because only the caller knows how they registered the instrument. Both must match that
+/// registration:
 ///
 /// - `instrument` is the [`InstrumentIndex`] the instrument received in `IndexedInstruments`.
 ///   Positions and unrealised PnL are strictly index-scoped, so a wrong index attributes this
@@ -40,7 +49,12 @@ pub struct LseCandleSource {
 }
 
 impl LseCandleSource {
-    /// Create a candle source for one instrument.
+    /// Create a candle source for one instrument, taking both engine-side keys on trust.
+    ///
+    /// Prefer [`resolve`](Self::resolve) whenever the registry is in hand: it derives `instrument`
+    /// from that registry and rejects a quote-asset disagreement, neither of which this can do.
+    /// This exists for callers assembling sources without an `IndexedInstruments` — and it means a
+    /// fabricated index, or a `.L` symbol registered in pounds, reaches the engine unremarked.
     pub fn new(
         symbol: impl Into<SmolStr>,
         instrument: InstrumentIndex,
@@ -51,6 +65,36 @@ impl LseCandleSource {
             instrument,
             exchange,
         }
+    }
+
+    /// Create a candle source by resolving the symbol against the engine's instrument registry.
+    ///
+    /// The checked constructor, and the one to reach for: `instrument` is derived from
+    /// `instruments` rather than supplied, so a fabricated or typo'd index is unrepresentable, and
+    /// the symbol's quote asset is verified against the registration. That verification is the
+    /// candle path's only defence against a London listing registered in `gbp` rather than `gbx`,
+    /// which books pence as pounds and inflates every notional, fee, PnL and balance by 100× with
+    /// nothing downstream able to notice. See
+    /// [`market::instrument_index_for`].
+    ///
+    /// # Errors
+    /// - [`LseError::UnknownInstrument`] if no instrument on `exchange` is registered under
+    ///   `symbol` as its exchange-side name.
+    /// - [`LseError::QuoteAssetMismatch`] if one is, but prices it in a different asset than the
+    ///   provider quotes that symbol in.
+    pub fn resolve(
+        instruments: &IndexedInstruments,
+        exchange: ExchangeId,
+        symbol: impl Into<SmolStr>,
+    ) -> Result<Self, LseError> {
+        let symbol = symbol.into();
+        let instrument = market::instrument_index_for(instruments, exchange, &symbol)?;
+
+        Ok(Self {
+            symbol,
+            instrument,
+            exchange,
+        })
     }
 }
 
@@ -99,7 +143,7 @@ impl LseCandleSource {
 /// # Errors
 /// A failed fetch on any source is forwarded immediately, ahead of buffered events from the others:
 /// once one instrument's series is incomplete, the merged replay is no longer the dataset that was
-/// asked for. [`LseError`](super::error::LseError) is flattened into
+/// asked for. [`LseError`] is flattened into
 /// [`DataError::Lse`] — handle `LseError` at the [`fetch_candles`](LseVaultClient::fetch_candles)
 /// level if you need to match on the cause.
 ///
@@ -153,7 +197,7 @@ fn owned_candles(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test code: panicking on a bad fixture is acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panicking on a bad fixture is acceptable
 mod tests {
     use super::*;
     use crate::event::MarketEvent;
@@ -310,6 +354,64 @@ mod tests {
         .collect::<Vec<_>>()
         .await;
 
-        assert!(matches!(events.first(), Some(Err(DataError::Lse(_)))));
+        assert!(matches!(events.first(), Some(Err(DataError::Lse { .. }))));
+    }
+
+    /// The candle path's half of the GBX protection.
+    ///
+    /// `new` takes both keys on trust, so before `resolve` existed nothing on this path could see a
+    /// London listing registered in pounds — the export path's check was unreachable from here, it
+    /// being behind `lse-parquet`. These assert the checked constructor closes that.
+    #[test]
+    fn resolve_derives_the_index_and_rejects_a_london_listing_registered_in_pounds() {
+        use rustrade_instrument::Underlying;
+        use rustrade_instrument::index::builder::IndexedInstrumentsBuilder;
+        use rustrade_instrument::instrument::name::{
+            InstrumentNameExchange, InstrumentNameInternal,
+        };
+        use rustrade_instrument::instrument::quote::InstrumentQuoteAsset;
+        use rustrade_instrument::instrument::{Instrument, kind::InstrumentKind};
+        use rustrade_instrument::test_utils::asset;
+
+        let register = |symbol: &str, quote: &str| {
+            let name = InstrumentNameExchange::from(symbol);
+            IndexedInstrumentsBuilder::default()
+                .add_instrument(Instrument::new(
+                    ExchangeId::LseEquities,
+                    InstrumentNameInternal::new_from_exchange(
+                        ExchangeId::LseEquities,
+                        name.clone(),
+                    ),
+                    name,
+                    Underlying::new(asset(&symbol.to_lowercase()), asset(quote)),
+                    InstrumentQuoteAsset::UnderlyingQuote,
+                    InstrumentKind::Spot,
+                    None,
+                ))
+                .build()
+        };
+
+        // `BP.L` prints ~548 where BP trades around £5.48, and the provider sends no unit -- so the
+        // registered asset IS the unit, and booking that as GBP inflates every notional, fee, PnL
+        // and balance by 100x with nothing downstream able to tell.
+        let instruments = register("BP.L", "gbp");
+        let error = LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP.L")
+            .expect_err("a pence-quoted listing registered in pounds must not build a source");
+        assert!(matches!(error, LseError::QuoteAssetMismatch { .. }));
+
+        // The correct registration builds, and carries the index the registry issued rather than
+        // one the caller supplied.
+        let instruments = register("BP.L", "gbx");
+        let source =
+            LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP.L").unwrap();
+        assert_eq!(source.instrument, InstrumentIndex::new(0));
+        assert_eq!(source.symbol, "BP.L");
+        assert_eq!(source.exchange, ExchangeId::LseEquities);
+
+        // The typo that would otherwise leave one instrument silently receiving nothing.
+        let error = LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP")
+            .expect_err("an unregistered symbol must not build a source");
+        assert!(matches!(error, LseError::UnknownInstrument { .. }));
+        assert!(error.to_string().contains("BP.L"));
     }
 }

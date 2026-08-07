@@ -144,6 +144,77 @@ pub enum LseError {
         end: DateTime<Utc>,
     },
 
+    /// A candle page stepped **backwards** in open time.
+    ///
+    /// Ascending order is how the vault answers today, not something it guarantees, and the
+    /// pagination cursor depends on it being at least non-descending *across* pages: the cursor
+    /// advances past the newest open a page carried, so a page served newest-first advances it to
+    /// the end of the range immediately. The next page is then empty, which is the documented
+    /// end-of-data signal, and `collect_candles` returns `Ok` with the last page of a multi-million
+    /// bar range and no indication that the rest was skipped.
+    ///
+    /// Terminal rather than repaired by sorting: a page arriving in an order the cursor arithmetic
+    /// was not built for means the vault changed behaviour, and every later assumption in this
+    /// module — the trim bounds, the cursor step, the end-of-data signal — was derived from the old
+    /// one. The same property is a typed rejection on the Parquet path
+    /// ([`NonMonotonicTimestamps`](Self::NonMonotonicTimestamps)).
+    #[error(
+        "page {page} for {symbol:?} stepped backwards in open time: {open} follows {previous_open}"
+    )]
+    NonMonotonicCandlePage {
+        symbol: String,
+        page: usize,
+        previous_open: DateTime<Utc>,
+        open: DateTime<Utc>,
+    },
+
+    /// Two consecutive candles are spaced closer together than the interval they were asked for.
+    ///
+    /// Impossible for a compliant fixed-interval series: consecutive bars are exactly one interval
+    /// apart, and a gap (a weekend, a holiday, a quiet symbol) only ever makes the spacing *wider*.
+    /// Spacing narrower than the interval means the candles are at a **finer resolution than the one
+    /// requested**, so every `close_time` derived for them overlaps the bars that follow.
+    ///
+    /// # The failure this exists to catch, on the vault path
+    /// The vault answers `200` to a misspelled resolution parameter and silently defaults to
+    /// 1-minute bars, in a byte-identical response shape (see the `vault` module docs). A `Day1`
+    /// request would then receive 1,440 one-minute rows per day, each stamped with a `close_time` of
+    /// `open + 24h` by the `historical` module's boundary arithmetic — overlapping, wrong, and
+    /// invisible to every other check there, because the range bounds are still satisfied and the
+    /// series still ascends. Spacing is the one property that distinguishes it.
+    ///
+    /// # And on the export path
+    /// `parquet::read_export` derives `close_time` from a **caller-supplied** interval, since
+    /// nothing in a Parquet artifact records the resolution it was written at. The wrong resolution
+    /// therefore reaches the same arithmetic from a different origin — the caller's declaration
+    /// rather than the provider's answer — and produces the same overlapping bars, so the same
+    /// check guards it: a file of 1-minute bars decoded as `Day1` is rejected rather than yielding
+    /// 390 "daily" bars per trading day. Reported in terms of the artifact's `ts` column, which
+    /// carries the bar's open — the close is a value that decoder derived, and only the open is
+    /// something a caller can find in the file itself.
+    ///
+    /// # Limits
+    /// Only the **finer-than-asked-for** direction is detectable. Coarser is not: daily bars taken
+    /// for `Min1` are spaced 24 hours apart, which is wider than 60 seconds and indistinguishable
+    /// from a genuine gap. A single candle is not checked at all, having no pair to measure.
+    ///
+    /// Only [`IntervalStep::Fixed`](crate::subscription::candle::IntervalStep::Fixed) resolutions
+    /// are checked. A calendar step (`month`, `quarter`, `year`) has no single width to compare
+    /// against, and February would false-positive against a 31-day one.
+    #[error(
+        "candles for {symbol:?} are spaced {actual} apart but {interval} was asked for ({open} \
+         follows {previous_open}): they appear to be at a finer resolution than that"
+    )]
+    UnexpectedCandleResolution {
+        symbol: String,
+        interval: CandleInterval,
+        previous_open: DateTime<Utc>,
+        open: DateTime<Utc>,
+        // `chrono::TimeDelta`, not the `std::time::Duration` imported above: the spacing is a
+        // difference between two instants and the type that produces it is chrono's.
+        actual: chrono::TimeDelta,
+    },
+
     /// The shared allowance is exhausted.
     ///
     /// Carries the allowance state at the point of rejection so the caller can decide how to pace.
@@ -303,11 +374,23 @@ pub enum LseError {
     #[error("export symbol mismatch: descriptor says {expected:?} but a row carries {found:?}")]
     SymbolMismatch { expected: String, found: String },
 
-    /// An artifact's timestamps go backwards.
+    /// An artifact's timestamps do not advance as its layout requires.
     ///
     /// A backtest fed an unsorted stream produces a non-monotonic clock and wrong results in
-    /// release, with no failure point, so this is rejected at decode. Note ties are **permitted** —
-    /// the tape is non-decreasing rather than strictly ascending.
+    /// release, with no failure point, so this is rejected at decode.
+    ///
+    /// # What counts as a violation depends on the layout
+    /// - **Tick and quote** tapes are *non-decreasing*: several prints routinely share a
+    ///   microsecond, so ties are permitted and only a step backwards is rejected.
+    /// - **Candle** artifacts at a fixed resolution are *strictly ascending*: two bars of one
+    ///   series cannot share an open, so they cannot share the close derived from it. A tie there
+    ///   means the file holds more than one series, or repeats a row. It does **not** mean the
+    ///   declared resolution is wrong — a fixed interval is a constant shift from open to close, so
+    ///   it cancels out of this comparison entirely and a mis-declared one produces distinct,
+    ///   strictly ascending closes. That is a separate check on bar *spacing*, which reports
+    ///   [`UnexpectedCandleResolution`](Self::UnexpectedCandleResolution). Calendar intervals are
+    ///   exempt from strictness: month arithmetic clamps day-of-month, so two distinct opens can
+    ///   legitimately share a close.
     #[error("export timestamps are not ascending: {found} follows {previous}")]
     NonMonotonicTimestamps {
         previous: DateTime<Utc>,
@@ -343,10 +426,160 @@ pub enum LseError {
         registered: String,
     },
 
+    /// The registered instrument prices this symbol in a different asset than the provider quotes
+    /// it in.
+    ///
+    /// The provider publishes no unit alongside a price, so the asset the caller registered *is*
+    /// the unit. Registering a `.L` listing against `gbp` rather than `gbx` is therefore not a
+    /// naming preference: `BP.L` prints ~548 where BP trades around £5.48, so every notional, fee,
+    /// unrealised PnL and balance derived from it is 100× wrong, and nothing downstream can tell.
+    ///
+    /// Raised at the same boundary as [`UnknownInstrument`](Self::UnknownInstrument), and for the
+    /// same reason: it is the one place the provider's view of a symbol and the caller's registry
+    /// meet, so it is the only place the disagreement is visible.
+    ///
+    /// Compared on [`AssetNameInternal`], because that is the identity the engine keys assets by —
+    /// `GBX` and `gbx` are one asset, and `GBP` is a different one.
+    ///
+    /// # `expected` is derived, not published
+    /// It comes from [`quote_asset`](super::market::quote_asset), which maps a venue suffix to an
+    /// asset and **defaults to USD** for any suffix outside its table. So a correctly-registered
+    /// listing on a venue that table does not cover is rejected here, with an `expected` the
+    /// provider never stated. The message says "this integration derives" rather than "the provider
+    /// quotes" for that reason. A caller in that position wants
+    /// [`LseCandleSource::new`](super::backtest::LseCandleSource::new), which carries no check.
+    ///
+    /// [`AssetNameInternal`]: rustrade_instrument::asset::name::AssetNameInternal
+    #[error(
+        "instrument {symbol:?} on {exchange} is registered with quote asset {registered:?}, but \
+         this integration derives {expected:?} for that symbol from its venue suffix (defaulting \
+         to USD); prices carry no unit, so a mismatch misprices every notional, fee and balance"
+    )]
+    QuoteAssetMismatch {
+        symbol: String,
+        exchange: rustrade_instrument::exchange::ExchangeId,
+        expected: String,
+        registered: String,
+    },
+
     /// The Parquet artifact could not be read.
     #[cfg(feature = "lse-parquet")]
     #[error("parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
+}
+
+/// A coarse classification of [`LseError`], for deciding what to do next.
+///
+/// [`LseError`] is `#[non_exhaustive]` and has a variant per measured provider behaviour, which is
+/// the right shape for diagnosing one failure and the wrong shape for *reacting* to one: a consumer
+/// writing retry logic wants five or six categories, not thirty, and should not have to revisit its
+/// match every time an endpoint gains a variant. This is that projection, and it is what
+/// [`DataError::Lse`](crate::error::DataError::Lse) carries so the classification survives being
+/// flattened into a `String`.
+///
+/// Mirrors `DatabentoErrorKind` — not linked, since that lives behind the `databento` feature and
+/// this type does not — plus the categories this integration's file and export surface adds.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum LseErrorKind {
+    /// API key missing, malformed, or rejected. Retrying changes nothing until it is fixed.
+    Authentication,
+    /// Throttled, or a metered allowance is spent. Resumable once it replenishes — see
+    /// [`LseError::RateLimited`]'s `retry_after` and [`LseError::QuotaExceeded`]'s status.
+    RateLimit,
+    /// Transport-level failure. Resumable; a retry may well succeed.
+    Network,
+    /// An export job did not reach a terminal state within the caller's timeout. Resumable: the
+    /// job keeps building and its identifier stays valid, so polling again spends no allowance.
+    Timeout,
+    /// The provider rejected the request or the job failed. Not resumable by retrying alone.
+    Api,
+    /// The bytes could not be read as what they claim to be — a malformed body, an unsupported or
+    /// mistyped Parquet schema, a value with no representation, an ordering violation, an
+    /// integrity mismatch. Terminal: the data is what it is.
+    Decode,
+    /// The caller's request or instrument registry is wrong. Terminal until the caller changes it.
+    InvalidInput,
+    /// A local filesystem failure.
+    Io,
+}
+
+impl LseErrorKind {
+    /// Whether retrying the same operation could succeed without the caller changing anything.
+    ///
+    /// [`RateLimit`](Self::RateLimit) and [`Timeout`](Self::Timeout) require *waiting* first; this
+    /// says the attempt is worth making again, not that it is worth making immediately.
+    #[must_use]
+    pub fn is_resumable(&self) -> bool {
+        matches!(self, Self::RateLimit | Self::Network | Self::Timeout)
+    }
+}
+
+impl std::fmt::Display for LseErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Authentication => "authentication",
+            Self::RateLimit => "rate limit",
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::Api => "API",
+            Self::Decode => "decode",
+            Self::InvalidInput => "invalid input",
+            Self::Io => "IO",
+        };
+        f.write_str(name)
+    }
+}
+
+impl LseError {
+    /// Classify this error for a consumer deciding whether to retry, wait, or stop.
+    ///
+    /// Exhaustive on purpose: a new variant must produce a compile error here rather than fall
+    /// through to a default. Getting this wrong is not a visible failure — it silently retries
+    /// something terminal, or abandons something that would have succeeded.
+    #[must_use]
+    pub fn kind(&self) -> LseErrorKind {
+        match self {
+            Self::EnvVar(_) | Self::InvalidCredential(_) => LseErrorKind::Authentication,
+            Self::RateLimited { .. } | Self::QuotaExceeded { .. } => LseErrorKind::RateLimit,
+            Self::Http(_) => LseErrorKind::Network,
+            Self::ExportTimeout { .. } => LseErrorKind::Timeout,
+            Self::Api { .. } | Self::ExportFailed { .. } => LseErrorKind::Api,
+            Self::Io { .. } => LseErrorKind::Io,
+
+            // The caller's request or registry, not the provider's answer.
+            Self::InvalidInput { .. }
+            | Self::UnsupportedInterval { .. }
+            | Self::UnknownDataset(_)
+            | Self::AmbiguousSlug { .. }
+            | Self::UnknownInstrument { .. }
+            | Self::QuoteAssetMismatch { .. } => LseErrorKind::InvalidInput,
+
+            // Everything the provider sent that could not be read as what it claims to be. An
+            // integrity or job mismatch belongs here rather than under `Api`: the request was
+            // accepted and answered, and it is the payload that does not hold up.
+            Self::Deserialize { .. }
+            | Self::TimestampOverflow { .. }
+            | Self::CursorOverflow { .. }
+            | Self::UnexpectedCandleRange { .. }
+            | Self::NonMonotonicCandlePage { .. }
+            | Self::UnexpectedCandleResolution { .. }
+            | Self::IntegrityMismatch { .. }
+            | Self::ExportJobMismatch { .. }
+            | Self::UnsupportedSchema { .. }
+            | Self::UnsupportedColumnType { .. }
+            | Self::NullValue { .. }
+            | Self::SymbolMismatch { .. }
+            | Self::NonMonotonicTimestamps { .. }
+            | Self::TimestampNotRepresentable { .. }
+            | Self::PriceNotRepresentable { .. } => LseErrorKind::Decode,
+
+            #[cfg(feature = "lse-parquet")]
+            Self::Parquet(_) => LseErrorKind::Decode,
+        }
+    }
 }
 
 /// Maximum retained length of a provider diagnostic, in bytes.
@@ -483,5 +716,154 @@ mod tests {
     #[test]
     fn an_empty_body_yields_an_empty_diagnostic() {
         assert_eq!(extract_detail(""), "");
+    }
+
+    /// The classification a consumer actually branches on.
+    ///
+    /// `kind()` is exhaustive, so a *new* variant is a compile error — but nothing in the compiler
+    /// checks that an existing variant is classified *correctly*, and getting that wrong is
+    /// invisible: it silently retries something terminal, or abandons something that would have
+    /// succeeded on the next attempt. These pin the pairs where that costs something.
+    #[test]
+    fn the_resumable_kinds_are_the_ones_a_retry_could_actually_fix() {
+        // The whole point of carrying `kind` through `DataError::Lse`: a consumer must be able to
+        // tell "wait and try again" from "stop" without substring-matching a `Display`.
+        assert!(LseErrorKind::RateLimit.is_resumable());
+        assert!(LseErrorKind::Network.is_resumable());
+        assert!(LseErrorKind::Timeout.is_resumable());
+
+        assert!(!LseErrorKind::Authentication.is_resumable());
+        assert!(!LseErrorKind::Api.is_resumable());
+        assert!(!LseErrorKind::Decode.is_resumable());
+        assert!(!LseErrorKind::InvalidInput.is_resumable());
+        assert!(!LseErrorKind::Io.is_resumable());
+    }
+
+    #[test]
+    fn a_rate_limit_classifies_as_resumable_and_a_decode_failure_does_not() {
+        // The pair the whole projection exists for, checked end to end from the variant rather
+        // than from the kind: `RateLimited` is documented resumable, `Deserialize` is terminal,
+        // and a consumer that confused them would either spin forever on a malformed body or
+        // abandon a fetch that a 60-second wait would have completed.
+        let rate_limited = LseError::RateLimited {
+            retry_after: Some(Duration::from_secs(60)),
+        };
+        assert_eq!(rate_limited.kind(), LseErrorKind::RateLimit);
+        assert!(rate_limited.kind().is_resumable());
+
+        let decode = LseError::Deserialize {
+            message: "unexpected end of input".to_owned(),
+        };
+        assert_eq!(decode.kind(), LseErrorKind::Decode);
+        assert!(!decode.kind().is_resumable());
+    }
+
+    #[test]
+    fn an_exhausted_allowance_is_a_rate_limit_and_an_export_timeout_is_a_timeout() {
+        // Both are export-path variants that a naive reading would file under `Api` -- they arrive
+        // as a 429 and as a job that never finished. Classifying either as terminal would stop a
+        // consumer that only had to wait.
+        assert_eq!(
+            LseError::QuotaExceeded { status: None }.kind(),
+            LseErrorKind::RateLimit
+        );
+        assert_eq!(
+            LseError::ExportTimeout {
+                job_id: "job-1".to_owned(),
+                status: "running".to_owned(),
+            }
+            .kind(),
+            LseErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn a_payload_that_was_accepted_but_does_not_hold_up_is_a_decode_failure_not_an_api_error() {
+        // The boundary that is easiest to get wrong: the request succeeded and the provider
+        // answered, so `status` is a success code -- but the bytes are not what they claim to be.
+        // Filing these under `Api` would tell a consumer to fix its request, which cannot help.
+        let decode_variants = [
+            LseError::IntegrityMismatch {
+                path: std::path::PathBuf::from("/tmp/export.parquet.part"),
+                expected: "abc".to_owned(),
+                actual: "def".to_owned(),
+                discarded: true,
+            },
+            LseError::ExportJobMismatch {
+                job_id: "job-1".to_owned(),
+                field: "symbol".to_owned(),
+                requested: "BP.L".to_owned(),
+                reported: "BP".to_owned(),
+            },
+            LseError::NonMonotonicTimestamps {
+                previous: DateTime::UNIX_EPOCH,
+                found: DateTime::UNIX_EPOCH,
+            },
+            LseError::SymbolMismatch {
+                expected: "BP.L".to_owned(),
+                found: "BP".to_owned(),
+            },
+        ];
+
+        for error in decode_variants {
+            assert_eq!(error.kind(), LseErrorKind::Decode, "{error}");
+        }
+
+        // The contrast: an error the provider itself reported about the request.
+        assert_eq!(
+            LseError::Api {
+                status: 404,
+                message: "no candle data".to_owned(),
+            }
+            .kind(),
+            LseErrorKind::Api
+        );
+    }
+
+    #[test]
+    fn a_caller_side_mistake_is_invalid_input_rather_than_an_api_error() {
+        // These are all detected before or independently of the request, so reporting them as the
+        // provider's fault would send the caller looking in the wrong place.
+        let caller_variants = [
+            LseError::UnknownDataset("nope".to_owned()),
+            LseError::UnsupportedInterval {
+                interval: CandleInterval::Sec1,
+            },
+            LseError::QuoteAssetMismatch {
+                symbol: "BP.L".to_owned(),
+                exchange: rustrade_instrument::exchange::ExchangeId::Other,
+                expected: "gbx".to_owned(),
+                registered: "gbp".to_owned(),
+            },
+        ];
+
+        for error in caller_variants {
+            assert_eq!(error.kind(), LseErrorKind::InvalidInput, "{error}");
+        }
+
+        // A credential problem is its own category: also terminal, but the fix is a key rather
+        // than a request.
+        assert_eq!(
+            LseError::EnvVar("LSE_API_KEY is not set".to_owned()).kind(),
+            LseErrorKind::Authentication
+        );
+    }
+
+    #[test]
+    fn the_kind_survives_flattening_into_the_crate_error() {
+        // The reason `DataError::Lse` is a struct variant at all. Once an LSE failure is flattened
+        // for the generic stream helpers, `message` is a `String` and the classification would be
+        // unrecoverable from it -- so `kind` has to be carried alongside, not derived later.
+        let error = crate::error::DataError::from(LseError::RateLimited { retry_after: None });
+
+        let crate::error::DataError::Lse { kind, message } = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+
+        assert_eq!(*kind, LseErrorKind::RateLimit);
+        assert!(kind.is_resumable());
+        // The message is still the full diagnostic; `kind` is an addition to it, not a
+        // replacement.
+        assert!(message.contains("rate limited"), "{message}");
     }
 }

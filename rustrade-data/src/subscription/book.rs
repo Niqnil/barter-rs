@@ -34,22 +34,37 @@ impl std::fmt::Display for OrderBooksL1 {
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize, Constructor,
 )]
 pub struct OrderBookL1 {
-    /// The venue's own instant for this book state.
+    /// The instant this book state describes — the venue's own, where the venue publishes one.
     ///
     /// # Producer obligation
     ///
     /// A producer **must** set this to the same instant it puts in the wrapping
-    /// [`MarketEvent::time_exchange`](crate::event::MarketEvent::time_exchange), and it must come
-    /// from the venue rather than from a local or aggregator clock.
+    /// [`MarketEvent::time_exchange`](crate::event::MarketEvent::time_exchange), and it **should**
+    /// come from the venue rather than from a local or aggregator clock.
     ///
     /// Downstream state orders L1 updates on this field, not on the event's, so the two must not
-    /// disagree. Stamping it from a different clock has two silent effects, neither of which
-    /// produces an error or a log: a staleness guard keyed on this field can reject legitimately
-    /// newer updates and freeze the held book, and a consumer ranking price sources by recency —
-    /// `DefaultInstrumentMarketData::price` in the `rustrade` crate is one — will rank this book
-    /// wrongly against trades and candles, moving `pnl_unrealised`.
+    /// disagree. A producer that lets them diverge gets no error and no log: a staleness guard keyed
+    /// on this field can reject legitimately newer updates and freeze the held book.
     ///
-    /// Every in-tree producer satisfies this.
+    /// # Not every in-tree producer has a venue instant to use
+    ///
+    /// The "should" above is not a "must", because some venues publish no book timestamp:
+    ///
+    /// - **Binance Spot** `bookTicker` carries `{u, s, b, B, a, A}` and no time field, so
+    ///   [`BinanceOrderBookL1`](crate::exchange::binance::book::l1::BinanceOrderBookL1) falls back
+    ///   to the host clock at deserialisation. (Binance USD-M futures *does* send `T`, and that path
+    ///   uses it.)
+    /// - **IBKR** quotes are assembled from separate bid/ask/size ticks, which carry no per-tick
+    ///   venue instant, so `exchange::ibkr` (behind the `ibkr` feature, hence no link) stamps the
+    ///   assembly time.
+    ///
+    /// Both fill the field from a local clock, and both keep it consistent with `time_exchange` as
+    /// required above. Consumers must therefore **not** rank this field against a *tick* timestamp
+    /// from another source — a trade's `time_exchange`, say — since the gap between them is
+    /// milliseconds and the comparison would be decided by skew rather than by the market. Ranking
+    /// it against a coarser instant, such as a candle's `close_time`, is sound while the gap stays
+    /// well above the skew. `DefaultInstrumentMarketData::price` in the `rustrade` crate does
+    /// exactly that, and documents where the margin runs out.
     pub last_update_time: DateTime<Utc>,
     pub best_bid: Option<Level>,
     pub best_ask: Option<Level>,

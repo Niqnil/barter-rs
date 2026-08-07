@@ -117,8 +117,15 @@ impl<AssetKey> InstrumentKind<AssetKey> {
     /// This matches exhaustively on `self`, with the wildcard confined to each arm's inner
     /// comparison, **deliberately**: a new variant must produce a compile error here rather than
     /// fall through to `false`. This function is the binding key between an `Instrument` and its
-    /// market-data subscription, so a missing arm is not a visible failure — it silently drops the
-    /// subscription, leaving an instrument that is configured, indexed and permanently dataless.
+    /// market-data subscription, so an arm that answered `false` where it should answer `true`
+    /// would leave the subscription unmatchable against any registered instrument.
+    ///
+    /// That failure is currently *loud* — the sole caller (`rustrade-data`'s indexed dynamic
+    /// stream builder) turns an unmatched subscription into `IndexError::InstrumentIndex`, which
+    /// propagates as a `DataError` rather than dropping the subscription silently. The exhaustive
+    /// match is kept regardless: the caller's loudness is that caller's property, not this
+    /// function's, and a future caller that resolves subscriptions by filtering would have no way
+    /// to tell "no such instrument" from "this predicate forgot a variant".
     pub fn eq_market_data_instrument_kind(&self, other: &MarketDataInstrumentKind) -> bool {
         match self {
             Self::Spot => matches!(other, MarketDataInstrumentKind::Spot),

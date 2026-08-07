@@ -42,6 +42,19 @@ use std::{
 /// undetectable downstream. So the merge advances at the pace of its slowest input. Inputs still
 /// make progress concurrently; it is only the emission that waits.
 ///
+/// # ⚠️ Inputs must be able to progress independently
+/// The corollary of the pace rule is that **an input which cannot make progress stalls the whole
+/// merge, permanently and silently**. The inputs are also collected eagerly here, so every one of
+/// them starts as soon as this function is called rather than when it is first polled.
+///
+/// The reachable case is
+/// [`stream_blocking_iter`](super::blocking::stream_blocking_iter), which takes a blocking-pool
+/// thread per input at construction and holds it for the whole decode. Tokio's pool defaults to
+/// `max_blocking_threads: 512`, so beyond 512 inputs the surplus decoders never get a thread, stay
+/// `Pending`, and hold the merge `Pending` — which stops the running decodes being drained, so none
+/// of them releases a thread either. Nothing errors and nothing logs. See that function's
+/// `# ⚠️ One blocking thread per call` section for the ways out.
+///
 /// # Errors
 /// The item type is a `Result` so that fallible sources (file decoders, paginated fetches) compose
 /// without collecting. An `Err` on any input is forwarded immediately, ahead of buffered events:
@@ -392,6 +405,22 @@ mod tests {
         assert_eq!(
             merged.first().unwrap().clone().err(),
             Some(TestError("boom"))
+        );
+
+        // The whole sequence, not just its head. Asserting only `first()` leaves the *other* half
+        // of this contract unpinned: forwarding the error must not also discard the events behind
+        // it. An implementation that reported the error and then ended -- the silent-truncation
+        // failure this module exists to prevent -- would satisfy the assertion above.
+        assert_eq!(
+            observed(&merged),
+            vec![(0, 10), (1, 20)],
+            "the error is forwarded ahead of the buffered events, not instead of them"
+        );
+        assert_eq!(merged.len(), 3, "exactly one error and both events");
+        assert_eq!(
+            merged.iter().filter(|event| event.is_err()).count(),
+            1,
+            "the error must be reported once, not re-yielded"
         );
     }
 

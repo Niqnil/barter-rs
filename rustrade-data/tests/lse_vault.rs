@@ -537,22 +537,70 @@ async fn a_malformed_timestamp_surfaces_rather_than_being_skipped() {
     assert!(matches!(error, LseError::Deserialize { .. }));
 }
 
+/// A descending page is rejected as a whole, **before** any of its bars is yielded.
+///
+/// This supersedes an earlier contract on the same input, which yielded the in-range bar and only
+/// then reported the range violation. That tolerance was written for a page whose rows arrive in an
+/// order the module does not require — but such a page also breaks the cursor arithmetic, which
+/// advances past the newest open a page carried, so tolerating it means a newest-first *and*
+/// row-capped page silently truncates a multi-million bar fetch to its final page. Order is a
+/// property of the response as a whole: a page that violates it is not partially usable, so nothing
+/// from it is emitted.
+///
+/// Driven as a stream rather than through `collect_candles`, which discards everything it collected
+/// the moment an item is `Err` — "nothing was yielded first" is invisible through it.
 #[tokio::test]
-async fn an_out_of_order_page_yields_the_in_range_bar_before_failing() {
+async fn a_descending_page_fails_without_yielding_any_of_its_bars() {
     let server = MockServer::start().await;
 
-    // Ascending rows are what the vault serves, not what it promises. A bar past the upper bound
-    // listed BEFORE an in-range one must not end the page early: the page is scanned to the end, so
-    // the in-range bar is yielded first and only then does the range violation terminate the stream.
-    //
-    // Driven as a stream rather than through `collect_candles`, which discards everything it
-    // collected the moment an item is `Err` — the ordering this guards is invisible through it.
     mount_page(
         &server,
         "2024-01-03 00:00:00",
         &[
             equity_row("2024-01-04 00:00:00.000000", "13.0"), // closes 01-05, past `end`
             equity_row("2024-01-03 00:00:00.000000", "12.0"), // closes 01-04, in range
+        ],
+    )
+    .await;
+
+    let client = client(&server);
+    let stream = client.fetch_candles(
+        "AAPL",
+        CandleInterval::Day1,
+        utc("2024-01-04T00:00:00Z"),
+        utc("2024-01-04T00:00:00Z"),
+    );
+    futures::pin_mut!(stream);
+
+    let error = stream
+        .next()
+        .await
+        .expect("the ordering violation must terminate the stream")
+        .unwrap_err();
+    assert!(
+        matches!(error, LseError::NonMonotonicCandlePage { .. }),
+        "expected the ordering violation, got {error:?}"
+    );
+
+    assert!(
+        stream.next().await.is_none(),
+        "the stream must end at the ordering violation"
+    );
+}
+
+/// The per-row range trim keeps its own behaviour on a **well-formed** page: the bar past the upper
+/// bound is not emitted, every in-range bar before it is, and the violation is terminal. This is the
+/// half of the old out-of-order test that still describes a page the vault can legitimately serve.
+#[tokio::test]
+async fn an_ascending_page_yields_its_in_range_bars_before_the_range_violation() {
+    let server = MockServer::start().await;
+
+    mount_page(
+        &server,
+        "2024-01-03 00:00:00",
+        &[
+            equity_row("2024-01-03 00:00:00.000000", "12.0"), // closes 01-04, in range
+            equity_row("2024-01-04 00:00:00.000000", "13.0"), // closes 01-05, past `end`
         ],
     )
     .await;
@@ -640,4 +688,219 @@ async fn a_full_page_at_the_row_cap_seams_onto_the_next_without_gap_or_duplicate
             "bar {index} breaks the one-minute sequence across the cap boundary"
         );
     }
+}
+
+// -----------------------------------------------------------------------------------------------
+// Credential containment
+// -----------------------------------------------------------------------------------------------
+
+/// The client attaches `x-api-key` as a client-wide default header, and reqwest's cross-host
+/// stripping covers `Authorization`, `Cookie`, `Cookie2`, `Proxy-Authorization` and
+/// `WWW-Authenticate` — a custom header is **not** on that list. Under reqwest's default `Policy::limited(10)` a single
+/// vault-issued 302 would therefore re-issue the request, live key attached, against whatever host
+/// the vault named. `Policy::none()` makes the "only ever requests URLs it builds itself" invariant
+/// structural: the 3xx is surfaced unfollowed, and — the load-bearing assertion — the redirect
+/// target receives no request at all, so the key cannot leak even if reqwest's stripping changes.
+#[tokio::test]
+async fn a_candle_fetch_does_not_follow_a_redirect_off_host() {
+    // Catch-all: it would answer, and receive the key, if the client ever followed the redirect.
+    let attacker = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&attacker)
+        .await;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/candles"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("{}/vault/candles", attacker.uri()).as_str(),
+        ))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-03T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, LseError::Api { status, .. } if (300..400).contains(&status)),
+        "expected an unfollowed 3xx as LseError::Api, got {error:?}"
+    );
+    assert!(
+        attacker.received_requests().await.unwrap().is_empty(),
+        "the client must not follow a redirect off-host: the x-api-key would ride along"
+    );
+}
+
+// -----------------------------------------------------------------------------------------------
+// Range and ordering contracts the vault supplies but does not guarantee
+// -----------------------------------------------------------------------------------------------
+
+/// The vault's `end` is **exclusive on open time**, so the client extends it one second past the
+/// final bar's open to readmit that bar. Nothing else in this suite matched on `end`, which meant
+/// deleting that compensation left every pagination test green while every live fetch silently
+/// returned one bar fewer at every resolution — and the shape canary could not see it either, since
+/// a missing *trailing* bar changes neither spacing nor ordering.
+///
+/// This mock matches on `end` explicitly, so the compensation is now pinned by a failing test
+/// rather than by the comment next to it.
+#[tokio::test]
+async fn the_exclusive_upper_bound_is_extended_past_the_final_bars_open() {
+    let server = MockServer::start().await;
+
+    // Requesting bars closing in [01-02, 01-04] means opens in [01-01, 01-03]. `end` is exclusive
+    // on open, so it must be sent as 01-03 00:00:01 — one second past the last bar's open — or the
+    // vault drops the bar that closes exactly on the requested end.
+    Mock::given(method("GET"))
+        .and(path("/vault/candles"))
+        .and(query_param("start", "2024-01-01 00:00:00"))
+        .and(query_param("end", "2024-01-03 00:00:01"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "[{}]",
+            [
+                equity_row("2024-01-01 00:00:00.000000", "10.0"),
+                equity_row("2024-01-02 00:00:00.000000", "11.0"),
+                equity_row("2024-01-03 00:00:00.000000", "12.0"),
+            ]
+            .join(",")
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The cursor lands on the exclusive bound after page one, so the fetch stops without a second
+    // request. Any request that does not carry the expected `end` matches nothing and 404s.
+
+    let candles = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-04T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        candles.len(),
+        3,
+        "the bar closing on `end` must be included"
+    );
+    assert_eq!(candles[2].close_time, utc("2024-01-04T00:00:00Z"));
+}
+
+/// Ascending order is how the vault answers today, not something it promises, and the cursor
+/// arithmetic depends on it: the cursor advances past the newest open a page carried, so a page
+/// served newest-first would jump it to the end of the range, make page two empty — the documented
+/// end-of-data signal — and return `Ok` holding the tail of the series with nothing to say the rest
+/// was skipped. A typed error is the only outcome that a caller can act on.
+#[tokio::test]
+async fn a_page_that_steps_backwards_in_open_time_is_a_terminal_error() {
+    let server = MockServer::start().await;
+    mount_page(
+        &server,
+        "2024-01-01 00:00:00",
+        &[
+            equity_row("2024-01-03 00:00:00.000000", "12.0"),
+            equity_row("2024-01-02 00:00:00.000000", "11.0"),
+            equity_row("2024-01-01 00:00:00.000000", "10.0"),
+        ],
+    )
+    .await;
+
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-04T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, LseError::NonMonotonicCandlePage { .. }),
+        "expected NonMonotonicCandlePage, got {error:?}"
+    );
+}
+
+/// The failure the whole module is arranged around: the vault answers `200` to a misspelled
+/// resolution parameter and silently serves 1-minute bars in a byte-identical shape. Until now
+/// every mitigation was documentation plus an `#[ignore]`d weekly canary — a `Day1` request
+/// receiving minute bars passes the range check (the bars are in range), passes the order check
+/// (they ascend), and is stamped `close_time = open + 24h` by this module's own arithmetic.
+///
+/// Spacing is the one property that gives it away: consecutive bars of a compliant fixed-interval
+/// series are exactly one interval apart, and a gap only ever widens that.
+#[tokio::test]
+async fn candles_spaced_closer_than_the_requested_interval_are_rejected() {
+    let server = MockServer::start().await;
+    // A `Day1` request answered with one-minute bars.
+    mount_page(
+        &server,
+        "2024-01-01 00:00:00",
+        &[
+            equity_row("2024-01-01 00:00:00.000000", "10.0"),
+            equity_row("2024-01-01 00:01:00.000000", "10.1"),
+            equity_row("2024-01-01 00:02:00.000000", "10.2"),
+        ],
+    )
+    .await;
+
+    let error = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-02T00:00:00Z"),
+            utc("2024-01-04T00:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, LseError::UnexpectedCandleResolution { .. }),
+        "expected UnexpectedCandleResolution, got {error:?}"
+    );
+}
+
+/// The mirror of the case above, and the reason the check is `<` rather than `!=`: a **gap** is
+/// ordinary. Weekends, holidays and quiet symbols all produce spacing wider than the interval, and
+/// rejecting those would make the detector useless on every real equity series.
+#[tokio::test]
+async fn a_gap_wider_than_the_interval_is_accepted() {
+    let server = MockServer::start().await;
+    // Friday, then Monday: a three-day step in a daily series.
+    mount_page(
+        &server,
+        "2024-01-05 00:00:00",
+        &[
+            equity_row("2024-01-05 00:00:00.000000", "10.0"),
+            equity_row("2024-01-08 00:00:00.000000", "11.0"),
+        ],
+    )
+    .await;
+    mount_page(&server, "2024-01-08 00:00:01", &[]).await;
+
+    let candles = client(&server)
+        .collect_candles(
+            "AAPL",
+            CandleInterval::Day1,
+            utc("2024-01-06T00:00:00Z"),
+            utc("2024-01-10T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        candles.len(),
+        2,
+        "a weekend gap is not a resolution failure"
+    );
 }

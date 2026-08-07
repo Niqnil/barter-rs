@@ -54,12 +54,23 @@ use rustrade_data::event::DataKind;
 use rustrade_data::exchange::lse::export::{
     LseExportRange, LseExportRequest, LseExportStatus, LseExportTimeframe,
 };
-use rustrade_data::exchange::lse::market::LseDataset;
+use rustrade_data::exchange::lse::market::{self, LseDataset};
 use rustrade_data::exchange::lse::parquet::read_export;
 use rustrade_data::exchange::lse::vault::LseVaultClient;
-use rustrade_instrument::instrument::InstrumentIndex;
+use rustrade_instrument::Underlying;
+use rustrade_instrument::asset::Asset;
+use rustrade_instrument::index::IndexedInstruments;
+use rustrade_instrument::instrument::name::{InstrumentNameExchange, InstrumentNameInternal};
+use rustrade_instrument::instrument::quote::InstrumentQuoteAsset;
+use rustrade_instrument::instrument::{Instrument, kind::InstrumentKind};
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// The one symbol this example exports, registers and decodes.
+///
+/// Named once because all three must agree: `read_export` verifies the symbol on every row against
+/// the job it came from, and `instrument_index_for` resolves the same string against the registry.
+const SYMBOL: &str = "EUR/USD";
 
 #[tokio::main]
 async fn main() {
@@ -84,7 +95,7 @@ async fn main() {
     // Validated before anything is sent: a `400` would cost an export just as a success does. This
     // rejects unknown resolutions, candle resolutions on tick-only datasets, blank symbols, the
     // `"all"` literal, and inverted ranges.
-    let request = LseExportRequest::new(LseDataset::Fx, "EUR/USD", LseExportTimeframe::Tick, range)
+    let request = LseExportRequest::new(LseDataset::Fx, SYMBOL, LseExportTimeframe::Tick, range)
         .expect("a valid export request");
 
     let job = client
@@ -141,9 +152,34 @@ async fn main() {
         "artifact downloaded and verified"
     );
 
-    // In a real backtest, derive this from the registry the engine was built with, using
-    // `instrument_index_for` - that makes a fabricated or typo'd index unrepresentable.
-    let instrument = InstrumentIndex::new(0);
+    // Derived from the registry the engine was built with rather than written as a literal: that
+    // makes a fabricated or typo'd index unrepresentable, and `instrument_index_for` additionally
+    // rejects a quote-asset disagreement -- a `.L` listing registered in `gbp` rather than `gbx`
+    // books pence as pounds, and every notional, fee and PnL downstream is 100x wrong with nothing
+    // to object. This example registers the one instrument it decodes; a real system passes the
+    // same `IndexedInstruments` it built the engine with.
+    let exchange = LseDataset::Fx.exchange_id();
+    let name = InstrumentNameExchange::new(SYMBOL);
+
+    // `underlying` splits the display symbol and derives the quote -- the same derivation
+    // `instrument_index_for` checks the registration against, so these agree by construction. On a
+    // `.L` ticker it yields `gbx`, which is the whole point.
+    let underlying = market::underlying(SYMBOL);
+
+    let instruments = IndexedInstruments::new(vec![Instrument::new(
+        exchange,
+        InstrumentNameInternal::new_from_exchange(exchange, name.clone()),
+        name,
+        Underlying::new(
+            Asset::new_from_exchange(underlying.base),
+            Asset::new_from_exchange(underlying.quote),
+        ),
+        InstrumentQuoteAsset::UnderlyingQuote,
+        InstrumentKind::Spot,
+        None,
+    )]);
+    let instrument = market::instrument_index_for(&instruments, exchange, SYMBOL)
+        .expect("the symbol to be registered, priced in the asset derived for its venue suffix");
 
     // Decoding is blocking file I/O, so it runs on a blocking thread rather than on this async
     // one -- `read_export`'s own rustdoc warns against calling it directly from an async context,

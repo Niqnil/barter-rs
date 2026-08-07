@@ -31,7 +31,7 @@ use crate::exchange::lse::error::LseError;
 use crate::exchange::lse::market::candle_interval_str;
 use crate::exchange::lse::vault::LseVaultClient;
 use crate::subscription::candle::{
-    Candle, CandleInterval, close_time_from_open, open_time_from_close,
+    Candle, CandleInterval, IntervalStep, close_time_from_open, open_time_from_close,
 };
 use async_stream::try_stream;
 use chrono::{DateTime, Duration as TimeDelta, NaiveDateTime, Utc};
@@ -171,6 +171,11 @@ impl LseVaultClient {
     /// bar on that page is yielded first. Note the lower bound is **not** symmetric — it is widened
     /// deliberately, so bars closing before `start` are trimmed without comment.
     ///
+    /// A page whose opens step backwards ends the stream with
+    /// [`LseError::NonMonotonicCandlePage`], and one whose bars are spaced closer than `interval`
+    /// with [`LseError::UnexpectedCandleResolution`]. Both are checked before *any* bar of that
+    /// page is yielded — unlike the range violation above, nothing from such a page is emitted.
+    ///
     /// # Request count
     /// Because the row cap is applied silently, a short page cannot be distinguished from the end
     /// of the data. Pagination therefore continues until a page comes back **empty** or the cursor
@@ -219,6 +224,10 @@ impl LseVaultClient {
 
             let mut cursor = request_start;
             let mut page = 0usize;
+            // Carried ACROSS pages, not reset per page: a vault that served each page ascending but
+            // the pages themselves out of order, or that repeated a page's worth of bars after the
+            // cursor advanced, would satisfy a per-page check and still corrupt the series.
+            let mut previous_open: Option<DateTime<Utc>> = None;
 
             loop {
                 // No sleep here: pacing is applied inside `get_json`, against a gate shared by
@@ -247,8 +256,66 @@ impl LseVaultClient {
                 let mut max_open: Option<DateTime<Utc>> = None;
                 let mut reached_end = false;
 
-                for row in rows {
+                // Two STRUCTURAL properties of the page, checked in full before a single bar of it
+                // is yielded. Both are properties of the response as a whole rather than of any one
+                // row, and a page violating either is not partially usable: the first invalidates
+                // the cursor arithmetic, the second means every `close_time` this module computes
+                // for the page is wrong. That is the difference from the range trim below, which is
+                // a per-row property of a well-formed page and is therefore applied per row.
+                //
+                // The cost is one extra pass over a `Vec` already in memory. The instants this pass
+                // parses are kept and reused by the conversion loop below rather than reparsed:
+                // `open_time` is a format-string parse, not a comparison, so reparsing them would
+                // double the timestamp work on every page of every backfill.
+                let mut opens = Vec::with_capacity(rows.len());
+                for row in &rows {
                     let open = row.open_time()?;
+
+                    if let Some(previous) = previous_open {
+                        // ORDER. Ascending is how the vault answers today, not something it
+                        // guarantees, and the cursor advances past the newest open a page carried
+                        // -- so a page served newest-first AND truncated at the row cap would jump
+                        // the cursor to the end of the range, make the next page empty (the
+                        // documented end-of-data signal), and return `Ok` holding the tail of the
+                        // series with nothing to say the rest was skipped.
+                        if open < previous {
+                            Err(LseError::NonMonotonicCandlePage {
+                                symbol: symbol.to_owned(),
+                                page,
+                                previous_open: previous,
+                                open,
+                            })?;
+                        }
+
+                        // RESOLUTION. Consecutive bars of a compliant fixed-interval series are
+                        // exactly one interval apart, and a gap (a weekend, a holiday, a quiet
+                        // symbol) only ever makes that spacing WIDER -- so spacing narrower than
+                        // the interval means the response is finer-grained than the request. This
+                        // is the runtime detector for the vault's documented habit of answering
+                        // `200` to a misspelled resolution parameter with 1-minute bars in a
+                        // byte-identical shape (see the `vault` module docs). Nothing else here can
+                        // see that: the bars ascend, and they fall inside the requested range.
+                        //
+                        // Skipped for a calendar step -- `month` has no single width, and February
+                        // would false-positive against a 31-day one.
+                        if let IntervalStep::Fixed(width) = step {
+                            let actual = open - previous;
+                            if actual < width {
+                                Err(LseError::UnexpectedCandleResolution {
+                                    symbol: symbol.to_owned(),
+                                    interval,
+                                    previous_open: previous,
+                                    open,
+                                    actual,
+                                })?;
+                            }
+                        }
+                    }
+                    previous_open = Some(open);
+                    opens.push(open);
+                }
+
+                for (row, open) in rows.into_iter().zip(opens) {
                     let close_time = close_time_from_open(open, step)
                         .ok_or(LseError::TimestampOverflow { open, interval })?;
 
@@ -257,13 +324,14 @@ impl LseVaultClient {
                     max_open = Some(max_open.map_or(open, |seen| seen.max(open)));
 
                     // A bar past the upper bound ends the fetch — but only after the rest of this
-                    // page has been examined. Ascending order is how the vault answers today, not
-                    // something it guarantees, and failing here immediately would discard any
-                    // in-range bar sitting behind an out-of-range one, so the error would arrive
-                    // having thrown away data the response actually carried. Continuing costs one
-                    // pass over a page already in memory and changes nothing else — `max_open`
-                    // below already scans every row, so the cursor arithmetic never depended on
-                    // the order in the first place.
+                    // page has been examined, so the error never arrives having thrown away data
+                    // the response actually carried. On a page that reaches here that is now belt
+                    // and braces: the order check above rejects any page on which an out-of-range
+                    // bar could precede an in-range one, since on an ascending page everything
+                    // after the first out-of-range bar is also out of range. Kept because it costs
+                    // one pass over a page already in memory, `max_open` below scans every row
+                    // regardless, and "yield everything valid before failing" is the property worth
+                    // holding structurally rather than as a consequence of another check.
                     if close_time > end {
                         reached_end = true;
                         continue;
@@ -376,23 +444,35 @@ mod tests {
 
     #[test]
     fn an_equity_row_deserializes_float_prices_and_an_integer_volume() {
-        // The measured equity shape: prices are JSON floats, volume a JSON integer. Both must land
-        // in `Decimal` without a custom helper.
-        let json = r#"{"ts":"2003-09-10 00:00:00.000000","symbol":"AAPL","open":0.4,
-                       "high":0.402321428571429,"low":0.4,"close":0.4,"volume":3428513}"#;
+        // The measured equity *shape*: prices are JSON floats, volume a JSON integer. Both must
+        // land in `Decimal` without a custom helper.
+        //
+        // Every number here is invented — deliberately round, or obviously not a price — so no row
+        // in this repo can be mistaken for provider data, which we are not licensed to redistribute
+        // (<https://londonstrategicedge.com/terms>). Decoding is value-independent, so a synthetic
+        // row proves exactly the property a captured one would.
+        //
+        // `high` carries **15 significant digits** deliberately: that is the part under test, since
+        // a price this long must survive the `f64` the JSON number is parsed as. 15 is also the
+        // ceiling — the deserializer goes JSON float -> `f64` -> `Decimal`, so a 17-digit literal
+        // like `10.123456789012345` lands as `10.123456789012344` and would make this test assert
+        // the loss rather than the fidelity.
+        let json = r#"{"ts":"2024-01-02 00:00:00.000000","symbol":"TEST","open":10.0,
+                       "high":10.1234567890123,"low":10.0,"close":10.0,"volume":1000000}"#;
 
         let row: LseCandleRow = serde_json::from_str(json).unwrap();
 
-        assert_eq!(row.open, dec!(0.4));
-        assert_eq!(row.high, dec!(0.402321428571429));
-        assert_eq!(row.volume, Some(dec!(3428513)));
+        assert_eq!(row.open, dec!(10.0));
+        assert_eq!(row.high, dec!(10.1234567890123));
+        assert_eq!(row.volume, Some(dec!(1000000)));
     }
 
     #[test]
     fn an_fx_row_omitting_volume_deserializes_as_none() {
         // The measured FX shape: no `volume` key at all. This must be `None`, never `Some(0)`.
-        let json = r#"{"ts":"2003-01-01 00:00:00.000000","symbol":"EUR/USD","open":1.0493,
-                       "high":1.0493,"low":1.0493,"close":1.0493}"#;
+        // Values are invented, for the reason given above.
+        let json = r#"{"ts":"2024-01-02 00:00:00.000000","symbol":"AAA/BBB","open":2.0,
+                       "high":2.0,"low":2.0,"close":2.0}"#;
 
         let row: LseCandleRow = serde_json::from_str(json).unwrap();
 

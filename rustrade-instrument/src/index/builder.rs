@@ -8,6 +8,7 @@ use crate::{
     },
     instrument::{Instrument, InstrumentIndex, spec::OrderQuantityUnits},
 };
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 #[derive(Debug, Default)]
@@ -66,13 +67,14 @@ impl IndexedInstrumentsBuilder {
     ///
     /// # Panics
     /// Panics if two added `Instrument`s share an
-    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal) — see
-    /// [`Self::try_build`], which returns that as an [`IndexError`] instead.
+    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal), or if any
+    /// added `Instrument` carries a non-positive `contract_size` — see [`Self::try_build`], which
+    /// returns both as an [`IndexError`] instead.
     pub fn build(self) -> IndexedInstruments {
-        // Deliberate panic: `build` is the infallible convenience over `try_build`, and the sole
-        // failure is a caller error that must not be silently tolerated (see `try_build`'s
-        // rustdoc). Panics with the error's `Display`, not `expect`'s `Debug`, so the operator
-        // reads the duplicate rather than a quoted struct dump.
+        // Deliberate panic: `build` is the infallible convenience over `try_build`, and every
+        // failure it can raise is a caller error that must not be silently tolerated (see
+        // `try_build`'s rustdoc). Panics with the error's `Display`, not `expect`'s `Debug`, so
+        // the operator reads the offending instrument rather than a quoted struct dump.
         #[allow(clippy::panic)] // Documented in this method's `# Panics` section.
         self.try_build()
             .unwrap_or_else(|error| panic!("failed to build IndexedInstruments: {error}"))
@@ -83,7 +85,9 @@ impl IndexedInstrumentsBuilder {
     ///
     /// # Errors
     /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two added `Instrument`s share an
-    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal).
+    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal), or
+    /// [`IndexError::InvalidContractSize`] if any added `Instrument` carries a non-positive
+    /// `contract_size`.
     ///
     /// `InstrumentNameInternal` must be unique across the collection: downstream state maps are
     /// keyed on it while being read **positionally** by [`InstrumentIndex`], so a duplicate
@@ -100,6 +104,27 @@ impl IndexedInstrumentsBuilder {
         self.instruments.dedup();
         self.assets.sort();
         self.assets.dedup();
+
+        // Enforce that every contract multiplier is positive. Applied through
+        // `InstrumentKind::contract_size`, so it covers every kind uniformly -- `Spot` reports a
+        // hard `Decimal::ONE` and can never trip it, and carving the contract-bearing kinds out
+        // individually would take more code than checking them all. See
+        // `IndexError::InvalidContractSize` for why neither degenerate value fails downstream.
+        for instrument in &self.instruments {
+            let contract_size = instrument.kind.contract_size();
+            if contract_size <= Decimal::ZERO {
+                return Err(IndexError::InvalidContractSize(format!(
+                    "{} ({:?}) on {} carries contract_size {contract_size}, but a contract \
+                     multiplier must be positive - it scales notional, PnL and fees, so zero \
+                     silently zeroes all three and a negative value inverts the sign of PnL",
+                    instrument.name_internal,
+                    instrument.kind,
+                    // `as_str`, not `Display`: the canonical snake_case spelling users write in
+                    // configs, rather than the bare variant name.
+                    instrument.exchange.as_str(),
+                )));
+            }
+        }
 
         // Enforce the InstrumentNameInternal uniqueness invariant that index-keyed state assumes.
         // Checked after the dedup above so exact duplicate `Instrument`s -- which are legitimate
@@ -188,7 +213,7 @@ mod tests {
     use crate::{
         Underlying,
         instrument::{
-            kind::{InstrumentKind, cfd::CfdContract},
+            kind::{InstrumentKind, cfd::CfdContract, perpetual::PerpetualContract},
             name::{InstrumentNameExchange, InstrumentNameInternal},
             quote::InstrumentQuoteAsset,
             spec::{
@@ -338,6 +363,196 @@ mod tests {
         // actionable.
         assert!(message.contains("Spot"), "{message}");
         assert!(message.contains("Cfd"), "{message}");
+    }
+
+    /// Builds a one-instrument collection whose only variable is the CFD multiplier.
+    fn cfd_with_contract_size(contract_size: Decimal) -> Result<IndexedInstruments, IndexError> {
+        IndexedInstrumentsBuilder::default()
+            .add_instrument(Instrument::new(
+                ExchangeId::Ibkr,
+                "ibkr-spx500_usd",
+                "SPX500",
+                Underlying::new(
+                    Asset::new_from_exchange("spx500"),
+                    Asset::new_from_exchange("usd"),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Cfd(CfdContract {
+                    contract_size,
+                    settlement_asset: Asset::new_from_exchange("usd"),
+                }),
+                None,
+            ))
+            .try_build()
+    }
+
+    #[test]
+    fn a_zero_contract_size_is_rejected_rather_than_silently_zeroing_notional_pnl_and_fees() {
+        // Zero is the dangerous value precisely because nothing downstream fails on it: every
+        // notional, fee and PnL becomes zero, so the run completes and reads as a strategy that
+        // found no edge.
+        let error = cfd_with_contract_size(Decimal::ZERO)
+            .expect_err("a zero contract multiplier must be rejected");
+
+        let IndexError::InvalidContractSize(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+
+        // The message must identify which instrument carried it, or an operator with a hundred
+        // configured instruments cannot act on it.
+        assert!(message.contains("ibkr-spx500_usd"), "{message}");
+        assert!(message.contains("ibkr"), "{message}");
+    }
+
+    #[test]
+    fn a_negative_contract_size_is_rejected_rather_than_inverting_the_sign_of_pnl() {
+        let error = cfd_with_contract_size(dec!(-25))
+            .expect_err("a negative contract multiplier must be rejected");
+
+        assert!(
+            matches!(error, IndexError::InvalidContractSize(_)),
+            "unexpected error variant: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_positive_contract_size_builds() {
+        // The control: the guard must reject only the degenerate values. €25-per-point is an
+        // ordinary index CFD multiplier, not an edge case.
+        let indexed = cfd_with_contract_size(dec!(25)).expect("a positive multiplier is valid");
+
+        assert_eq!(indexed.instruments().len(), 1);
+        assert_eq!(
+            indexed.instruments()[0].value.kind.contract_size(),
+            dec!(25)
+        );
+    }
+
+    #[test]
+    fn the_contract_size_guard_covers_every_kind_that_carries_one() {
+        // The check reads `InstrumentKind::contract_size`, so it is uniform by construction -- but
+        // that is the property worth pinning, since a future kind gaining a multiplier inherits
+        // the guard for free only as long as it reports through that accessor.
+        let usd = || Asset::new_from_exchange("usd");
+
+        let kinds = [
+            InstrumentKind::Perpetual(PerpetualContract {
+                contract_size: Decimal::ZERO,
+                settlement_asset: usd(),
+            }),
+            InstrumentKind::Cfd(CfdContract {
+                contract_size: Decimal::ZERO,
+                settlement_asset: usd(),
+            }),
+        ];
+
+        for kind in kinds {
+            let error = IndexedInstrumentsBuilder::default()
+                .add_instrument(Instrument::new(
+                    ExchangeId::Ibkr,
+                    "ibkr-aapl",
+                    "AAPL",
+                    Underlying::new(Asset::new_from_exchange("aapl"), usd()),
+                    InstrumentQuoteAsset::UnderlyingQuote,
+                    kind.clone(),
+                    None,
+                ))
+                .try_build()
+                .expect_err("a zero contract multiplier must be rejected on every kind");
+
+            assert!(
+                matches!(error, IndexError::InvalidContractSize(_)),
+                "{kind:?} was not guarded: {error:?}"
+            );
+        }
+
+        // `Spot` reports a hard `Decimal::ONE` and therefore cannot trip the guard -- pinned so a
+        // future change to that accessor cannot make every spot collection unbuildable.
+        assert!(
+            IndexedInstrumentsBuilder::default()
+                .add_instrument(instrument(ExchangeId::BinanceSpot, "btc", "usdt"))
+                .try_build()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn try_new_applies_the_same_collection_invariants_as_the_builder() {
+        // `IndexedInstruments::try_new` is the entry point config-derived collections actually
+        // take, and it folds into the builder -- but nothing pinned that, so a future
+        // reimplementation could bypass `try_build` and lose both guards silently.
+        let duplicate = |name_exchange| {
+            Instrument::new(
+                ExchangeId::BinanceSpot,
+                "binance_spot-btc_usdt",
+                name_exchange,
+                Underlying::new(
+                    Asset::new_from_exchange("btc"),
+                    Asset::new_from_exchange("usdt"),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Spot,
+                None,
+            )
+        };
+
+        assert!(matches!(
+            IndexedInstruments::try_new([duplicate("BTCUSDT"), duplicate("BTC-USDT")]),
+            Err(IndexError::DuplicateInstrumentNameInternal(_))
+        ));
+
+        assert!(matches!(
+            IndexedInstruments::try_new([Instrument::new(
+                ExchangeId::Ibkr,
+                "ibkr-spx500_usd",
+                "SPX500",
+                Underlying::new(
+                    Asset::new_from_exchange("spx500"),
+                    Asset::new_from_exchange("usd"),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Cfd(CfdContract {
+                    contract_size: Decimal::ZERO,
+                    settlement_asset: Asset::new_from_exchange("usd"),
+                }),
+                None,
+            )]),
+            Err(IndexError::InvalidContractSize(_))
+        ));
+
+        // And the valid case still builds, so the assertions above are not passing on a
+        // constructor that rejects everything.
+        let indexed = IndexedInstruments::try_new([
+            instrument(ExchangeId::BinanceSpot, "btc", "usdt"),
+            instrument(ExchangeId::BinanceSpot, "eth", "usdt"),
+        ])
+        .expect("two distinct spot instruments are a valid collection");
+
+        assert_eq!(indexed.instruments().len(), 2);
+        assert_eq!(indexed.exchanges().len(), 1);
+        // BTC, ETH, USDT -- the shared quote is indexed once.
+        assert_eq!(indexed.assets().len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid contract_size")]
+    fn new_panics_on_an_invalid_collection_rather_than_indexing_it() {
+        // The infallible convenience must not be a way around the guard.
+        let _ = IndexedInstruments::new([Instrument::new(
+            ExchangeId::Ibkr,
+            "ibkr-spx500_usd",
+            "SPX500",
+            Underlying::new(
+                Asset::new_from_exchange("spx500"),
+                Asset::new_from_exchange("usd"),
+            ),
+            InstrumentQuoteAsset::UnderlyingQuote,
+            InstrumentKind::Cfd(CfdContract {
+                contract_size: Decimal::ZERO,
+                settlement_asset: Asset::new_from_exchange("usd"),
+            }),
+            None,
+        )]);
     }
 
     #[test]

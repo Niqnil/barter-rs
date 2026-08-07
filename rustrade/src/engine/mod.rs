@@ -494,8 +494,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // would also arbitrate the most consequential number in this function by map
                 // insertion order, ie/ by the order the user happened to declare instruments.
                 //
-                // Deliberately NOT the same predicate as `is_split_eligible`: that one is expected
-                // to widen to equity CFDs one day, this one is not. Do not fold them.
+                // Deliberately NOT the same predicate as `is_split_eligible`. The two agree on
+                // every variant today, but they answer different questions — "is this the
+                // deliverable an option settles against" versus "can split arithmetic be applied
+                // to this" — so folding them would tie each one's future to the other's. Widen
+                // either on its own rule, not on the fact that they currently match.
                 let spot_matches: Vec<_> = self
                     .state
                     .instruments

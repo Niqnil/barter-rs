@@ -5,8 +5,8 @@
 use super::error::MassiveError;
 use super::pagination::PaginationGuard;
 use super::transformer::{
-    AggregateVolume, AggregatesResponse, QuotesResponse, TradesResponse, parse_aggregates_response,
-    parse_quotes_response, parse_trades_response, timespan_to_step,
+    AggregateProvenance, AggregatesResponse, QuotesResponse, TradesResponse,
+    parse_aggregates_response, parse_quotes_response, parse_trades_response, timespan_to_step,
 };
 use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped, truncate_str};
 use crate::subscription::{
@@ -363,7 +363,7 @@ impl MassiveRestClient {
 
             // What `v` means on this ticker's market. Forex bars are aggregated from quoted
             // bid/ask rather than a trade tape, so their `v` is quote activity, not volume.
-            let bar_volume = AggregateVolume::for_ticker(ticker);
+            let bar_volume = AggregateProvenance::for_ticker(ticker);
 
             // Range contract: yield candles whose `close_time ∈ [from, to]`. The
             // Massive (Polygon) endpoint filters by the bar's open-time, so widen

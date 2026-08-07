@@ -35,6 +35,15 @@ impl InstrumentNameInternal {
     /// The exchange segment is [`ExchangeId::as_str`] — the same canonical `snake_case`
     /// spelling [`Self::new_from_exchange`] uses — so both constructors resolve the same
     /// instrument to the same name. See that method for why the two must agree.
+    ///
+    /// # No in-tree caller
+    /// Every constructor in this workspace now builds names from an `InstrumentNameExchange`, so
+    /// this is public API for downstream users whose instrument source gives them a base/quote
+    /// pair and no exchange symbol — not a path this library exercises. It is kept rather than
+    /// deleted because the must-agree invariant above is only meaningful while both spellings
+    /// exist, and a downstream caller reaching for it would otherwise hand-roll the format string
+    /// and reintroduce exactly the divergence that invariant exists to prevent. The agreement is
+    /// pinned by `test_both_constructors_agree_on_the_same_instrument` rather than by a caller.
     pub fn new_from_exchange_underlying<Ass>(exchange: ExchangeId, base: &Ass, quote: &Ass) -> Self
     where
         for<'a> &'a Ass: Into<&'a AssetNameExchange>,

@@ -76,12 +76,19 @@ pub trait InstrumentDataState<
 /// whole-struct ordering is intentionally not provided (see [`Timed`] docs).
 ///
 /// # Deserialising state written by an older build
-/// Every field is `#[serde(default)]`, so state persisted before a field existed still loads, with
-/// the absent field taking its `Default`. Without it serde treats a missing key as a hard error
-/// even for an `Option` — deriving `Default` does not change that — and an engine-state snapshot,
-/// audit replica or replay stream from an earlier version would fail to load outright.
+/// Fields added after this type shipped carry `#[serde(default)]` individually, so state persisted
+/// before such a field existed still loads with that field taking its `Default`. Without it serde
+/// treats a missing key as a hard error even for an `Option` — deriving `Default` does not change
+/// that — and an engine-state snapshot, audit replica or replay stream from an earlier version
+/// would fail to load outright.
+///
+/// The attribute is deliberately **per field rather than on the container**. A container-level
+/// `#[serde(default)]` also makes `l1` and `last_traded_price` optional, and their `Default` is not
+/// a neutral value: an absent `l1` would load as an epoch-stamped empty book, which
+/// [`price`](InstrumentDataState::price) reads as "no price yet" rather than as the truncated
+/// snapshot it is. Per field, a new field's author has to decide whether its `Default` is a sound
+/// stand-in for "written before this existed" — which for `candle` it is, and for a book it is not.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Default, Deserialize, Serialize, Constructor)]
-#[serde(default)]
 pub struct DefaultInstrumentMarketData {
     pub l1: OrderBookL1,
     pub last_traded_price: Option<Timed<Decimal>>,
@@ -90,55 +97,94 @@ pub struct DefaultInstrumentMarketData {
     ///
     /// Only candles that have actually closed by the event's own `time_exchange` are retained; a
     /// candle closing after it is dropped as lookahead (see the [`Processor`] impl).
+    ///
+    /// Defaults on deserialisation: this field postdates the type, and `None` is exactly what a
+    /// build that never tracked candles meant.
+    #[serde(default)]
     pub candle: Option<Candle>,
 }
 
 impl InstrumentDataState for DefaultInstrumentMarketData {
     type MarketEventKind = DataKind;
 
-    /// Latest price: the **most recent** of the three inputs this state holds, with a fixed source
-    /// order breaking an exact tie.
+    /// Latest price: the **tick-regime** input (the L1 book where it has a mid, else the last
+    /// trade), unless a candle has closed more recently than that input's own stamp.
     ///
-    /// Each candidate is stamped with the instant it describes — the L1 book's `last_update_time`,
-    /// a candle's `close_time`, a trade's [`Timed::time`] — and the newest wins. `None` if the
-    /// instrument has received no price input at all.
+    /// `None` if the instrument has received no price input at all.
     ///
-    /// # Why recency, for all three
-    /// A stale input must never outrank a fresh one. On a mixed feed — which one provider alone can
-    /// produce, e.g. a session of quote ticks followed by a year of daily bars — a fixed precedence
-    /// means whichever kind sits at the top wins forever: an L1 book that stopped updating a year
-    /// ago would mark every position after it, `pnl_unrealised` would stop moving, and the tear
-    /// sheet would look entirely normal. Ties go to the finer-grained source — L1 book, then trade,
-    /// then candle — so a feed carrying only one kind behaves exactly as it did before the other two
-    /// were considered, and on the common single-kind feed the comparison is inert.
+    /// # Why the two regimes are ranked differently
+    /// Recency is the right rule *across* regimes and the wrong rule *within* one, because the three
+    /// stamps are not drawn from a single clock.
+    ///
+    /// **Across regimes — recency.** On a mixed feed, which one provider alone can produce (a
+    /// session of quote ticks followed by a year of daily bars), a fixed precedence means whichever
+    /// kind sits at the top wins forever: an L1 book that stopped updating a year ago would mark
+    /// every position after it, `pnl_unrealised` would stop moving, and the tear sheet would look
+    /// entirely normal. A candle therefore wins when it closed strictly later than the held tick.
+    /// The gap this decides is usually a *regime change* — days to years — which survives clock skew
+    /// of any realistic size. It is not always: subscribing to L1 **and** candles on one connector
+    /// concurrently is supported, and on a venue whose book instant is host-stamped that narrows the
+    /// gap to the bar interval. What remains there is a skew-sized window just after each bar close
+    /// in which the candle can win by the host's error rather than the market's — bounded by the
+    /// skew, self-correcting once a tick is stamped past the bar close, and far smaller than ranking
+    /// two tick stamps against each other, but not nothing.
+    ///
+    /// **Within the tick regime — fixed precedence, L1 over trade.** These two stamps routinely come
+    /// from different clocks on the same connector, and the gap between them is milliseconds, so a
+    /// recency comparison would be decided by the skew rather than by the market.
+    /// [`OrderBookL1::last_update_time`] is a *payload* field and several venues publish no book
+    /// instant at all — Binance Spot's `bookTicker` and IBKR's tick stream both carry none, so their
+    /// connectors stamp it from the host clock — while `time_exchange` on a trade is the venue's own
+    /// instant. Ranking those against each other means a host running 200 ms behind the venue (well
+    /// inside the skew Binance's own `recvWindow` tolerates, and routine on a VM after
+    /// suspend/resume) flips every mark from the book mid to the last trade, with no log and no
+    /// error. An NTP step mid-session flips it back. L1 is preferred outright instead: it is the
+    /// finer view of the current market, and the choice no longer depends on a clock comparison that
+    /// cannot be made soundly.
+    ///
+    /// # Known limitation
+    /// The flip side of that fixed precedence: an L1 book that **freezes while trades keep
+    /// arriving** shadows those trades for as long as it stays frozen. That is narrower than the
+    /// cross-regime hole above — both inputs come from one connector's live feed, so a book that
+    /// stops while the trade tape runs is a connector defect rather than a feed shape — but it is
+    /// real, and it is the price of not comparing two clocks. A strategy that needs trade-led marks
+    /// on such a feed should implement its own [`InstrumentDataState`].
     ///
     /// # The L1 contribution
     /// The volume-weighted mid-price where the book publishes sizes, else the plain mid.
     /// A **one-sided** book contributes nothing: half a book has no mid, and
     /// marking a position at whichever side happens to be quoted is a judgement this state does not
-    /// make on the caller's behalf.
+    /// make on the caller's behalf. A book contributing nothing falls through to the last trade, so
+    /// the fixed precedence never *costs* a price.
     ///
     /// # Caller obligation
-    /// The L1 candidate is ranked on [`OrderBookL1::last_update_time`], so a producer must stamp
-    /// that field with the same venue instant it puts in `MarketEvent::time_exchange` (the
-    /// obligation is stated on the field). A custom connector that stamps it from its own
-    /// aggregator clock instead gets no error and no log — just a book that can freeze, and a
-    /// recency ranking that silently moves `pnl_unrealised`.
+    /// A candle producer must set `close_time` to the true end of the bar's period, and stamp
+    /// `MarketEvent::time_exchange` with it (see the [`Processor`] impl, which rejects a candle
+    /// closing after its own `time_exchange` as lookahead). The tick-regime stamps are no longer
+    /// ranked against each other, so a producer that stamps [`OrderBookL1::last_update_time`] from a
+    /// local clock no longer loses the mark to a *trade*. It still costs the freshness guard in
+    /// `process`, and — on a feed carrying candles too — the skew-sized window after each bar close
+    /// described above.
     fn price(&self) -> Option<Decimal> {
-        [
-            self.l1_price()
-                .map(|price| (self.l1.last_update_time, PriceSource::L1, price)),
-            self.last_traded_price
-                .map(|trade| (trade.time, PriceSource::Trade, trade.value)),
-            self.candle
-                .map(|candle| (candle.close_time, PriceSource::Candle, candle.close)),
-        ]
-        .into_iter()
-        .flatten()
-        // No two candidates share a key, since each carries a distinct `PriceSource`, so the
-        // winner does not depend on iteration order.
-        .max_by_key(|(time, source, _)| (*time, *source))
-        .map(|(_, _, price)| price)
+        // Fixed precedence within the tick regime: a book that has a mid wins outright, and a book
+        // with nothing to say (one-sided, or never received) falls through to the last trade.
+        let tick = self
+            .l1_price()
+            .map(|price| (self.l1.last_update_time, price))
+            .or_else(|| self.last_traded_price.map(|last| (last.time, last.value)));
+
+        match (tick, self.candle) {
+            // Strictly later, so an exact tie goes to the tick: `close_time` is the EXCLUSIVE period
+            // end, and an observation stamped at that instant belongs to the next period.
+            (Some((tick_time, price)), Some(candle)) => Some(if candle.close_time > tick_time {
+                candle.close
+            } else {
+                price
+            }),
+            (Some((_, price)), None) => Some(price),
+            (None, Some(candle)) => Some(candle.close),
+            (None, None) => None,
+        }
     }
 }
 
@@ -154,19 +200,6 @@ impl InstrumentDataState for DefaultInstrumentMarketData {
 /// Process-global rather than per-instrument: `InstrumentKey` carries no bound this impl could key
 /// a map on, which is the same reason the warning cannot name the instrument it came from.
 static LOOKAHEAD_CANDLES_DROPPED: AtomicU64 = AtomicU64::new(0);
-
-/// Tie-break order for [`DefaultInstrumentMarketData::price`], coarsest first.
-///
-/// Only consulted when two inputs describe the **same instant**; recency decides otherwise. The
-/// order is by granularity: an L1 book is the finest view of the current market, and a trade beats a
-/// candle because `close_time` is the *exclusive* period end — a trade stamped at that instant
-/// belongs to the next period and is therefore the fresher observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum PriceSource {
-    Candle,
-    Trade,
-    L1,
-}
 
 impl DefaultInstrumentMarketData {
     /// The [`OrderBookL1`]'s price contribution, or `None` if it has none to make.
@@ -192,8 +225,10 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
     ///
     /// A candle whose `close_time` is **ahead of its own `time_exchange`** is dropped with a
     /// warning rather than applied: it would mark positions with the outcome of a period the
-    /// engine's clock says is still open. See the `DataKind::Candle` arm for why that input is
-    /// reachable at all. Every such candle is dropped, but the warning is rate-limited by a
+    /// engine's clock says is still open. Every in-tree candle producer sets the two fields to the
+    /// same value, so this can only fire on a third-party producer — see the `DataKind::Candle`
+    /// arm, which also records what it does *not* catch. Every such candle is dropped, but the
+    /// warning is rate-limited by a
     /// counter shared by **every instance of this type in the process**: on a multi-instrument run
     /// the power-of-two cadence and the `dropped` total on the line count drops across all of them
     /// combined, so neither is scoped to the exchange the line does name.
@@ -215,9 +250,14 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
                 }
             }
             // Ordered on the payload's `last_update_time`, not `event.time_exchange`, for the same
-            // reason as the candle below: `price()`'s recency comparison reads that field, so
-            // keying the guard on anything else would let the two disagree. Every in-tree producer
-            // stamps it from the venue's own book instant.
+            // reason as the candle below: that is the field `price()` reads, so keying the guard on
+            // anything else would let the two disagree.
+            //
+            // NOT every in-tree producer stamps this from the venue: Binance Spot's `bookTicker` and
+            // IBKR's tick stream publish no book instant, so those connectors fill it from the host
+            // clock (see `OrderBookL1::last_update_time`). That is why `price()` no longer ranks
+            // this field against a trade's venue stamp. It still orders books against each other
+            // here, which is sound — one connector's books all carry the same clock.
             DataKind::OrderBookL1(l1) => {
                 if self.l1.last_update_time < l1.last_update_time {
                     self.l1 = l1.clone()
@@ -240,6 +280,20 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
             // Dropped rather than clamped or accepted: there is no correct price to salvage, and a
             // clamp would silently paper over a mis-stamped feed. `process` has no error channel
             // (`Audit = ()`), so the warning is what makes it observable.
+            //
+            // Reachable only from OUTSIDE this workspace, and worth knowing before trusting it.
+            // Every in-tree candle producer sets `time_exchange = close_time` by construction —
+            // `lse::parquet`, `databento::transformer` and `massive::transformer` all do — so the
+            // two fields are the same value and this comparison cannot fire on any feed this repo
+            // ships. It guards a third-party `Processor` input, which is exactly what a public
+            // library should guard, but it is not a check on our own transformers.
+            //
+            // Nor is it a general lookahead check. It compares two fields of one event, so it
+            // catches only a producer that disagrees with itself. A producer that derives
+            // `close_time` from a wrong bar period and stamps `time_exchange` with that same wrong
+            // value — declaring a daily interval over a file of one-minute bars, say — passes here
+            // and still injects lookahead. That class has to be caught where the period is
+            // declared, not here.
             DataKind::Candle(candle) => {
                 if candle.close_time > event.time_exchange {
                     // Rate-limited: see `LOOKAHEAD_CANDLES_DROPPED`. The drop itself is
@@ -376,8 +430,8 @@ mod tests {
         assert_eq!(DefaultInstrumentMarketData::default().price(), None);
     }
 
-    /// The compatibility claim `#[serde(default)]` is here for: engine state written by a build
-    /// predating a field still loads, with the absent field taking its `Default`.
+    /// The compatibility claim `#[serde(default)]` on `candle` is here for: engine state written by
+    /// a build predating that field still loads, with the absent field taking its `Default`.
     ///
     /// Pinned because the attribute is easy to drop in a refactor and nothing else would notice.
     /// Serde treats a missing key as a hard error even when the field is an `Option`, and deriving
@@ -401,13 +455,21 @@ mod tests {
         assert_eq!(data.candle, None);
         // The fields that *were* present still round-trip rather than being defaulted wholesale.
         assert_eq!(data.l1.last_update_time, at(1_704_067_200));
+    }
 
-        // The degenerate case, so a field added after `candle` inherits the same protection
-        // without a further edit here.
-        assert_eq!(
-            serde_json::from_str::<DefaultInstrumentMarketData>("{}").unwrap(),
-            DefaultInstrumentMarketData::default()
-        );
+    /// The other half of that choice: the default is per field, so a snapshot missing a field that
+    /// predates `candle` is an error rather than a silent substitution.
+    ///
+    /// A container-level `#[serde(default)]` would load this as an epoch-stamped empty book, which
+    /// `price()` reports as "no price yet" — indistinguishable from an instrument that simply has
+    /// not ticked, and it would mark nothing for the rest of the run.
+    #[test]
+    fn a_snapshot_missing_the_book_is_rejected_rather_than_defaulted_to_an_empty_one() {
+        let error =
+            serde_json::from_str::<DefaultInstrumentMarketData>(r#"{ "last_traded_price": null }"#)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("l1"), "{error}");
     }
 
     #[test]
@@ -432,20 +494,48 @@ mod tests {
         assert_eq!(data.price(), Some(dec!(300)));
     }
 
-    /// The mirror of the case above. L1 outranks a trade at an exact tie, so a stale book losing to
-    /// a fresh trade is specifically the recency comparison working rather than the rank order —
-    /// which is why it is worth pinning separately from the candle case.
+    /// The deliberate counterpart to the candle case above, and the reason it is *not* symmetric.
+    ///
+    /// An L1 book and a trade are both tick-regime inputs, and their stamps routinely come from
+    /// different clocks on one connector — Binance Spot's `bookTicker` publishes no venue instant,
+    /// so its book carries a host stamp while its trades carry Binance's `T`. Ranking them by
+    /// recency would decide the mark by that skew: a host 200 ms behind the venue flips essentially
+    /// every mark from the book mid to the last trade, silently. L1 therefore wins outright,
+    /// however old it is.
+    ///
+    /// The cost is stated in `price`'s "Known limitation": a frozen book shadows a live trade tape.
+    /// That is a connector defect rather than a feed shape, which is the trade this rule makes.
     #[test]
-    fn stale_l1_does_not_shadow_fresh_trade() {
+    fn stale_l1_still_outranks_a_fresh_trade() {
         let mut data = DefaultInstrumentMarketData::default();
         data.process(&event(at(100), l1(at(100), dec!(100))));
         data.process(&event(at(86_500), trade(dec!(200))));
 
-        assert_eq!(data.price(), Some(dec!(200)));
+        assert_eq!(data.price(), Some(dec!(100)));
     }
 
-    /// At equal recency L1 still wins, which is what keeps an L1-only feed behaving exactly as it
-    /// did before the other two inputs were considered.
+    /// The property the rule above exists for, stated directly: no timestamp a *trade* carries can
+    /// change which source `price()` reads while a two-sided book is held. Sweeping the trade across
+    /// both sides of the book's stamp — and onto it exactly — pins that the comparison is gone
+    /// rather than merely currently favouring L1.
+    #[test]
+    fn no_trade_timestamp_can_displace_a_two_sided_book() {
+        for trade_seconds in [1, 99, 100, 101, 86_400] {
+            let mut data = DefaultInstrumentMarketData::default();
+            data.process(&event(at(100), l1(at(100), dec!(100))));
+            data.process(&event(at(trade_seconds), trade(dec!(200))));
+
+            assert_eq!(
+                data.price(),
+                Some(dec!(100)),
+                "a trade stamped at t={trade_seconds} must not displace the book mid"
+            );
+        }
+    }
+
+    /// At an exact tie the tick regime wins, which keeps an L1-only feed behaving exactly as it did
+    /// before the other two inputs were considered. `close_time` is the exclusive period end, so a
+    /// book stamped at that instant belongs to the next period and is the fresher observation.
     #[test]
     fn l1_wins_exact_tie_with_candle_and_trade() {
         let mut data = DefaultInstrumentMarketData::default();

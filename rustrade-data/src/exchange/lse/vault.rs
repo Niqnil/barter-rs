@@ -201,6 +201,25 @@ impl std::fmt::Debug for LseVaultClient {
 impl LseVaultClient {
     /// Create a client with an explicit API key.
     ///
+    /// # Redirects are not followed
+    /// The key rides every request as a client-wide `x-api-key` default header, and reqwest's
+    /// cross-host header stripping covers `Authorization`, `Cookie`, `Cookie2`,
+    /// `Proxy-Authorization` and `WWW-Authenticate` — **not** a custom header. Under reqwest's
+    /// default
+    /// [`Policy::limited(10)`](reqwest::redirect::Policy::limited) a single server-issued 302 would
+    /// therefore re-issue the request, live key attached, against whatever host the vault named.
+    /// The download endpoint is exactly the shape that hands off to object storage, and in a CI
+    /// workflow that key is a repository secret.
+    ///
+    /// [`Policy::none`](reqwest::redirect::Policy::none) makes the "this client only ever requests
+    /// URLs it builds itself" invariant structural rather than a property of the vault's current
+    /// behaviour — a followed redirect *is* a server-supplied URL. An unexpected 3xx surfaces as a
+    /// typed error instead of being followed. This matches `MassiveRestClient::new` (not linked:
+    /// it is behind the `massive` feature, which this client is not) and the IBKR Flex client, and
+    /// it applies **wholesale**: a same-origin 301/308 (trailing-slash
+    /// normalisation by a proxy or CDN) is surfaced too, so a base URL set via
+    /// [`with_base_url`](Self::with_base_url) must serve responses directly.
+    ///
     /// # Errors
     /// Returns [`LseError::InvalidCredential`] if the key cannot be encoded as an HTTP header
     /// value (e.g. non-ASCII bytes), or [`LseError::Http`] if the HTTP client cannot be built.
@@ -218,6 +237,13 @@ impl LseVaultClient {
             .user_agent(USER_AGENT)
             .timeout(REQUEST_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
+            // The key above is a client-wide default header, and reqwest strips only
+            // `Authorization`, `Cookie`, `Cookie2`, `Proxy-Authorization` and `WWW-Authenticate`
+            // when a redirect crosses hosts -- a custom `x-api-key` survives the hop. `set_sensitive`
+            // redacts `Debug` output and does nothing here. Without this line the default
+            // `Policy::limited(10)` would forward the live key to any host the vault names, which
+            // is precisely the invariant `with_base_url` and `download_export` claim to hold.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         Ok(Self {
@@ -280,6 +306,14 @@ impl LseVaultClient {
     /// error, no log, and nothing to observe but a run that stops making progress. Set
     /// [`timeout`](reqwest::ClientBuilder::timeout) and
     /// [`read_timeout`](reqwest::ClientBuilder::read_timeout) on any client passed here.
+    ///
+    /// # ⚠️ And its own redirect policy
+    /// [`new`](Self::new) sets
+    /// [`Policy::none`](reqwest::redirect::Policy::none) so the API key cannot ride a server-issued
+    /// redirect to another host; reqwest's default is `Policy::limited(10)`, which strips only the
+    /// standard auth headers and would forward a custom `x-api-key` intact. A client supplied here
+    /// that carries the key **must** set `Policy::none` itself, or a single 302 from the vault (or
+    /// from a proxy in front of it) leaks the credential with no error and no log.
     #[must_use]
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.http = client;
@@ -587,8 +621,8 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 
-    /// The property M6 was about: N concurrent callers share ONE schedule, so the aggregate rate is
-    /// one request per `pace` — not N.
+    /// N concurrent callers share ONE schedule, so the aggregate rate is one request per `pace` —
+    /// not N.
     #[tokio::test(start_paused = true)]
     async fn the_gate_spaces_concurrent_callers_against_one_shared_schedule() {
         let pace = Duration::from_millis(300);

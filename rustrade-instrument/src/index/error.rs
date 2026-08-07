@@ -42,4 +42,23 @@ pub enum IndexError {
     /// Contains a description naming the duplicated name and the instruments that share it.
     #[error("duplicate InstrumentNameInternal: {0}")]
     DuplicateInstrumentNameInternal(String),
+
+    /// An [`Instrument`](crate::instrument::Instrument)'s `contract_size` is not a positive
+    /// multiplier.
+    ///
+    /// `contract_size` multiplies every money quantity derived from an instrument — quote
+    /// notional, unrealised and realised PnL, and any notional-scaled fee model. Neither
+    /// degenerate value fails anywhere downstream:
+    /// - **Zero** makes every notional, fee and PnL zero, so a backtest trades freely, is charged
+    ///   nothing and never moves. It reads as a strategy that found no edge.
+    /// - **Negative** inverts the sign of PnL, so a losing strategy reports a profit.
+    ///
+    /// Checked while building because that is the last point at which the value is still
+    /// attributable to the instrument that carried it; past it the multiplier is copied into
+    /// positions and fee calculations, where a wrong number is indistinguishable from a wrong
+    /// price.
+    ///
+    /// Contains a description naming the instrument and the rejected value.
+    #[error("invalid contract_size: {0}")]
+    InvalidContractSize(String),
 }

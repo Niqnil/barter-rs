@@ -1123,3 +1123,142 @@ fn an_inverted_or_empty_range_is_rejected() {
         Err(LseError::InvalidInput { .. })
     ));
 }
+
+#[test]
+fn a_range_starting_more_than_a_day_after_today_is_wholly_in_the_future() {
+    let today: chrono::NaiveDate = "2026-07-01".parse().unwrap();
+    let day_after = |date: chrono::NaiveDate, days| date + chrono::Days::new(days);
+
+    // A fat-fingered year is the failure this exists for; it misses by hundreds of days.
+    let next_year = LseExportRange::new(day_after(today, 365), day_after(today, 366)).unwrap();
+    assert!(next_year.is_wholly_after(today));
+
+    // The documented day of slack: a caller at UTC+14 can legitimately mean UTC's tomorrow by
+    // "today", so the boundary sits at today + 1, not at today.
+    let tomorrow = LseExportRange::new(day_after(today, 1), day_after(today, 2)).unwrap();
+    assert!(!tomorrow.is_wholly_after(today));
+
+    let day_after_tomorrow = LseExportRange::new(day_after(today, 2), day_after(today, 3)).unwrap();
+    assert!(day_after_tomorrow.is_wholly_after(today));
+
+    // "Wholly" is the operative word: a range that merely ENDS in the future still holds data.
+    let straddling = LseExportRange::new(today, day_after(today, 30)).unwrap();
+    assert!(!straddling.is_wholly_after(today));
+
+    let past = LseExportRange::new("2026-06-01".parse().unwrap(), today).unwrap();
+    assert!(!past.is_wholly_after(today));
+}
+
+/// The check exists to stop an export being spent, so the assertion that matters is that the
+/// request never left the process.
+#[tokio::test]
+async fn a_wholly_future_range_is_rejected_before_an_export_is_spent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/vault/export"))
+        .respond_with(
+            ResponseTemplate::new(202).set_body_raw(submit_body("job1"), "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    // Relative to the same clock `submit_export` reads, so this cannot rot into a past range.
+    let start = chrono::Utc::now().date_naive() + chrono::Days::new(400);
+    let request = LseExportRequest::new(
+        LseDataset::Fx,
+        "EUR/USD",
+        LseExportTimeframe::Tick,
+        LseExportRange::new(start, start + chrono::Days::new(1)).unwrap(),
+    )
+    .unwrap();
+
+    let error = client(&server).submit_export(&request).await.unwrap_err();
+
+    assert!(matches!(error, LseError::InvalidInput { .. }));
+    assert!(error.to_string().contains("EMPTY"));
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "the rejection must happen client-side: a submitted request costs an export"
+    );
+}
+
+#[test]
+fn the_uppercase_all_hatch_is_scoped_to_the_equity_datasets() {
+    // "Matches nothing" is a property of the (dataset, symbol) PAIR: on `Fx` a symbol is
+    // pair-shaped and on the synthetic classes it is a contract slug, so no casing of `ALL` names
+    // anything there -- and letting it through spends a billed export to learn that.
+    for dataset in [LseDataset::Fx, LseDataset::Volatility] {
+        let error =
+            LseExportRequest::new(dataset, "ALL", LseExportTimeframe::Tick, range()).unwrap_err();
+
+        assert!(
+            matches!(error, LseError::InvalidInput { .. }),
+            "{dataset:?} should reject \"ALL\""
+        );
+        assert!(error.to_string().contains("EMPTY"));
+        // The Allstate hint must not appear on a dataset carrying no such listing.
+        assert!(
+            !error.to_string().contains("Allstate"),
+            "{dataset:?} must not send the reader after a listing it does not carry"
+        );
+    }
+
+    // Both equity classes keep the hatch -- `Etf` as well as `Stocks`, since they share one venue
+    // and one symbology.
+    for dataset in [LseDataset::Stocks, LseDataset::Etf] {
+        assert!(
+            LseExportRequest::new(dataset, "ALL", LseExportTimeframe::Tick, range()).is_ok(),
+            "{dataset:?} must admit Allstate's real ticker"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// Credential containment
+// -----------------------------------------------------------------------------------------------
+
+/// The download endpoint is the one that genuinely invites a redirect — a multi-gigabyte artifact
+/// is exactly the shape that hands off to object storage — and it carries the same client-wide
+/// `x-api-key` every other call does. reqwest strips only `Authorization`, `Cookie`, `Cookie2`,
+/// `Proxy-Authorization` and `WWW-Authenticate` across hosts, so under the default
+/// `Policy::limited(10)` that key would ride a `302 Location: https://<bucket>/…` straight to the
+/// bucket host. `Policy::none()` surfaces the 3xx unfollowed instead; the assertion that matters is
+/// that the redirect target is never contacted, which holds regardless of reqwest's stripping list.
+#[tokio::test]
+async fn a_download_does_not_follow_a_redirect_off_host() {
+    let bucket = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"artifact".to_vec()))
+        .mount(&bucket)
+        .await;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("{}/bucket/job1.parquet", bucket.uri()).as_str(),
+        ))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("out.parquet");
+    let job: LseExportJobStatus = serde_json::from_str(&ready_body("job1", b"artifact")).unwrap();
+
+    let error = client(&server)
+        .download_export(&job, &destination, &tick_request())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, LseError::Api { status, .. } if (300..400).contains(&status)),
+        "expected an unfollowed 3xx as LseError::Api, got {error:?}"
+    );
+    assert!(
+        bucket.received_requests().await.unwrap().is_empty(),
+        "the client must not follow a redirect off-host: the x-api-key would ride along"
+    );
+    // Nothing was written, so no `.part` is left claiming progress against this job.
+    assert!(!part_path(&destination, "job1").exists());
+}

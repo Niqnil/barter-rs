@@ -63,7 +63,7 @@ use crate::event::{DataKind, MarketEvent};
 use crate::exchange::lse::error::LseError;
 use crate::exchange::lse::export::{LseExport, LseExportTimeframe};
 use crate::subscription::book::OrderBookL1;
-use crate::subscription::candle::{Candle, CandleInterval, close_time_from_open};
+use crate::subscription::candle::{Candle, CandleInterval, IntervalStep, close_time_from_open};
 use crate::subscription::trade::PublicTrade;
 use chrono::{DateTime, Utc};
 use parquet::basic::{ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
@@ -71,12 +71,10 @@ use parquet::column::reader::ColumnReaderImpl;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, DoubleType, Int64Type};
 use parquet::errors::ParquetError;
 use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
+use parquet::file::statistics::Statistics;
 use parquet::schema::types::{Type as SchemaType, TypePtr};
 use rust_decimal::Decimal;
-use rustrade_instrument::instrument::name::InstrumentNameExchange;
-use rustrade_instrument::{
-    exchange::ExchangeId, index::IndexedInstruments, instrument::InstrumentIndex,
-};
+use rustrade_instrument::{exchange::ExchangeId, instrument::InstrumentIndex};
 use smol_str::SmolStr;
 use std::fs::File;
 use std::path::Path;
@@ -121,16 +119,14 @@ enum RowLayout {
     /// L1 quote has nowhere to put a single undifferentiated size anyway: it cannot be split into a
     /// bid size and an ask size without inventing one.
     ///
-    /// So the slot exists to *check* the measurement, not to use it. The check keys on a **non-zero**
-    /// value, because a zero is the provider doing exactly what it has always done and discarding it
-    /// loses nothing — whereas a real size means the provider started populating a column this
-    /// layout drops, which is a fact worth one `warn!` rather than a silent drop. Keying on
-    /// non-null instead would warn on every artifact, which is noise rather than observability.
-    QuoteFromPrice {
-        price: usize,
-        ask: usize,
-        volume: Option<usize>,
-    },
+    /// So the layout names no slot for it: it is **not decoded at all**. That the measurement still
+    /// holds is checked from each row group's column-chunk statistics instead — see
+    /// [`ColumnPlan::discarded_volume`]. The check keys on a **non-zero** value, because a zero is
+    /// the provider doing exactly what it has always done and discarding it loses nothing — whereas
+    /// a real size means the provider started populating a column this layout drops, which is a fact
+    /// worth one `warn!` rather than a silent drop. Keying on non-null instead would warn on every
+    /// artifact, which is noise rather than observability.
+    QuoteFromPrice { price: usize, ask: usize },
     /// `price` + `volume` with no ask.
     Trade { price: usize, volume: usize },
     /// OHLC, with `volume` present only on some datasets.
@@ -168,6 +164,18 @@ struct ColumnPlan {
     symbol: LeafColumn,
     /// The layout's value columns, indexed by its slots.
     values: Vec<LeafColumn>,
+    /// A `volume` column present on a [`RowLayout::QuoteFromPrice`] artifact, which that layout
+    /// discards.
+    ///
+    /// Held **outside** [`values`](Self::values) because it is never decoded. Its purpose is to
+    /// notice the provider starting to populate a column this layout drops, and that is a fact about
+    /// the artifact rather than about any row — so it is answered from each row group's column-chunk
+    /// **statistics**, which the writer already computed, instead of by decoding the column.
+    ///
+    /// Decoding it cost one extra `DOUBLE` chunk decompressed and read end to end for at most one
+    /// `warn!` line: roughly 400 MB of decode on a 50M-row artifact, and no early exit, since the
+    /// column was read as part of the row batch whether or not the warning had already fired.
+    discarded_volume: Option<LeafColumn>,
 }
 
 impl ColumnPlan {
@@ -229,25 +237,10 @@ impl ColumnPlan {
             LseExportTimeframe::Tick => match (has("bid"), has("ask"), has("price")) {
                 (true, true, _) => (RowLayout::Quote { bid: 0, ask: 1 }, vec!["bid", "ask"]),
                 // `price` beside an `ask` is the bid, so this is a quote despite the column name.
-                (false, true, true) => {
-                    let mut names = vec!["price", "ask"];
-
-                    // Opened only to verify it stays a zero -- see `RowLayout::QuoteFromPrice`.
-                    let mut volume = None;
-                    if has("volume") {
-                        volume = Some(names.len());
-                        names.push("volume");
-                    }
-
-                    (
-                        RowLayout::QuoteFromPrice {
-                            price: 0,
-                            ask: 1,
-                            volume,
-                        },
-                        names,
-                    )
-                }
+                (false, true, true) => (
+                    RowLayout::QuoteFromPrice { price: 0, ask: 1 },
+                    vec!["price", "ask"],
+                ),
                 (false, false, true) if has("volume") => (
                     RowLayout::Trade {
                         price: 0,
@@ -259,6 +252,13 @@ impl ColumnPlan {
             },
         };
 
+        // Located and type-checked like any other column, but deliberately NOT in `values`: it is
+        // never decoded. See `RowLayout::QuoteFromPrice` and `ColumnPlan::discarded_volume`.
+        let discarded_volume = match (&layout, has("volume")) {
+            (RowLayout::QuoteFromPrice { .. }, true) => Some(double_column(fields, "volume")?),
+            _ => None,
+        };
+
         Ok(Self {
             layout,
             ts: timestamp_column(fields, COL_TS)?,
@@ -267,6 +267,7 @@ impl ColumnPlan {
                 .into_iter()
                 .map(|name| double_column(fields, name))
                 .collect::<Result<_, _>>()?,
+            discarded_volume,
         })
     }
 }
@@ -497,7 +498,25 @@ impl<T: DataType> BatchedColumn<T> {
     /// blaming the file for a fault that is not in it, and on a nullable one it is not surfaced at
     /// all — the row simply decodes with a missing `volume` or a one-sided book.
     fn take(&mut self, row: usize) -> Result<Option<T::T>, LseError> {
-        if self.optional && self.def_levels.get(row).copied().unwrap_or_default() == 0 {
+        let value = self.peek(row)?.cloned();
+        self.advance(row);
+
+        Ok(value)
+    }
+
+    /// Borrow the value at `row` without advancing.
+    ///
+    /// The half of [`take`](Self::take) that costs nothing. For a `BYTE_ARRAY` column the clone
+    /// `take` performs is **not** a memcpy — [`ByteArray`] wraps an `Option<bytes::Bytes>`, so a
+    /// dictionary-backed clone is an atomic increment and its drop an atomic decrement: two
+    /// lock-prefixed read-modify-writes per row, on the order of 100M of them across a 50M-row
+    /// export, for a value that is only compared against a `&[u8]` and dropped. Callers that just
+    /// look at the value pair this with [`advance`](Self::advance) instead.
+    ///
+    /// # Errors
+    /// As [`take`](Self::take).
+    fn peek(&self, row: usize) -> Result<Option<&T::T>, LseError> {
+        if self.is_null(row) {
             return Ok(None);
         }
 
@@ -510,10 +529,24 @@ impl<T: DataType> BatchedColumn<T> {
             .into());
         };
 
-        let value = value.clone();
-        self.cursor += 1;
-
         Ok(Some(value))
+    }
+
+    /// Consume the value at `row`, having read it or decided not to.
+    ///
+    /// Advances only past a **present** row, matching [`take`](Self::take): the cursor runs over the
+    /// non-null values, so a null row occupies a definition level and no value slot. Calling this
+    /// without a preceding [`peek`](Self::peek) is sound but pointless — it is how a column is
+    /// skipped, which no layout currently does.
+    fn advance(&mut self, row: usize) {
+        if !self.is_null(row) {
+            self.cursor += 1;
+        }
+    }
+
+    /// Whether `row` of the buffered batch is a genuine SQL null.
+    fn is_null(&self, row: usize) -> bool {
+        self.optional && self.def_levels.get(row).copied().unwrap_or_default() == 0
     }
 }
 
@@ -590,42 +623,6 @@ impl RowGroupCursor {
     }
 }
 
-/// Resolve the [`InstrumentIndex`] a display symbol was registered under.
-///
-/// # Why derive it rather than accept one
-/// [`InstrumentIndex`] is a public, unbounded `usize`, and engine state indexes positionally — a
-/// fabricated index attributes this file's prices to a different instrument, or panics. Deriving
-/// it from the registry the engine was actually built with makes both unrepresentable, and catches
-/// the typo (`BP` for `BP.L`) that would otherwise yield an instrument that silently never marks.
-///
-/// # Errors
-/// Returns [`LseError::UnknownInstrument`] if no instrument on `exchange` carries `symbol` as its
-/// exchange-side name, listing what is registered there.
-pub fn instrument_index_for(
-    instruments: &IndexedInstruments,
-    exchange: ExchangeId,
-    symbol: &str,
-) -> Result<InstrumentIndex, LseError> {
-    let wanted = InstrumentNameExchange::new(symbol);
-
-    instruments
-        .instruments()
-        .iter()
-        .find(|keyed| keyed.value.exchange.value == exchange && keyed.value.name_exchange == wanted)
-        .map(|keyed| keyed.key)
-        .ok_or_else(|| LseError::UnknownInstrument {
-            symbol: symbol.to_owned(),
-            exchange,
-            registered: instruments
-                .instruments()
-                .iter()
-                .filter(|keyed| keyed.value.exchange.value == exchange)
-                .map(|keyed| keyed.value.name_exchange.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        })
-}
-
 /// List the distinct symbols an artifact contains, without decoding it.
 ///
 /// Lets a caller validate a file against their instrument registry *before* a backtest. It is
@@ -669,16 +666,21 @@ pub fn symbols_in_export(path: impl AsRef<Path>) -> Result<Vec<String>, LseError
             }
 
             for row in 0..rows {
+                // `peek` rather than `take`: `ByteArray` wraps `Option<Bytes>`, so a dictionary-
+                // backed clone is an atomic increment and its drop a decrement — two lock-prefixed
+                // RMWs per row, for a value only compared and dropped. NLL ends the borrow at the
+                // last use of `value`, which is why `advance` can follow.
                 let value = buffered
-                    .take(row)?
-                    .ok_or(LseError::NullValue { column: COL_SYMBOL })?;
-                let value = value.as_utf8()?;
+                    .peek(row)?
+                    .ok_or(LseError::NullValue { column: COL_SYMBOL })?
+                    .as_utf8()?;
                 // Compare before allocating: every artifact is single-symbol, so all but the first
                 // row of a file that can run to hundreds of thousands would otherwise allocate only
                 // to be discarded.
                 if !symbols.iter().any(|symbol| symbol == value) {
                     symbols.push(value.to_owned());
                 }
+                buffered.advance(row);
             }
         }
     }
@@ -748,16 +750,56 @@ pub fn symbols_in_export(path: impl AsRef<Path>) -> Result<Vec<String>, LseError
 /// - **The symbol on every row**, against [`LseExport::symbol`]. Cheap next to Parquet decode, and
 ///   the only thing that catches a file described by the wrong descriptor.
 /// - **Ascending `time_exchange`**, because `MarketDataStreamed` explicitly delegates that
-///   obligation to its source rather than checking it. **The comparison is `<=`**: timestamps are
-///   non-decreasing, not strictly ascending — 68% of adjacent rows tie on an equity tape — so
-///   requiring strict ascent would reject valid files.
+///   obligation to its source rather than checking it. How strictly depends on the layout: a tick
+///   or quote tape is checked as **non-decreasing**, since 68% of adjacent rows tie on an equity
+///   tape and requiring strict ascent would reject valid files; a candle artifact at a fixed
+///   resolution is checked as **strictly ascending**, since two bars of one series cannot share an
+///   open and therefore cannot share the close derived from it.
+/// - **Bar spacing against the declared resolution**, on a candle artifact at a fixed resolution.
+///   Consecutive bars of a compliant series are exactly one interval apart and a gap only ever
+///   makes that spacing *wider*, so spacing narrower than the declared interval means the file is
+///   at a finer resolution than the caller said — [`LseError::UnexpectedCandleResolution`], the same
+///   detector the vault path runs. It is the only thing *in this decoder* that can see that: an
+///   artifact records no resolution of its own, and the ordering check above is blind to it because
+///   a fixed interval is a constant shift from open to close and cancels out of every comparison it
+///   makes. An [`LseExport`] built by `download_export` is additionally cross-checked against the
+///   timeframe the job echoed back, but only when it echoed one at all.
+///
+/// # ⚠️ The `interval` check is one-directional
+/// It catches a file **finer** than declared — 1-minute bars declared `Day1`, which would otherwise
+/// yield strictly ascending closes with every bar claiming a 24-hour period overlapping the next
+/// 1,439.
+///
+/// It does **not** catch a file **coarser** than declared, and that is the worse of the two
+/// mistakes: daily bars declared `Min1` are spaced 24 hours apart, which is wider than the declared
+/// 60 seconds and indistinguishable from a genuine gap, so they decode cleanly — and each bar then
+/// enters the timeline a minute after its day opened rather than at the end of it, which is a full
+/// day of lookahead. The only evidence available is that *no* pair in the file is exactly one
+/// interval apart, which a streaming decoder cannot act on: it is a property of the whole artifact,
+/// unknown until every event has already been yielded, and a sparse but valid file can legitimately
+/// have no such pair. Nor does the check fire on a single-row artifact, which has no pair to
+/// measure, or on a **calendar** interval (`Month1`), which has no single width — February would
+/// false-positive against a 31-day one.
+///
+/// Nothing in an artifact records its own resolution, so within those limits only the caller can
+/// get this right — prefer [`LseExport`] built from a job whose `timeframe` is known, which
+/// `verify_job_covers_request` cross-checks.
+///
+/// # ⚠️ `instrument` is taken on trust — resolve it from the registry
+/// Nothing here can check it: [`InstrumentIndex`] is an unbounded `usize` read positionally by
+/// engine state, so a fabricated one attributes this file's prices to a different instrument or
+/// panics, and neither the artifact nor this decoder can tell. Obtain it from
+/// [`market::instrument_index_for`](super::market::instrument_index_for), which derives it from
+/// the registry the engine was built with and additionally rejects the quote-asset disagreement
+/// that would book a `.L` listing's pence as pounds — 100× wrong, silently. Passing a hand-built
+/// index bypasses both checks.
 ///
 /// # Errors
 /// See [`LseError::UnsupportedSchema`], [`LseError::SymbolMismatch`],
-/// [`LseError::NonMonotonicTimestamps`], [`LseError::PriceNotRepresentable`],
-/// [`LseError::TimestampNotRepresentable`], [`LseError::TimestampOverflow`] and
-/// [`LseError::Parquet`]. Decode errors are surfaced, never skipped, and the **first one ends the
-/// iterator** — see [`LseExportEvents`].
+/// [`LseError::NonMonotonicTimestamps`], [`LseError::UnexpectedCandleResolution`],
+/// [`LseError::PriceNotRepresentable`], [`LseError::TimestampNotRepresentable`],
+/// [`LseError::TimestampOverflow`] and [`LseError::Parquet`]. Decode errors are surfaced, never
+/// skipped, and the **first one ends the iterator** — see [`LseExportEvents`].
 pub fn read_export(
     export: &LseExport,
     instrument: InstrumentIndex,
@@ -799,6 +841,7 @@ pub fn read_export(
         exchange: export.exchange_id(),
         instrument,
         previous: None,
+        previous_open: None,
         failed: false,
         // Saturating rather than failing: the row count only feeds `size_hint`, which is a hint.
         remaining: usize::try_from(rows).unwrap_or(usize::MAX),
@@ -836,7 +879,17 @@ pub struct LseExportEvents {
     expected_symbol: String,
     exchange: ExchangeId,
     instrument: InstrumentIndex,
+    /// The last `time_exchange` yielded — the high-water mark the ordering rule is checked against.
     previous: Option<DateTime<Utc>>,
+    /// The last row's `ts` column, which for a candle layout is the bar's **open**.
+    ///
+    /// Distinct from `previous` above, which for a candle holds the *derived close*. The two track
+    /// different invariants: `previous` guards the timeline's order, this guards the artifact's bar
+    /// **spacing** against the declared resolution. Spacing is compared on opens rather than closes
+    /// — the two are equal for a fixed step, but only the opens are values a caller can find in
+    /// their own file, so only the opens are worth naming in the error. On a tick or quote layout
+    /// this simply mirrors `previous` and is never read.
+    previous_open: Option<DateTime<Utc>>,
     /// Set once any error has been yielded; see the type's documentation.
     ///
     /// Also what makes [`FusedIterator`](std::iter::FusedIterator) sound: a failing row leaves the
@@ -914,6 +967,7 @@ impl LseExportEvents {
 
                 // Every measured artifact holds one row group, but that is a property of the
                 // provider's writer rather than anything the format promises, so this loops.
+                self.check_discarded_volume(self.group);
                 self.cursor = Some(RowGroupCursor::open(&self.reader, self.group, &self.plan)?);
                 self.group += 1;
                 continue;
@@ -930,7 +984,17 @@ impl LseExportEvents {
             // Checked before anything else is read: it is the only check that catches a file
             // described by the wrong descriptor, and it compares bytes rather than allocating a
             // `String` per row for a column that is one dictionary-encoded value for the whole file.
-            match cursor.symbol.take(row)?.as_ref().map(ByteArray::data) {
+            //
+            // `peek`, not `take`: the value is compared and dropped, and cloning a `ByteArray` is
+            // two atomic refcount operations per row rather than the free copy the `f64` columns
+            // get. `advance` after the match completes the read.
+            //
+            // Both error arms return WITHOUT advancing, where the `take` this replaced advanced
+            // unconditionally — so on those paths the symbol cursor is left one row behind the
+            // other columns. That is sound only because `next` latches `failed` on any error and
+            // never calls `read_next` again, so no later row is decoded against the stale cursor.
+            // If that latch is ever removed, `advance` must move above the `match`.
+            match cursor.symbol.peek(row)?.map(ByteArray::data) {
                 Some(symbol) if symbol == self.expected_symbol.as_bytes() => {}
                 Some(symbol) => {
                     return Err(LseError::SymbolMismatch {
@@ -940,6 +1004,7 @@ impl LseExportEvents {
                 }
                 None => return Err(LseError::NullValue { column: COL_SYMBOL }),
             }
+            cursor.symbol.advance(row);
 
             let Some(micros) = cursor.ts.take(row)? else {
                 return Err(LseError::NullValue { column: COL_TS });
@@ -961,7 +1026,72 @@ impl LseExportEvents {
         self.decode(micros, &values).map(Some)
     }
 
-    /// Decode one row's values, enforcing the ordering invariant.
+    /// Warn, at most once per artifact, if the `volume` column a
+    /// [`QuoteFromPrice`](RowLayout::QuoteFromPrice) layout discards has stopped being the measured
+    /// constant zero.
+    ///
+    /// Answered from the row group's **column-chunk statistics**, which the writer already computed
+    /// and stored in the footer: a chunk whose `min` and `max` are both zero cannot contain a
+    /// non-zero value, so the whole column is cleared without reading a page of it. The previous
+    /// version decoded the column alongside the real ones and compared every row — one extra
+    /// `DOUBLE` chunk decompressed end to end, roughly 400 MB on a 50M-row artifact, for at most one
+    /// log line.
+    ///
+    /// # When statistics are absent
+    /// Nothing is reported for that row group. Writers are not required to emit statistics, and the
+    /// alternative — falling back to decoding the column — would reinstate exactly the cost this
+    /// avoids, on the artifacts least able to afford it. The check is an observability aid for a
+    /// column the layout discards either way, so failing to run it costs no correctness: the decoded
+    /// bid/ask are unaffected, which is the same reason a positive result warns rather than errors.
+    ///
+    /// The `warn` is deliberately not "a non-zero size": what it detects is "not the measured
+    /// `0.0`", and mislabelling that as a quantity sends a reader looking for the wrong thing.
+    ///
+    /// # NaN is not detected
+    /// Parquet writers exclude NaN from `min`/`max` by spec, so a chunk of `[0.0, NaN]` reports
+    /// bounds of `0.0`/`0.0` and an all-NaN chunk reports no bounds at all — neither warns. The
+    /// per-row check this replaced did catch NaN, since `value != 0.0` is true of it. That loss is
+    /// accepted for the same reason the absent-statistics case is: this is an observability aid for
+    /// a column the layout discards either way, and reinstating the per-row decode to catch it
+    /// would cost the whole column on every artifact.
+    fn check_discarded_volume(&mut self, group: usize) {
+        if self.warned_discarded_volume {
+            return;
+        }
+        let Some(column) = self.plan.discarded_volume else {
+            return;
+        };
+
+        let Some(statistics) = self
+            .reader
+            .metadata()
+            .row_group(group)
+            .column(column.leaf)
+            .statistics()
+        else {
+            return;
+        };
+
+        // `min`/`max` are `Option`s of their own: a chunk can carry a null count and no bounds.
+        // Absent bounds prove nothing, so they are treated as "not checked" rather than as zero.
+        let Statistics::Double(bounds) = statistics else {
+            return;
+        };
+        let populated = matches!(bounds.min_opt(), Some(min) if *min != 0.0)
+            || matches!(bounds.max_opt(), Some(max) if *max != 0.0);
+
+        if populated {
+            self.warned_discarded_volume = true;
+            warn!(
+                symbol = %self.expected_symbol,
+                "LSE quote export populated the `volume` column with a value other than the \
+                 measured `0.0`, which this layout discards: an L1 quote has no undifferentiated \
+                 size field. Reported once per artifact; the decoded bid/ask are unaffected"
+            );
+        }
+    }
+
+    /// Decode one row's values, enforcing the ordering and spacing invariants.
     fn decode(
         &mut self,
         micros: i64,
@@ -973,15 +1103,77 @@ impl LseExportEvents {
         // For a candle this is the bar's OPEN instant, so the payload decides the event time.
         let (time_exchange, kind) = self.decode_kind(values, observed)?;
 
-        // The invariant is `previous <= current`, not strict ascent: ties are the common case
-        // rather than an edge case, so only a step BACKWARDS is a violation.
-        if let Some(previous) = self.previous.filter(|previous| time_exchange < *previous) {
+        // The resolution this artifact was declared at, if it is a candle artifact at a FIXED one.
+        // Both checks below key on it, and both are therefore skipped for a CALENDAR step, because
+        // month arithmetic clamps day-of-month: `2024-01-30 + 1mo` and `2024-01-31 + 1mo` both land
+        // on `2024-02-29`, so two legitimate bars share a close, and `month` has no single width to
+        // compare a spacing against — February would false-positive against a 31-day one.
+        // `historical.rs` skips calendar steps in its own resolution check for the same reasons.
+        let fixed_candle = match self.plan.layout {
+            RowLayout::Candle { interval, .. } => match interval.to_step() {
+                IntervalStep::Fixed(width) => Some((interval, width)),
+                IntervalStep::Months(_) => None,
+            },
+            _ => None,
+        };
+
+        // ORDER. The rule is LAYOUT-DEPENDENT, because "two rows share an instant" means different
+        // things on the two shapes.
+        //
+        // On a TICK or QUOTE tape a tie is the common case rather than an edge case — 68% of
+        // adjacent rows tie on an equity tape, since several prints can share a microsecond — so
+        // only a step backwards is a violation.
+        //
+        // On a CANDLE artifact at a FIXED resolution a tie is impossible: two bars of one series
+        // cannot share an open, so they cannot share the close derived from it. A duplicate there
+        // means the file holds more than one series, or repeats a row.
+        let violated = self.previous.filter(|previous| {
+            if fixed_candle.is_some() {
+                time_exchange <= *previous
+            } else {
+                time_exchange < *previous
+            }
+        });
+        if let Some(previous) = violated {
             return Err(LseError::NonMonotonicTimestamps {
                 previous,
                 found: time_exchange,
             });
         }
+
+        // RESOLUTION. Consecutive bars of a compliant fixed-interval series are exactly one
+        // interval apart, and a gap (a weekend, an exchange holiday, a quiet symbol) only ever
+        // makes that spacing WIDER — so spacing NARROWER than the declared interval means the
+        // artifact is at a finer resolution than the caller declared, and every `close_time`
+        // derived above is wrong.
+        //
+        // Nothing else here can see that. An artifact records no resolution of its own, the bars
+        // still ascend, and the ORDER check above is blind to it by construction: a fixed interval
+        // is a constant shift from open to close, so it cancels out of every comparison made there
+        // and a mis-declared one still yields distinct, strictly ascending closes. Spacing is the
+        // one property that distinguishes it — the same detector `historical.rs` runs against the
+        // vault's habit of answering a misspelled resolution parameter with 1-minute bars.
+        //
+        // Compared on OPENS, which is what `ts` carries. The two spacings are equal for a fixed
+        // step, so the choice is purely about what the error names: an open is a value the caller
+        // can find in their own file, where the close is one this decoder invented.
+        //
+        // Only the finer-than-declared direction is reachable; see `read_export`.
+        if let (Some((interval, width)), Some(previous_open)) = (fixed_candle, self.previous_open) {
+            let actual = observed - previous_open;
+            if actual < width {
+                return Err(LseError::UnexpectedCandleResolution {
+                    symbol: self.expected_symbol.clone(),
+                    interval,
+                    previous_open,
+                    open: observed,
+                    actual,
+                });
+            }
+        }
+
         self.previous = Some(time_exchange);
+        self.previous_open = Some(observed);
 
         Ok(MarketEvent {
             time_exchange,
@@ -1013,9 +1205,10 @@ impl LseExportEvents {
                     required(values, ask, "ask")?,
                 ),
             )),
-            RowLayout::QuoteFromPrice { price, ask, volume } => {
+            RowLayout::QuoteFromPrice { price, ask } => {
                 // `price` is the bid; `ask` is nullable on these datasets, so a null row yields a
-                // one-sided book rather than a fabricated ask.
+                // one-sided book rather than a fabricated ask. The `volume` column these artifacts
+                // also carry is not read here at all — see `check_discarded_volume`.
                 let bid = required(values, price, "price")?;
                 let kind = match optional(values, ask)? {
                     Some(ask) => quote(time, bid, ask),
@@ -1025,33 +1218,6 @@ impl LseExportEvents {
                         best_ask: None,
                     }),
                 };
-
-                // The measurement that says this column is a constant zero is not re-run per
-                // artifact, so check rather than assume. A zero is the measured state and says
-                // nothing; only a real size means the provider started using the column. Warned
-                // once and not escalated: the quote itself is still correct, and failing a whole
-                // decode over a column this layout has nowhere to put would be worse than
-                // reporting it.
-                if !self.warned_discarded_volume
-                    && let Some(slot) = volume
-                    && values
-                        .get(slot)
-                        .copied()
-                        .flatten()
-                        .is_some_and(|volume| volume != 0.0)
-                {
-                    self.warned_discarded_volume = true;
-                    warn!(
-                        symbol = %self.expected_symbol,
-                        // Deliberately not "a non-zero size": the comparison is also true of a
-                        // NaN, which is not a size at all, and mislabelling garbage as a quantity
-                        // would send a reader looking for the wrong thing.
-                        "LSE quote export populated the `volume` column with a value other than \
-                         the measured `0.0`, which this layout discards: an L1 quote has no \
-                         undifferentiated size field. Reported once per artifact; the decoded \
-                         bid/ask are unaffected"
-                    );
-                }
 
                 Ok((time, kind))
             }

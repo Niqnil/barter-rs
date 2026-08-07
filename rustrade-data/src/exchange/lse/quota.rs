@@ -87,18 +87,43 @@ impl QuotaStatus {
         u32::try_from(self.historical_data_months).ok()
     }
 
-    /// Whether any metered dimension is exhausted.
+    /// Whether the **byte** allowance is exhausted, on either window.
+    ///
+    /// This is the one that gates reading data — streaming candles over REST, downloading an
+    /// artifact — because bytes are what those spend.
+    #[must_use]
+    pub fn is_byte_allowance_exhausted(&self) -> bool {
+        self.bytes_remaining_month() == 0 || self.bytes_remaining_week() == 0
+    }
+
+    /// Whether this hour's **export submit** allowance is exhausted.
+    ///
+    /// Gates [`submit_export`](super::vault::LseVaultClient::submit_export) and nothing else.
+    /// Downloading an artifact from a job already submitted spends bytes, not exports.
+    #[must_use]
+    pub fn is_export_allowance_exhausted(&self) -> bool {
+        self.exports_remaining_hour() == 0
+    }
+
+    /// Whether **any** metered dimension is exhausted.
     ///
     /// Covers only the dimensions the provider reports as used-against-cap (monthly bytes, weekly
     /// bytes, hourly exports). The static limits — [`calls_per_minute`](Self::calls_per_minute),
     /// [`max_rows_per_request`](Self::max_rows_per_request),
     /// [`vault_concurrency`](Self::vault_concurrency) — are request-shaping constraints with no
     /// running total, so they cannot be "exhausted" and are excluded.
+    ///
+    /// # Usually the wrong question
+    /// The dimensions meter **different operations**, so the union is only right for a consumer
+    /// that does all of them. Gating a candle backfill on this stops fetching for up to an hour
+    /// after five exports, with terabytes of byte allowance untouched and nothing about the fetches
+    /// actually blocked. Gate on the dimension the operation spends:
+    /// [`is_byte_allowance_exhausted`](Self::is_byte_allowance_exhausted) for reading data,
+    /// [`is_export_allowance_exhausted`](Self::is_export_allowance_exhausted) for submitting an
+    /// export.
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
-        self.bytes_remaining_month() == 0
-            || self.bytes_remaining_week() == 0
-            || self.exports_remaining_hour() == 0
+        self.is_byte_allowance_exhausted() || self.is_export_allowance_exhausted()
     }
 }
 

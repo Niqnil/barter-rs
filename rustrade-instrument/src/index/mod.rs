@@ -66,8 +66,9 @@ impl IndexedInstruments {
     ///
     /// # Errors
     /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two `Instrument`s share an
-    /// [`InstrumentNameInternal`] — see [`IndexedInstrumentsBuilder::try_build`] for why that
-    /// invariant exists.
+    /// [`InstrumentNameInternal`], or [`IndexError::InvalidContractSize`] if an `Instrument`
+    /// carries a non-positive `contract_size` — see [`IndexedInstrumentsBuilder::try_build`] for
+    /// why both invariants exist.
     pub fn try_new<Iter, I>(instruments: Iter) -> Result<Self, IndexError>
     where
         Iter: IntoIterator<Item = I>,

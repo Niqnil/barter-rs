@@ -1,8 +1,11 @@
 use crate::exchange::lse::error::LseError;
 use crate::subscription::candle::CandleInterval;
+use rustrade_instrument::asset::name::AssetNameInternal;
+use rustrade_instrument::instrument::name::InstrumentNameExchange;
+use rustrade_instrument::instrument::quote::InstrumentQuoteAsset;
 use rustrade_instrument::{
-    Underlying, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::market_data::kind::MarketDataInstrumentKind,
+    Underlying, asset::name::AssetNameExchange, exchange::ExchangeId, index::IndexedInstruments,
+    instrument::InstrumentIndex, instrument::market_data::kind::MarketDataInstrumentKind,
 };
 use smol_str::{SmolStr, StrExt};
 
@@ -259,6 +262,100 @@ pub fn underlying(symbol: &str) -> Underlying<AssetNameExchange> {
     };
 
     Underlying::new(AssetNameExchange::new(base.to_uppercase_smolstr()), quote)
+}
+
+/// Resolve the [`InstrumentIndex`] a display symbol was registered under.
+///
+/// # Why derive it rather than accept one
+/// [`InstrumentIndex`] is a public, unbounded `usize`, and engine state indexes positionally — a
+/// fabricated index attributes a symbol's prices to a different instrument, or panics. Deriving it
+/// from the registry the engine was actually built with makes both unrepresentable, and catches the
+/// typo (`BP` for `BP.L`) that would otherwise yield an instrument that silently never marks.
+///
+/// # The quote asset is checked here too
+/// This is where the provider's view of a symbol and the caller's registry meet, so it is where a
+/// disagreement between them is visible. The provider publishes no unit alongside a price, which
+/// makes the registered asset *the* unit: a `.L` listing registered against `gbp` rather than the
+/// `gbx` [`quote_asset`] derives for it books pence as pounds, and every notional, fee, PnL and
+/// balance downstream is 100× wrong with nothing to object. See [`quote_asset`] for why London
+/// listings are a distinct asset rather than a scaled one.
+///
+/// The instrument's *pricing* asset is what is compared — [`InstrumentQuoteAsset::UnderlyingBase`]
+/// selects the base — because that is the one the provider's number is denominated in.
+///
+/// # This is the ingest path's obligation, and the check reaches only its callers
+/// [`LseCandleSource::resolve`](super::backtest::LseCandleSource::resolve) performs it on the
+/// candle-replay path. On the export path `parquet::read_export` does **not**: it takes its
+/// `instrument` argument on trust, and callers should obtain that argument here. Constructing an
+/// [`InstrumentIndex`] by hand and passing it to either bypasses this
+/// — [`LseCandleSource::new`](super::backtest::LseCandleSource::new) exists for callers who have no
+/// registry to check against, and carries no protection.
+///
+/// It lives in this module rather than in `parquet` because it is registry symbology, not artifact
+/// decoding: the candle path needs it and is **not** gated behind `lse-parquet`, so a consumer
+/// building with `--features lse` alone could not otherwise reach it. Those two references are
+/// deliberately not intra-doc links for the same reason — the item they name is absent from that
+/// build.
+///
+/// # Errors
+/// - [`LseError::UnknownInstrument`] if no instrument on `exchange` carries `symbol` as its
+///   exchange-side name, listing what is registered there.
+/// - [`LseError::QuoteAssetMismatch`] if it does, but prices it in a different asset than the
+///   provider quotes that symbol in.
+pub fn instrument_index_for(
+    instruments: &IndexedInstruments,
+    exchange: ExchangeId,
+    symbol: &str,
+) -> Result<InstrumentIndex, LseError> {
+    let wanted = InstrumentNameExchange::new(symbol);
+
+    let instrument = instruments
+        .instruments()
+        .iter()
+        .find(|keyed| keyed.value.exchange.value == exchange && keyed.value.name_exchange == wanted)
+        .ok_or_else(|| LseError::UnknownInstrument {
+            symbol: symbol.to_owned(),
+            exchange,
+            registered: instruments
+                .instruments()
+                .iter()
+                .filter(|keyed| keyed.value.exchange.value == exchange)
+                .map(|keyed| keyed.value.name_exchange.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })?;
+
+    let pricing_asset = match instrument.value.quote {
+        InstrumentQuoteAsset::UnderlyingQuote => instrument.value.underlying.quote,
+        InstrumentQuoteAsset::UnderlyingBase => instrument.value.underlying.base,
+    };
+
+    // An `AssetIndex` held by an indexed instrument was issued by this same registry, so the
+    // lookup cannot miss; treating a miss as a mismatch would report the wrong problem, so it is
+    // mapped to the registry's own error rather than folded in.
+    let registered =
+        instruments
+            .find_asset(pricing_asset)
+            .map_err(|error| LseError::UnknownInstrument {
+                symbol: symbol.to_owned(),
+                exchange,
+                registered: error.to_string(),
+            })?;
+
+    // Compared on `name_internal`: that is the identity the engine keys assets by, so `GBX` and
+    // `gbx` are one asset and `GBP` is a different one — which is exactly the distinction that
+    // matters here.
+    let expected = AssetNameInternal::new(quote_asset(symbol).name().clone());
+    if registered.asset.name_internal != expected {
+        return Err(LseError::QuoteAssetMismatch {
+            symbol: symbol.to_owned(),
+            exchange,
+            expected: expected.to_string(),
+            registered: registered.asset.name_internal.to_string(),
+        });
+    }
+
+    Ok(instrument.key)
 }
 
 /// Derives the dataset slug for a London Strategic Edge display symbol.

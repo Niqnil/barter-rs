@@ -86,9 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path — stamping the open would let a strategy act on a completed bar at the instant its period
   began. Ascending timestamps are enforced by the decoder, since the streaming backtest source
   delegates that obligation rather than checking it; the comparison permits ties, which are the
-  common case on an equity tape. `instrument_index_for` derives the `InstrumentIndex` from the
-  registry the engine was built with, so a fabricated or typo'd index is unrepresentable, and every
-  row's symbol is checked against the descriptor. The iterator **ends at its first error**: the
+  common case on an equity tape. `lse::market::instrument_index_for` derives the `InstrumentIndex`
+  from the registry the engine was built with, so a fabricated or typo'd index is unrepresentable
+  for callers who use it — `read_export` takes the index on trust and cannot check it itself — and
+  every row's symbol is checked against the descriptor. The iterator **ends at its first error**: the
   symbol and ordering checks are verdicts on the whole file rather than per-row conditions, so
   continuing would hand a caller who discards errors a silently truncated view of an artifact
   already proven corrupt.
@@ -419,6 +420,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **⚠️ This renames every config-derived instrument**, e.g. `binance_spot-btc_usdt` →
   `binance_spot-btcusdt` for a config whose `name_exchange` is `BTCUSDT`. The same persisted-state
   migration applies as for the `InstrumentNameInternal` fix below — see that entry.
+  **⚠️ It also renumbers `InstrumentIndex`.** `IndexedInstrumentsBuilder` sorts instruments by
+  `name_internal`, so changing that key changes the sort order and therefore which instrument each
+  index denotes. Indices are read **positionally** into engine state, the audit replica and
+  backtest replay streams, so any state persisted under the old naming — snapshots, recorded
+  audit streams, serialized `InstrumentIndex` values — refers to different instruments after this
+  change and cannot be loaded against a new build. Rebuild it from the config rather than
+  migrating it in place. Ordering is unaffected only where a config's `name_exchange` happens to
+  sort identically to its old `base`/`quote` derivation, which is not something to rely on.
 
 - **`load_trades_from_dbn` / `load_quotes_from_dbn` now document a caller obligation**
   (`rustrade-data`, `databento` feature; documentation only, no behaviour change). Both tag every
@@ -432,37 +441,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine fed a candle-only feed was silently inert — `price()` returned `None`, no position could be
   valued, and nothing reported a problem. Candle-first data sources therefore required a custom
   `InstrumentDataState` that every user had to copy from an example.
-  **This changes behaviour for existing feeds, in two ways.** An instrument receiving candles (or
-  candles and trades) with no L1 book now has a price where it previously had none. And `price()`
-  now ranks **all three** inputs by recency instead of giving the L1 book unconditional precedence,
-  so **an instrument with both an L1 book and trades — no candles involved — can now be marked from
-  a trade**, whenever that trade is newer than the book's `last_update_time`. Both move
-  `pnl_unrealised` and anything derived from it.
-  The rule: each candidate is stamped with the instant it describes — the L1 book's
-  `last_update_time`, a candle's `close_time`, a trade's `Timed::time` — and the newest wins. An
-  **exact** tie is broken by granularity, finest first: L1 book, then trade, then candle (a trade
-  stamped at a bar's `close_time` belongs to the next period, since `close_time` is the exclusive
-  period end). Recency rather than any fixed precedence is deliberate: a fixed order lets a stale
-  input shadow a fresh one indefinitely — on a mixed feed one provider alone can produce, such as a
-  session of quote ticks followed by a year of daily bars, a year-old book would mark every position
-  after it, `pnl_unrealised` would stop moving, and the tear sheet would look entirely normal.
+  **This changes behaviour for existing feeds.** An instrument receiving candles (or candles and
+  trades) with no L1 book now has a price where it previously had none, moving `pnl_unrealised` and
+  anything derived from it. An instrument with only an L1 book and trades — no candles — is
+  unaffected: the book still wins outright.
+  The rule ranks the two *regimes* differently, because the three stamps are not drawn from one
+  clock. **Within the tick regime, fixed precedence:** the L1 book wins over the last trade
+  whenever it has a mid to contribute (a one-sided or never-received book contributes nothing and
+  falls through to the trade, so the precedence never costs a price). `OrderBookL1::last_update_time`
+  is a *payload* field and several venues publish no book instant at all, so their connectors stamp
+  it from the host clock, while a trade's `time_exchange` is the venue's own — ranking those against
+  each other would let a host running a few hundred milliseconds behind the venue flip every mark
+  from the book mid to the last trade, and an NTP step flip it back, with no log and no error.
+  **Across regimes, recency:** a candle wins when its `close_time` is strictly later than the held
+  tick's stamp. A fixed order there would let a stale input shadow a fresh one indefinitely — on a
+  mixed feed one provider alone can produce, such as a session of quote ticks followed by a year of
+  daily bars, a year-old book would mark every position after it and the tear sheet would look
+  entirely normal. That gap is usually a regime change measured in days to years, which survives
+  clock skew of any realistic size — though subscribing to L1 and candles concurrently is supported,
+  and on a venue whose book instant is host-stamped that narrows it to the bar interval, leaving a
+  skew-sized window after each bar close. An exact tie goes to the tick, since `close_time` is the
+  exclusive period end and an observation stamped at that instant belongs to the next period.
+  *Known limitation, stated on the method:* the flip side of the fixed precedence is that an L1 book
+  which **freezes while trades keep arriving** shadows those trades until it resumes. A strategy
+  needing trade-led marks on such a feed should implement its own `InstrumentDataState`.
   The struct gains a `candle: Option<Candle>` field, so its positional `new()` and its serialized
-  shape both change. It is now `#[serde(default)]`, so state written by a build predating the field
-  still deserializes with `candle: None` instead of failing on a missing key — serde requires an
-  absent field to be declared defaultable even when its type is `Option`, and deriving `Default` does
-  not change that. Given that engine state is persisted, replicated to the audit path and replayed,
-  a snapshot from an older build failing to load outright would be the more disruptive default.
+  shape both change. `#[serde(default)]` is applied to **that field only, not to the container**, so
+  state written by a build predating the field still deserializes with `candle: None` instead of
+  failing on a missing key — serde requires an absent field to be declared defaultable even when its
+  type is `Option`, and deriving `Default` does not change that. Per field rather than
+  container-wide because `l1`'s `Default` is not a neutral value: a container-level default would
+  make a snapshot truncated before `l1` load as an epoch-stamped empty book, which `price()` reports
+  as "no price yet" — indistinguishable from an instrument that never ticked. Such a snapshot is
+  now rejected.
   `OrderBook` (L2), `Liquidation` and `OptionGreeks` remain excluded, now with a
   stated reason each in place of the catch-all; `Liquidation` in particular is a forced fill at a
   potentially dislocated price and must never reach `price()`.
 
-- **`OrderBookL1::last_update_time` now documents a producer obligation** (`rustrade-data`). It must
-  carry the venue's own instant and match the wrapping `MarketEvent::time_exchange`. Downstream
-  state orders L1 updates on this field rather than on the event's, so a custom connector stamping
-  it from a local or aggregator clock gets two effects with no error and no log: a staleness guard
-  keyed on it can reject legitimately newer updates and freeze the held book, and recency ranking
-  against trades and candles goes wrong, silently moving `pnl_unrealised`. Every in-tree producer
-  already satisfies this; only the contract is new.
+- **`OrderBookL1::last_update_time` now documents a producer obligation, and names the in-tree
+  producers that cannot meet it** (`rustrade-data`). It should carry the venue's own instant and
+  match the wrapping `MarketEvent::time_exchange`. Downstream state orders L1 updates on this field
+  rather than on the event's, so a connector stamping it from a local clock gets a staleness guard
+  keyed on it that can reject legitimately newer updates and freeze the held book.
+  **Not every in-tree producer satisfies it, and the docs now say so.** Binance Spot's `bookTicker`
+  payload carries no venue timestamp (the deserializer defaults the field to `Utc::now()`), and the
+  IBKR quote path stamps it from a host-clock parameter. Both are venue limitations rather than
+  connector defects — there is no instant to carry — so the field is documented as best-effort with
+  the two exceptions named at the site. `DefaultInstrumentMarketData::price` was changed to stop
+  ranking this stamp against a venue trade stamp for exactly this reason; see that entry.
 
 - **`BacktestMarketData::stream()` items are now `Result<_, BarterError>`, and a source failure
   aborts the backtest** (`rustrade`). The item type was infallible, which was adequate only while
@@ -540,15 +566,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected is now accepted as "unknown"; a pre-migration `{"volume": 0}` still reads back as
   `Some(0)`, and `None` serializes as an explicit `null` rather than being skipped.
 
-- **BREAKING: Massive aggregates now declare what their volume counts, and forex bars report
-  `volume: None`** (`rustrade-data`, `massive` feature). Two provider facts were being read as if
-  they said something else, and both produced numbers that look ordinary:
-  - A forex aggregate's `v` is **not traded volume**. The provider generates forex bars "from quoted
-    bid/ask prices rather than executed trades", so `v` counts quote updates — a quantity with no
-    units in common with a share count, which a VWAP, a volume filter or a liquidity screen would
-    consume as though it had. Forex bars now report `volume: None`, the crate's existing "the venue
-    reports none" signal, on both the REST and the WebSocket path. Their `n` (transaction count) is
-    documented as a count on every market and is still passed through.
+- **BREAKING: Massive aggregates now declare what they were built from, and forex bars report
+  `volume: None` *and* `trade_count: None`** (`rustrade-data`, `massive` feature). Two provider
+  facts were being read as if they said something else, and both produced numbers that look
+  ordinary:
+  - A forex aggregate's `v` and `n` are **not traded volume and not a transaction count**. The
+    provider generates forex bars "from quoted bid/ask prices rather than executed trades", so `v`
+    counts quote updates — a quantity with no units in common with a share count, which a VWAP, a
+    volume filter or a liquidity screen would consume as though it had. `n` is documented just as
+    generically ("the number of transactions in the aggregate window"), and the same fact overrides
+    it: a bar generated from quotes contains no transactions, so `n` is a quote-update count too —
+    the same quantity as `v`, differing only in units. Gating one and passing the other through
+    would leave `candle.trade_count` reporting quote ticks in the hundreds per minute regardless of
+    liquidity, so a `trade_count >= 50` liquidity filter would pass on every forex bar and look like
+    it was working — bit-for-bit the defect gating `v` removes. Forex bars now report **both** as
+    `None`, the crate's existing "the venue reports none" signal, on the REST and the WebSocket
+    path alike.
   - The WebSocket aggregate's `z` is documented verbatim as *"The average trade size for this
     aggregate window"* and was being decoded as a trade **count**. `WsAggregateMsg.trade_count:
     Option<u64>` is therefore renamed `average_trade_size: Option<Decimal>`. The `u64` was also a
@@ -557,12 +590,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     aggregates now report `trade_count: None`; REST keeps its `n`.
 
   `AggregateBar::into_candle`, `AggregateBar::into_candle_with_step` and
-  `WsAggregateMsg::into_candle` gain a leading `AggregateVolume` parameter (`Traded` /
-  `QuoteTicks`) so the classification is made once, at the call site that knows the ticker, rather
-  than re-derived per bar. `AggregateVolume::for_ticker` applies the provider's own `C:` prefix
-  convention, matched ASCII case-insensitively since nothing upstream normalises a caller-supplied
-  ticker. Migration: pass `AggregateVolume::for_ticker(ticker)`, or `AggregateVolume::Traded` if
-  the ticker is known to be an equity.
+  `WsAggregateMsg::into_candle` gain a leading `AggregateProvenance` parameter (`TradeTape` /
+  `QuoteTape`) so the classification is made once, at the call site that knows the ticker, rather
+  than re-derived per bar. The type names the bar's **source**, not one of its fields, because that
+  is what the provider fact is about and what decides the meaning of every activity count on the
+  bar. `AggregateProvenance::for_ticker` applies the provider's own `C:` prefix convention, matched
+  ASCII case-insensitively since nothing upstream normalises a caller-supplied ticker. Migration:
+  pass `AggregateProvenance::for_ticker(ticker)`, or `AggregateProvenance::TradeTape` if the ticker
+  is known to be an equity.
 
 - **BREAKING: `IbkrHistoricalData::fetch_option_chain` now returns `OptionChainResult`, and no
   longer discards already-decoded entries on a mid-stream IB error** (`rustrade-data`, `ibkr`
@@ -703,6 +738,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Field/read access is unchanged (auto-derefs through the box: `order.key`, `order.state`).
   **No wire change**: `Box<T>` serializes identically to `T`.
 
+- **BREAKING: `DataError::Lse` carries a machine-readable `kind`** (`rustrade-data`, `lse`
+  feature). The variant was `Lse(String)`, so a consumer could not tell a resumable
+  `LseError::RateLimited` from a terminal `LseError::Deserialize` without substring-matching a
+  `Display` — a classification that changes on any wording edit. It is now
+  `Lse { kind: LseErrorKind, message: String }`, matching the shape the sibling `DataError::Databento`
+  already uses. `LseError` itself cannot be nested structurally (it wraps a `reqwest::Error`, which
+  is neither `Clone` nor serialisable), so the flattening stays — but the classification now
+  survives it. The new public `LseErrorKind` is `#[non_exhaustive]` with eight variants
+  (`Authentication`, `RateLimit`, `Network`, `Timeout`, `Api`, `Decode`, `InvalidInput`, `Io`) and
+  an `is_resumable()` predicate; `LseError::kind()` derives it through an **exhaustive** match, so a
+  new `LseError` variant is a compile error here rather than a silent fall-through to a default.
+  Migration: `DataError::Lse(message)` → `DataError::Lse { message, .. }`, or match `kind` where the
+  distinction matters.
+
+- **BREAKING: `DataError` is now `#[non_exhaustive]`** (`rustrade-data`). Variants are added as
+  integrations land, and two of them (`Databento`, `Lse`) exist only under their own feature — so
+  the variant set a downstream `match` sees already depended on the feature selection it built with,
+  and a wildcard arm was already required in practice. The attribute makes that a compile-time
+  contract instead of something a consumer discovers when a feature flag or a release moves, and
+  matches the sibling `LseError`, `IndexError` and the new `LseErrorKind`. Matches inside
+  `rustrade-data` stay exhaustively checked, so a new variant is still a compile error at every
+  in-crate site. Bundled with the `DataError::Lse` reshape above so downstream matchers absorb one
+  breaking window rather than two. Migration: add a `_ => ...` arm to any exhaustive `match` on
+  `DataError`.
+
+- **BREAKING: `IndexedInstruments` now rejects a non-positive `contract_size`** (`rustrade-instrument`).
+  `contract_size` multiplies every money quantity derived from an instrument — quote notional,
+  realised and unrealised PnL, and any notional-scaled fee model — and neither degenerate value
+  failed anywhere downstream. Zero makes all three zero, so a backtest trades freely, is charged
+  nothing, never moves, and reads as a strategy that found no edge; a negative value inverts the
+  sign of PnL, so a losing strategy reports a profit. `try_build`/`try_new` now return the new
+  `IndexError::InvalidContractSize` (and `build`/`new` panic with it, as they already do for a
+  duplicate name). Checked through `InstrumentKind::contract_size`, so it covers `Perpetual`,
+  `Future`, `Option` and `Cfd` uniformly — `Spot` reports a hard `Decimal::ONE` and can never trip
+  it. **Breaking** for any configuration that was silently carrying a zero or negative multiplier;
+  such a collection now fails at build time rather than producing a meaningless run.
+  `IndexError` is `#[non_exhaustive]`, so the variant itself is additive.
+
+- **`LseVaultClient::submit_export` rejects a wholly-future range** (`rustrade-data`, `lse`
+  feature). The export allowance is five per hour and a rejected submit still consumes one, so a
+  fat-fingered year burned an export and returned a valid, complete-schema, **zero-row** artifact
+  with no error at any layer — the provider's silent-empty trap. The new pure predicate
+  `LseExportRange::is_wholly_after(today)` is checked at submit against `Utc::now().date_naive()`,
+  leaving the constructor pure and testable. It allows **one full day of slack**: the maximum real
+  UTC offset is +14, so a caller's local "today" can be at most UTC's tomorrow. It therefore cannot
+  false-positive on a legitimately-today range while still catching a wrong year.
+
+- **The `"ALL"` export rejection is now scoped to the equity datasets** (`rustrade-data`, `lse`
+  feature). `"ALL"` is a literal that matches nothing rather than a request for every symbol, so an
+  export naming it spends one of five hourly exports on an empty artifact — but `ALL` is also
+  Allstate's real ticker, which is why the rejection is case-sensitive. It now applies only to
+  `LseDataset::Stocks | Etf`, the classes that share the venue and symbology where that listing
+  exists; on any other dataset `"ALL"` is rejected without the Allstate caveat in the message. The
+  error text is dataset-aware for the same reason.
+
+- **`QuotaStatus::is_exhausted` split into two predicates** (`rustrade-data`, `lse` feature).
+  London Strategic Edge meters streaming and bulk export against one shared allowance, but they are
+  separate dimensions: a consumer gating a candle backfill on the combined answer stopped fetching
+  for up to an hour after five exports, with terabytes of byte allowance left. `is_byte_allowance_exhausted()`
+  and `is_export_allowance_exhausted()` are the ones to branch on; `is_exhausted()` remains as their
+  union, now documented as usually the wrong question.
+
+- **`take_market` rejects a backwards `time_exchange` in release, not only under `debug_assert`**
+  (`rustrade`, `backtest`). `MarketDataInMemory::new` hard-asserts ascending order in release,
+  commented that an unsorted stream "would silently produce a non-monotonic clock and wrong
+  simulation results in release". `MarketDataStreamed` pushed that obligation to the caller's
+  factory, where the only check was a `debug_assert` inside `merge_time_sorted` — compiled out of
+  release, and present at all only if the factory happened to use that helper. An out-of-order event
+  is now recorded as `BarterError::BacktestMarketData` and ends the stream through the existing
+  source-failure path, so a wrong run fails rather than returning `Ok` with a normal-looking
+  summary. The message names both instants. Repeated timestamps are still accepted (ties are the
+  common case on a tape) and `MarketStreamEvent::Reconnecting` is not treated as out-of-order.
+  `TimedMergeStream` is now **fused** and implements `FusedStream`, without which the abort was not
+  an abort: the next poll fell through to draining the aux stream, emitting events at instants the
+  market data never reached.
+
 ### Removed
 
 - **`EngineOutput::OptionPositionsUnadjustedForSplit`** (`rustrade`). The placeholder option-split
@@ -721,6 +832,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **LSE candle pages are now checked for ordering and resolution instead of assumed correct**
+  (`rustrade-data`, `lse` feature). Two provider behaviours the module compensates for were pinned
+  by documentation only. Each page is now scanned in a **pre-pass** before any bar is yielded, and
+  two new `LseError` variants reject the whole page:
+  - `NonMonotonicCandlePage` — ascending order is how the vault answers today, not something it
+    guarantees, and the pagination cursor depends on it: the cursor advances past the newest open a
+    page carried, so a page served newest-first would advance it to the end of the range, make the
+    next page empty (the documented end-of-data signal), and return `Ok` with 5,000 of 3,000,000
+    bars. `previous_open` is carried **across** pages, so the check spans the seam.
+  - `UnexpectedCandleResolution` — the vault answers `200` to a misspelled `timeframe` and silently
+    defaults to 1-minute bars in a byte-identical response shape. A `Day1` request would then
+    receive 1,440 one-minute rows per day, each stamped `close_time = open + 24h` by this module's
+    own boundary arithmetic: overlapping, wrong, and invisible to every other check, since the range
+    bounds are still satisfied and the series still ascends. Spacing is the one property that
+    distinguishes it — consecutive bars of a compliant fixed-interval series are exactly one
+    interval apart, and a gap only ever makes spacing *wider*. Checked for
+    `IntervalStep::Fixed` resolutions only: a calendar step (`month`, `quarter`, `year`) has no
+    single width to compare against, and February would false-positive against a 31-day one.
+  Structural properties of a page reject the whole page; the per-row *range* trim stays in the yield
+  loop, so a well-formed page still yields its in-range bars before failing. `LseError` is
+  `#[non_exhaustive]`, so both variants are additive.
+
+- **The Parquet decoder's monotonicity rule is now layout-dependent** (`rustrade-data`,
+  `lse-parquet` feature). The rule was `<=` for every layout — correct for a tick or quote tape,
+  where several prints routinely share a microsecond, and wrong for a **candle** artifact, where two
+  bars of one series cannot share an open and therefore cannot share the close derived from it. A
+  tie there means the file holds more than one series, or repeats a row. Candle artifacts at a fixed
+  resolution are now required to be strictly ascending; tapes still permit ties, and so do calendar
+  intervals — month arithmetic clamps day-of-month, so `2024-01-30` and `2024-01-31` both close on
+  `2024-02-29` and strictness would reject a valid file.
+  Ordering alone cannot catch a mis-declared `interval` — a fixed interval is a constant shift from
+  open to close, so it cancels out of that comparison and a file of 1-minute bars declared `Day1`
+  still ascends strictly. That is now a separate check; see below.
+
+- **⚠️ The Parquet decoder now rejects a candle artifact finer than the resolution it was decoded
+  at** (`rustrade-data`, `lse-parquet` feature). Nothing in a Parquet artifact records the
+  resolution it was written at, so `read_export` derives every `close_time` from a
+  caller-supplied `interval` — cross-checked only by `verify_job_covers_request`, which is skipped
+  when the job echoes no timeframe and absent altogether for `LseExport::new`, the documented entry
+  point for a file obtained out of band. Declaring `Day1` over a file of 1-minute bars therefore
+  produced 390 "daily" bars per trading day, each claiming a 24-hour period overlapping the next
+  1,439, ascending and without error.
+  `read_export` now measures **bar spacing** against the declared interval — the same detector the
+  vault path runs, raising the same `LseError::UnexpectedCandleResolution`. Consecutive bars of a
+  compliant fixed-interval series are exactly one interval apart, and a gap only ever makes spacing
+  *wider*, so spacing narrower than the declared interval means the file is finer than it was said
+  to be. Compared on the opens the `ts` column carries rather than the closes the decoder derives,
+  so the error names instants a caller can find in their own file.
+  **This is a new rejection path on a public decode API**: an artifact that previously decoded may
+  now yield an error mid-iteration.
+  Its reach, which the rustdoc now states rather than leaving implied: it catches **finer than
+  declared**, and cannot catch **coarser** than declared — daily bars decoded as `Min1` are spaced
+  wider than 60 seconds, indistinguishable from a genuine gap, and each bar then enters the timeline
+  a minute after its day opened rather than at the end of it, a full day of lookahead. It also
+  cannot fire on a single-row artifact, and calendar intervals (`Month1`) are exempt for the same
+  reason they are exempt from strict ascent.
+
+- **The LSE GBX protection now runs on the candle-replay path, and is stated as the export path's
+  caller obligation**
+  (`rustrade-data`, `lse` feature). `lse::market::quote_asset` computed the right answer but had no
+  caller outside its own tests, so a user registering `BP.L` with quote asset `gbp` got pence booked
+  as pounds — `BP.L` prints ~548 where BP trades around £5.48, so every notional, fee, unrealised
+  PnL and balance was 100× wrong with nothing downstream able to notice. The check now runs inside
+  `instrument_index_for`, where the provider's view of a symbol and the caller's registry meet, and
+  a disagreement is the new `LseError::QuoteAssetMismatch`. It compares the instrument's **pricing**
+  asset (honouring `InstrumentQuoteAsset::UnderlyingBase`) on `AssetNameInternal`, the identity the
+  engine keys assets by — so `GBX` and `gbx` are one asset and `GBP` is caught.
+  The check reaches exactly as far as its callers: the new `LseCandleSource::resolve` routes through
+  it on the candle-replay path, while `read_export` takes its `instrument` argument on trust — its
+  rustdoc now directs callers to obtain that argument here. Both shipped examples resolve rather
+  than writing an `InstrumentIndex` literal. `LseCandleSource::new` remains for callers with no registry to check against, and its
+  rustdoc says plainly that it carries no protection.
+
+- **⚠️ BREAKING: `instrument_index_for` moved from `lse::parquet` to `lse::market`**
+  (`rustrade-data`, `lse` feature). It is registry symbology rather than artifact decoding, and its
+  old home is gated behind `lse-parquet` — so a consumer building with `--features lse` got the
+  entire candle-replay API and **could not compile a call to the guard at all**, which is why the
+  candle path had no protection to route through. Update imports from
+  `exchange::lse::parquet::instrument_index_for` to `exchange::lse::market::instrument_index_for`;
+  the signature and behaviour are unchanged.
+
+- **`LseVaultClient::await_export` could panic on a large `poll_interval`** (`rustrade-data`, `lse`
+  feature). The deadline was computed with `checked_add`, commented that `Instant + Duration` panics
+  on overflow and that `Duration::MAX` is a plausible "no timeout" sentinel — and the next line then
+  used a bare `+` on the caller's `poll_interval`. `.min(deadline)` could not protect it, because
+  the addition is evaluated first. A public library method therefore aborted the caller's task on an
+  argument its own docs called plausible. Now `checked_add(...).map_or(deadline, |i| deadline.min(i))`,
+  with both sentinels covered by the rustdoc and by tests.
+
+- **Two per-row costs removed from the LSE Parquet decode loop** (`rustrade-data`, `lse-parquet`
+  feature). The `price`+`ask` layout opened and decoded an entire extra `DOUBLE` column — around
+  400 MB uncompressed on a 50M-row artifact — solely to check that `volume` stayed `0.0` for a
+  one-shot `warn!`, and the check latched off after the first hit while the column kept being read.
+  That check now reads the row group's column-chunk **statistics** instead of decoding per row. And
+  the symbol column was cloned per row: `ByteArray` wraps `Option<bytes::Bytes>`, so a
+  dictionary-backed clone plus its drop is two atomic read-modify-writes — roughly 100M of them on a
+  50M-row export — for a value that was only compared against the expected symbol's bytes and
+  dropped. `BatchedColumn::take` is now a `peek`/`advance` split, which removes the clone
+  (`symbols_in_export` uses it too). The same rows decode to the same events. One behaviour change,
+  recorded on the method: the statistics-based check cannot see a row group whose writer emitted no
+  column statistics, nor a NaN — writers exclude NaN from `min`/`max` by spec, where the old per-row
+  `value != 0.0` caught it. Both are accepted losses on an observability aid for a column the layout
+  discards either way.
+
+- **`transfer_export` no longer writes an unbounded body when the job reports its size**
+  (`rustrade-data`, `lse` feature). A misbehaving proxy streaming 500 GB against a job declaring
+  1 MB filled the disk before the integrity check could fire, and on `ENOSPC` the oversized `.part`
+  was *retained*. The write loop now stops once the download exceeds `job.bytes`. The offending
+  chunk is written **before** the break deliberately, so the caller observes `downloaded > expected`
+  and takes the existing "longer than the artifact → corrupt → discard" branch rather than reporting
+  a misleading digest mismatch.
 
 - **`lse::market::quote_asset` returned USD for a lowercase venue suffix, the 100× error it exists
   to prevent** (`rustrade-data`, `lse` feature). The venue arms were exact string literals, so
@@ -918,9 +1141,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   followed by a long run of bars, which one provider alone can produce — open positions marked to a
   book that had stopped updating, `pnl_unrealised` stopped moving, and the tear sheet looked normal.
   This is the same failure the candle-vs-trade rule was already recency-based to prevent, applied to
-  the third input. All three are now compared by recency, with L1 winning an exact tie so an L1-only
-  feed behaves exactly as before, and the L1 staleness guard keys on the payload's
-  `last_update_time` — the same instant `price()` orders on — so the two cannot disagree.
+  the third input. A candle now wins whenever it closed strictly later than the input the tick regime
+  holds, so a book that has stopped updating no longer decides the price forever; within that regime
+  L1 keeps a fixed precedence over the last trade, so an L1-only feed behaves exactly as before. See
+  the `Changed` entry on `DefaultInstrumentMarketData` above for why the two regimes are ranked
+  differently. The L1 staleness guard keys on the payload's `last_update_time` — the same instant
+  `price()` orders on — so the two cannot disagree.
 
 - **A failing run in `run_backtests` leaked every cancelled sibling's task tree** (`rustrade`).
   `run_backtests` short-circuits on the first `Err`, dropping the other runs' futures — and dropping
@@ -965,6 +1191,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live positions to freshly-zeroed state. There is no in-library upgrade step — rewrite the
   exchange segment of every persisted `name_internal` from the concatenated variant name to the
   `snake_case` spelling, or rebuild the state from scratch.
+
+- **Three undocumented caller obligations are now stated at the API boundary** (`rustrade-data`;
+  documentation only, no behaviour change).
+  - `download_export` names the `<destination>.<job id>.part` glob and states that abandoned partial
+    files are never reclaimed. `.part` is scoped to the job id — a sound invariant, and the reason a
+    resumed transfer cannot pick up a stale file — but the only deletion path is a discarding
+    integrity failure, so a killed process or a re-export (new job id, new `.part`) orphans the old
+    one permanently. A 7 GB export killed at 6 GB leaves 6 GB. No cleanup API is offered, because
+    enumerating and deleting files a caller chose the location of is the caller's decision.
+  - `stream_blocking_iter` states that it holds **one blocking thread per call for the whole
+    decode**, and `merge_time_sorted` states that its inputs must be able to progress independently.
+    Composed, N artifacts start N blocking tasks at call time (not first poll), and `blocking_send`
+    parks the OS thread without returning it to the pool. Past tokio's default `max_blocking_threads`
+    of 512, tasks 513+ never get a thread, their streams stay `Pending`, the merge — which requires
+    every input to buffer or end — returns `Pending` forever, nothing drains, and no thread is
+    released: a permanent stall with no error and no log. A 512-instrument universe is not exotic.
+    Both ways out are documented (raise `max_blocking_threads`, or batch the inputs).
+  - `stream_blocking_iter`'s claim that "every consumer reaches this stream through
+    `merge_time_sorted`" is removed: it has no in-tree production caller, so the `FusedStream`
+    choice is a design judgement rather than an observation, and is now described as one.
 
 - **Published rustdoc no longer points at items readers cannot open** (`rustrade-data`). Twelve
   public items across the IBKR Flex, Massive and Alpaca surfaces linked to private items, which
@@ -1024,6 +1270,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never completed). Benchmark-only; no library behaviour changes.
 
 ### Security
+
+- **The London Strategic Edge vault client no longer follows redirects, so `x-api-key` cannot be
+  forwarded to another host** (`rustrade-data`, `lse` feature). The client was built with no
+  `.redirect(...)`, so `reqwest` applied its default `Policy::limited(10)`. On a cross-host
+  redirect reqwest strips only `Authorization`, `Cookie`, `Cookie2`, `Proxy-Authorization` and
+  `WWW-Authenticate` — a custom `x-api-key` installed via `default_headers` is not in that set and
+  survives the hop. (`set_sensitive` affects `Debug` redaction only, not redirect behaviour.) The
+  exposure is concrete: `GET /vault/export/{id}/download` is the multi-gigabyte endpoint, exactly
+  the kind that hands off to object storage with a `302`, and reqwest would have re-issued the GET
+  carrying the live key. It also broke an invariant the module states twice in its own docs — that
+  this client only ever requests URLs it builds itself, which is why the provider's own
+  `download_url` is deliberately ignored — since a followed redirect *is* a server-supplied URL.
+  `LseVaultClient::new` now sets `redirect::Policy::none()`, matching the two sibling API-key-bearing
+  clients in this crate (`massive::rest` and `ibkr::flex`), and both `new` and `with_client` document
+  it. **Behaviour change:** a `3xx` from the vault now surfaces as an `LseError::Api` carrying that
+  status instead of being followed silently.
 
 - **Fixed a bearer-token leak in Massive REST pagination** (`rustrade-data`). The client attaches its
   API key as an `Authorization: Bearer` default header sent with every request, and validated each

@@ -80,9 +80,33 @@ pub const DEFAULT_BLOCKING_CHANNEL_CAPACITY: usize = 1024;
 /// (an `async_stream` generator breaks both) would break callers. [`Unpin`] is therefore in the
 /// return type, so such a rewrite fails to compile here rather than at some downstream call site;
 /// the terminal `None` cannot be spelled in a signature and is pinned by test instead. `FusedStream`
-/// is deliberately *not* implemented: nothing needs it, every consumer reaches
-/// this stream through [`merge_time_sorted`](super::merge::merge_time_sorted), which fuses its
-/// inputs itself, and widening the return type later is an additive change.
+/// is deliberately *not* implemented: the terminal `None` above already gives a consumer what
+/// fusing would, the intended consumer
+/// [`merge_time_sorted`](super::merge::merge_time_sorted) fuses its inputs itself, and widening the
+/// return type later is an additive change. That is a design judgement rather than an observation —
+/// this helper has no in-tree production callers, so there is no consumer set to appeal to.
+///
+/// # ⚠️ One blocking thread per call, held for the whole decode
+/// [`tokio::task::spawn_blocking`] fires **at call time, not at first poll**, so building N of
+/// these starts N blocking tasks immediately, before anything is polled. Each holds its thread for
+/// the whole decode: `blocking_send` parks the thread while the channel is full rather than
+/// returning it to the pool, which is precisely the back-pressure described above.
+///
+/// Tokio's blocking pool defaults to `max_blocking_threads: 512`. Past that, further tasks are
+/// queued and get no thread until a running one returns — and a decode only returns when its
+/// consumer drains it.
+///
+/// **That combination deadlocks under a k-way merge.**
+/// [`merge_time_sorted`](super::merge::merge_time_sorted) collects its inputs eagerly and cannot
+/// emit until *every* input has buffered an event or ended (see its `# Pace` section). With more
+/// than 512 inputs, the queued tasks never run, so their streams stay `Pending`, so the merge stays
+/// `Pending`, so none of the *running* decodes is drained and none releases its thread. Nothing
+/// times out and nothing logs: the backtest simply stops.
+///
+/// A 512-instrument universe is not exotic, so a caller merging more inputs than the pool has
+/// threads must either raise
+/// [`max_blocking_threads`](tokio::runtime::Builder::max_blocking_threads) above the input count,
+/// or merge in batches whose size it does not exceed.
 ///
 /// # Examples
 /// ```no_run
@@ -197,9 +221,10 @@ mod tests {
     use std::{
         io::{Error, ErrorKind},
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     fn ok_iter(count: usize) -> Result<std::vec::IntoIter<Result<usize, Error>>, Error> {
@@ -273,27 +298,38 @@ mod tests {
     }
 
     /// The items decoded before the panic are real data and are still delivered; the panic arrives
-    /// in their place at the end, not instead of them.
+    /// after them, not instead of them.
     #[tokio::test]
     async fn items_before_a_panic_are_still_yielded() {
-        let stream = stream_blocking_iter(4, || {
-            Ok((0..10).map(|index: usize| {
-                assert!(index < 3, "boom");
-                Ok::<usize, Error>(index)
-            }))
-        });
+        // Collected through a handle that OUTLIVES the unwind. A `Vec` local to the caught future
+        // is destroyed by the panic along with the rest of that frame, so nothing can be asserted
+        // about it afterwards -- which left the "items before the panic are still yielded" half of
+        // this contract untested, and only the "the panic escapes" half pinned.
+        let delivered = Arc::new(Mutex::new(Vec::new()));
 
-        let collect = std::panic::AssertUnwindSafe(async {
-            let mut stream = Box::pin(stream);
-            let mut items = Vec::new();
+        let sink = Arc::clone(&delivered);
+        let collect = std::panic::AssertUnwindSafe(async move {
+            let mut stream = Box::pin(stream_blocking_iter(4, || {
+                Ok((0..10).map(|index: usize| {
+                    assert!(index < 3, "boom");
+                    Ok::<usize, Error>(index)
+                }))
+            }));
+
             while let Some(item) = stream.next().await {
-                items.push(item.unwrap());
+                // The lock is never held across the await, so the panic cannot poison it.
+                sink.lock().unwrap().push(item.unwrap());
             }
-            items
         });
 
         let outcome = futures::FutureExt::catch_unwind(collect).await;
+
         assert!(outcome.is_err(), "the panic must not be swallowed");
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec![0, 1, 2],
+            "every item decoded before the panic is real data and must still reach the consumer"
+        );
     }
 
     /// The clean path must stay clean: a normal end is still a normal end, not a panic.
@@ -341,11 +377,12 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_stream_stops_the_producer() {
+        const ITEMS: usize = 10_000;
         let produced = Arc::new(AtomicUsize::new(0));
 
         let counter = Arc::clone(&produced);
         let mut stream = Box::pin(stream_blocking_iter(2, move || {
-            Ok((0..10_000).map(move |index| {
+            Ok((0..ITEMS).map(move |index| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok::<usize, Error>(index)
             }))
@@ -354,11 +391,34 @@ mod tests {
         assert!(stream.next().await.is_some());
         drop(stream);
 
-        // The producer stops at its next hand-off, so the count stops climbing. Sampled twice
-        // rather than compared against a bound, since the exact stopping point is a race.
-        tokio::task::yield_now().await;
-        let first = produced.load(Ordering::SeqCst);
-        tokio::task::yield_now().await;
-        assert_eq!(produced.load(Ordering::SeqCst), first);
+        // Wait for the count to STOP climbing, rather than assuming it already has. The producer
+        // runs on its own OS thread and stops at its next hand-off, so a `yield_now` on this side
+        // proves nothing about where that thread has got to -- sampling twice around one yield can
+        // catch it mid-iteration and fail spuriously. Polling until two samples separated by a real
+        // delay agree is the same assertion made soundly.
+        let mut settled = produced.load(Ordering::SeqCst);
+        let mut stopped = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let current = produced.load(Ordering::SeqCst);
+            if current == settled {
+                stopped = true;
+                break;
+            }
+            settled = current;
+        }
+
+        assert!(
+            stopped,
+            "the producer was still running 500ms after the stream was dropped ({settled} items)"
+        );
+        // The property that matters, and the one a "count stopped changing" assertion alone does
+        // not establish: it stopped *early*, rather than draining the whole iterator into a channel
+        // nobody was left to read. The tight bound belongs to the sibling capacity test; here the
+        // question is only whether the drop was observed at all.
+        assert!(
+            settled < ITEMS,
+            "the producer ran to completion ({settled} items) despite the stream being dropped"
+        );
     }
 }
