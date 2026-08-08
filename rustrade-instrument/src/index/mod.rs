@@ -285,6 +285,7 @@ mod tests {
             actual.instruments()[0].value,
             Instrument {
                 exchange: Keyed::new(ExchangeIndex(0), ExchangeId::BinanceSpot),
+                data_venue: None,
                 name_exchange: InstrumentNameExchange::new("btc_usdt"),
                 name_internal: InstrumentNameInternal::new("binance_spot-btc_usdt"),
                 underlying: Underlying {

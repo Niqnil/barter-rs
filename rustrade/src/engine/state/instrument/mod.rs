@@ -1119,13 +1119,14 @@ where
             .instruments()
             .iter()
             .map(|instrument| {
-                let exchange_index = instrument.value.exchange.key;
-
                 (
                     instrument.value.name_internal.clone(),
                     InstrumentState {
                         key: instrument.key,
-                        instrument: instrument.value.clone().map_exchange_key(exchange_index),
+                        instrument: instrument
+                            .value
+                            .clone()
+                            .map_exchange_key(|exchange| exchange.key),
                         tear_sheet: TearSheetGenerator::init(time_engine_start),
                         position: position_manager_init(),
                         orders: orders_init(),

@@ -460,6 +460,10 @@ fn generate_mock_exchange_instruments(
                     quote,
                     kind,
                     spec,
+                    // Bound explicitly rather than via `..` so a future `Instrument` field forces a
+                    // decision here instead of being silently dropped from the projection. See the
+                    // construction below for why this one is.
+                    data_venue: _,
                 } = instrument;
 
                 let kind = match kind {
@@ -546,6 +550,11 @@ fn generate_mock_exchange_instruments(
                     quote: *quote,
                     kind,
                     spec,
+                    // Deliberately dropped. This projection describes the instrument to the
+                    // `MockExchange`, which fills orders — a `DataVenue` states where *prices* are
+                    // sourced from, which the mock neither reads nor can act on. Carrying it here
+                    // would imply the mock fills against that venue, which it does not.
+                    data_venue: None,
                 };
 
                 Some((instrument.name_exchange.clone(), instrument))
