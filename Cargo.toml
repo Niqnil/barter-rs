@@ -91,5 +91,5 @@ criterion = { version = "0.8.2" }
 wiremock = { version = "0.6" }
 prost = { version = "0.14.3" }
 temp-env = { version = "0.3" }
-serial_test = { version = "3.2" }
+serial_test = { version = "4.0" }
 tempfile = { version = "3" }
