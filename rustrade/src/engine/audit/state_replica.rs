@@ -169,9 +169,16 @@ where
                     .trading
                     .update(trading_state);
             }
+            // The three `UntrackedExchange` results below are event-replayed, not output-mirrored:
+            // the replica's `ConnectivityStates` is a clone of the live engine's, so the same
+            // lookup against the same map reaches the same verdict from the event alone. On `Err`
+            // the live engine mutated nothing, and so does the replica — discarding the result
+            // *is* the mirror. (The live engine already emitted the observable and logged it; the
+            // replica mirrors state, not outputs.)
             EngineEvent::Account(event) => match event {
                 AccountStreamEvent::Reconnecting(exchange) => {
-                    self.replica_engine_state_mut()
+                    let _untracked = self
+                        .replica_engine_state_mut()
                         .connectivity
                         .update_from_account_reconnecting(&exchange);
                 }
@@ -181,12 +188,13 @@ where
             },
             EngineEvent::Market(event) => match event {
                 MarketStreamEvent::Reconnecting(exchange) => {
-                    self.replica_engine_state_mut()
+                    let _untracked = self
+                        .replica_engine_state_mut()
                         .connectivity
                         .update_from_market_reconnecting(&exchange);
                 }
                 MarketStreamEvent::Item(event) => {
-                    self.replica_engine_state_mut().update_from_market(&event);
+                    let _untracked = self.replica_engine_state_mut().update_from_market(&event);
                 }
             },
             EngineEvent::ContractExpiry(key) => {

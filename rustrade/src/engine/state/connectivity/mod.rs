@@ -1,3 +1,4 @@
+use derive_more::Constructor;
 use indexmap::IndexMap;
 use rustrade_instrument::{
     exchange::{ExchangeId, ExchangeIndex},
@@ -25,10 +26,26 @@ impl ConnectivityStates {
     ///
     /// Sets the account `ConnectivityState` for the provided `ExchangeId`
     /// to [`Health::Reconnecting`].
-    pub fn update_from_account_reconnecting(&mut self, exchange: &ExchangeId) {
+    ///
+    /// # Errors
+    /// Returns [`UntrackedExchange`] if the `ExchangeId` has no `ConnectivityState`, having mutated
+    /// nothing — including [`Self::global`].
+    pub fn update_from_account_reconnecting(
+        &mut self,
+        exchange: &ExchangeId,
+    ) -> Result<(), UntrackedExchange> {
+        let Some(state) = self.exchanges.get_mut(exchange) else {
+            return Err(UntrackedExchange::new(
+                *exchange,
+                ConnectivityDimension::Account,
+            ));
+        };
+
         warn!(%exchange, "EngineState received AccountStream disconnected event");
+        state.account = Health::Reconnecting;
         self.global = Health::Reconnecting;
-        self.connectivity_mut(exchange).account = Health::Reconnecting;
+
+        Ok(())
     }
 
     /// Updates from an exchange AccountStream event, setting the `ConnectivityState` account
@@ -62,10 +79,26 @@ impl ConnectivityStates {
     ///
     /// Sets the market data `ConnectivityState` for the provided `ExchangeId`
     /// to [`Health::Reconnecting`].
-    pub fn update_from_market_reconnecting(&mut self, exchange: &ExchangeId) {
+    ///
+    /// # Errors
+    /// Returns [`UntrackedExchange`] if the `ExchangeId` has no `ConnectivityState`, having mutated
+    /// nothing — including [`Self::global`].
+    pub fn update_from_market_reconnecting(
+        &mut self,
+        exchange: &ExchangeId,
+    ) -> Result<(), UntrackedExchange> {
+        let Some(state) = self.exchanges.get_mut(exchange) else {
+            return Err(UntrackedExchange::new(
+                *exchange,
+                ConnectivityDimension::MarketData,
+            ));
+        };
+
         warn!(%exchange, "EngineState received MarketStream disconnect event");
+        state.market_data = Health::Reconnecting;
         self.global = Health::Reconnecting;
-        self.connectivity_mut(exchange).market_data = Health::Reconnecting
+
+        Ok(())
     }
 
     /// Updates from an exchange MarketStream event, setting the `ConnectivityState` market data
@@ -73,14 +106,32 @@ impl ConnectivityStates {
     ///
     /// If after the update all `ConnectivityState`s are healthy, the global health is set to
     /// `Health::Healthy`.
-    pub fn update_from_market_event(&mut self, exchange: &ExchangeId) {
-        if self.global == Health::Healthy {
-            return;
-        }
+    ///
+    /// # Errors
+    /// Returns [`UntrackedExchange`] if the `ExchangeId` has no `ConnectivityState`. The exchange is
+    /// resolved on **every** call, including the already-globally-healthy fast path, so this is
+    /// reported deterministically on the first event from that exchange — see the note at the
+    /// lookup for why that matters.
+    pub fn update_from_market_event(
+        &mut self,
+        exchange: &ExchangeId,
+    ) -> Result<(), UntrackedExchange> {
+        // Resolved BEFORE the `global == Healthy` short-circuit below, deliberately. Skipping the
+        // lookup while global health held is what made an untracked exchange an *intermittent*
+        // fault: its events were silently ignored for as long as everything else was healthy, and
+        // the misconfiguration only surfaced once something dragged `global` back to `Reconnecting`
+        // -- in practice a reconnect, hours into a run. Resolving unconditionally costs one
+        // `IndexMap` get per market event and makes the report fire on the first event from that
+        // exchange, in every run.
+        let Some(state) = self.exchanges.get_mut(exchange) else {
+            return Err(UntrackedExchange::new(
+                *exchange,
+                ConnectivityDimension::MarketData,
+            ));
+        };
 
-        let state = self.connectivity_mut(exchange);
-        if state.market_data == Health::Healthy {
-            return;
+        if self.global == Health::Healthy || state.market_data == Health::Healthy {
+            return Ok(());
         }
 
         info!(
@@ -93,12 +144,19 @@ impl ConnectivityStates {
             info!("EngineState setting global connectivity to Healthy");
             self.global = Health::Healthy
         }
+
+        Ok(())
     }
 
     /// Returns a reference to the `ConnectivityState` associated with the
     /// provided `ExchangeIndex`.
     ///
     /// Panics if the `ConnectivityState` associated with the `ExchangeIndex` is not found.
+    ///
+    /// Unlike the `ExchangeId`-keyed update path — which reports an [`UntrackedExchange`] rather
+    /// than panicking — an `ExchangeIndex` is derived from the same [`IndexedInstruments`] this
+    /// collection was built from, so an out-of-range one is a library bug rather than a
+    /// misconfigured input, and is not something a caller could handle.
     pub fn connectivity_index(&self, key: &ExchangeIndex) -> &ConnectivityState {
         self.exchanges
             .get_index(key.index())
@@ -120,7 +178,9 @@ impl ConnectivityStates {
     /// Returns a reference to the `ConnectivityState` associated with the
     /// provided `ExchangeId`.
     ///
-    /// Panics if the `ConnectivityState` associated with the `ExchangeId` is not found.
+    /// Panics if the `ConnectivityState` associated with the `ExchangeId` is not found. This is an
+    /// assertive accessor for a key the caller already knows is tracked; event-driven code takes
+    /// the fallible path instead and reports an [`UntrackedExchange`].
     pub fn connectivity(&self, key: &ExchangeId) -> &ConnectivityState {
         self.exchanges
             .get(key)
@@ -146,6 +206,48 @@ impl ConnectivityStates {
     pub fn exchange_states(&self) -> impl Iterator<Item = &ConnectivityState> {
         self.exchanges.values()
     }
+}
+
+/// One half of a venue's connectivity — the axis a [`VenueRole`] declares membership of, and the
+/// one an [`UntrackedExchange`] report names.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum ConnectivityDimension {
+    /// The market data subscription.
+    MarketData,
+
+    /// The account and execution connection.
+    Account,
+}
+
+/// A stream event arrived tagged with an [`ExchangeId`] that has no [`ConnectivityState`] — an
+/// exchange that is neither the execution venue nor the data venue of any instrument the engine was
+/// built from.
+///
+/// # Why this is reported rather than panicked
+/// The engine cannot rule it out in advance. A `SystemBuild`'s market stream is a caller-supplied
+/// `Stream` forwarded verbatim, so the set of exchanges it will emit is unknowable at build time —
+/// there is no seam at which to reject the mismatch early. The only honest options at the point of
+/// discovery are to abort the engine or to report and continue, and a single stray event from a
+/// venue nothing was configured against is not grounds for taking down a trading session.
+///
+/// # Nothing was mutated
+/// In particular [`ConnectivityStates::global`] is left alone. An exchange the engine does not track
+/// has no bearing on the health of the ones it does, so a stray disconnect notice must not degrade
+/// global health — nor can it be repaired, since no later event for that exchange can restore a
+/// state that does not exist.
+///
+/// Market events additionally stop **before** instrument state is touched. `InstrumentIndex` lookups
+/// are positional, so continuing would either panic on an out-of-range index or, worse, silently
+/// attribute the print to whichever instrument happens to occupy that slot.
+#[derive(
+    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
+)]
+pub struct UntrackedExchange {
+    /// The exchange the event was tagged with.
+    pub exchange: ExchangeId,
+
+    /// Which connection the event would have updated.
+    pub dimension: ConnectivityDimension,
 }
 
 /// Represents the `Health` status of a component or connection to an exchange endpoint.
@@ -436,7 +538,7 @@ mod tests {
             assert_eq!(states.global, Health::Reconnecting);
 
             if market_data_first {
-                states.update_from_market_event(&DATA);
+                states.update_from_market_event(&DATA).unwrap();
                 assert_eq!(
                     states.global,
                     Health::Reconnecting,
@@ -450,11 +552,79 @@ mod tests {
                     Health::Reconnecting,
                     "the data venue has not reported yet"
                 );
-                states.update_from_market_event(&DATA);
+                states.update_from_market_event(&DATA).unwrap();
             }
 
             assert_eq!(states.global, Health::Healthy, "{market_data_first}");
         }
+    }
+
+    #[test]
+    fn an_untracked_exchange_is_reported_even_while_global_health_holds() {
+        // The regression this locks: the lookup used to sit *after* a `global == Healthy`
+        // short-circuit, so a misconfigured exchange was silently ignored for as long as everything
+        // else was healthy, and only panicked once a reconnect dragged global back down. Reaching
+        // `Healthy` first is therefore the whole point of this setup.
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let mut states = generate_empty_indexed_connectivity_states(&instruments);
+
+        let execution = instruments.find_exchange_index(EXECUTION).unwrap();
+        states.update_from_market_event(&EXECUTION).unwrap();
+        states.update_from_account_event(&execution);
+        assert_eq!(states.global, Health::Healthy);
+
+        let error = states.update_from_market_event(&DATA).unwrap_err();
+
+        assert_eq!(
+            error,
+            UntrackedExchange::new(DATA, ConnectivityDimension::MarketData)
+        );
+        assert_eq!(states.global, Health::Healthy, "the report must not mutate");
+        assert_eq!(states.exchanges.len(), 1, "no state may be created for it");
+    }
+
+    #[test]
+    fn an_untracked_exchange_disconnect_does_not_degrade_global_health() {
+        // A disconnect notice from a venue the engine never tracked is not evidence about the
+        // venues it does track -- and could never be repaired, since no later event for it can
+        // restore a `ConnectivityState` that does not exist.
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let mut states = generate_empty_indexed_connectivity_states(&instruments);
+
+        let execution = instruments.find_exchange_index(EXECUTION).unwrap();
+        states.update_from_market_event(&EXECUTION).unwrap();
+        states.update_from_account_event(&execution);
+        assert_eq!(states.global, Health::Healthy);
+
+        assert_eq!(
+            states.update_from_market_reconnecting(&DATA).unwrap_err(),
+            UntrackedExchange::new(DATA, ConnectivityDimension::MarketData)
+        );
+        assert_eq!(
+            states.update_from_account_reconnecting(&DATA).unwrap_err(),
+            UntrackedExchange::new(DATA, ConnectivityDimension::Account)
+        );
+
+        assert_eq!(states.global, Health::Healthy);
+    }
+
+    #[test]
+    fn a_tracked_exchange_disconnect_still_degrades_global_health() {
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let mut states = generate_empty_indexed_connectivity_states(&instruments);
+
+        let execution = instruments.find_exchange_index(EXECUTION).unwrap();
+        states.update_from_market_event(&EXECUTION).unwrap();
+        states.update_from_account_event(&execution);
+        assert_eq!(states.global, Health::Healthy);
+
+        states.update_from_market_reconnecting(&EXECUTION).unwrap();
+
+        assert_eq!(states.global, Health::Reconnecting);
+        assert_eq!(
+            states.connectivity(&EXECUTION).market_data,
+            Health::Reconnecting
+        );
     }
 
     #[test]

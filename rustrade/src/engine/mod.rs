@@ -14,6 +14,7 @@ use crate::{
         execution_tx::ExecutionTxMap,
         state::{
             EngineState,
+            connectivity::UntrackedExchange,
             instrument::{OptionSplitPlan, data::InstrumentDataState},
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
             position::{Position, PositionExited, PositionId, SplitRoundingPolicy},
@@ -320,11 +321,19 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     {
         match event {
             AccountStreamEvent::Reconnecting(exchange) => {
-                self.state
+                // An untracked exchange skips `on_disconnect` as well as the state update: the
+                // strategy has no link to that venue to react to, and the engine's own health is
+                // unaffected by one it never tracked.
+                match self
+                    .state
                     .connectivity
-                    .update_from_account_reconnecting(exchange);
-
-                UpdateFromAccountOutput::OnDisconnect(Strategy::on_disconnect(self, *exchange))
+                    .update_from_account_reconnecting(exchange)
+                {
+                    Ok(()) => UpdateFromAccountOutput::OnDisconnect(Strategy::on_disconnect(
+                        self, *exchange,
+                    )),
+                    Err(untracked) => UpdateFromAccountOutput::UntrackedExchange(untracked),
+                }
             }
             AccountStreamEvent::Item(event) => self
                 .state
@@ -350,16 +359,23 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     {
         match event {
             MarketStreamEvent::Reconnecting(exchange) => {
-                self.state
+                // An untracked exchange skips `on_disconnect` as well as the state update — see the
+                // equivalent account-stream arm above.
+                match self
+                    .state
                     .connectivity
-                    .update_from_market_reconnecting(exchange);
-
-                UpdateFromMarketOutput::OnDisconnect(Strategy::on_disconnect(self, *exchange))
+                    .update_from_market_reconnecting(exchange)
+                {
+                    Ok(()) => UpdateFromMarketOutput::OnDisconnect(Strategy::on_disconnect(
+                        self, *exchange,
+                    )),
+                    Err(untracked) => UpdateFromMarketOutput::UntrackedExchange(untracked),
+                }
             }
-            MarketStreamEvent::Item(event) => {
-                self.state.update_from_market(event);
-                UpdateFromMarketOutput::None
-            }
+            MarketStreamEvent::Item(event) => match self.state.update_from_market(event) {
+                Ok(()) => UpdateFromMarketOutput::None,
+                Err(untracked) => UpdateFromMarketOutput::UntrackedExchange(untracked),
+            },
         }
     }
 
@@ -1580,6 +1596,25 @@ pub enum EngineOutput<
         /// The already-processed action `id` that was skipped.
         id: SmolStr,
     },
+
+    /// Observable, **non-mutating** signal that a market or account stream event named an exchange
+    /// the engine was not built against, so it could not be routed and was dropped.
+    ///
+    /// Emitted in place of the panic this path used to take. The check is now performed on **every**
+    /// market event rather than only while global connectivity is degraded, so a misconfigured
+    /// exchange is reported on its first event instead of surfacing hours later on a reconnect —
+    /// see [`UntrackedExchange`] for the full rationale and for exactly what was left untouched.
+    ///
+    /// **No state was mutated**, including
+    /// [`ConnectivityStates::global`](crate::engine::state::connectivity::ConnectivityStates::global).
+    /// A consumer folding
+    /// observables into a mutation tally must not count this variant — the same treatment as
+    /// [`CorporateActionAlreadyProcessed`](Self::CorporateActionAlreadyProcessed).
+    ///
+    /// Repeats per offending event, not once per exchange: the engine holds no "already reported"
+    /// set for untracked venues, since by definition it has no state keyed on them. A consumer that
+    /// wants one alert per venue must deduplicate on `exchange` itself.
+    UntrackedExchange(UntrackedExchange),
 }
 
 /// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.
@@ -1638,20 +1673,35 @@ pub enum UpdateTradingStateOutput<OnTradingDisabled> {
 
 /// Output produced by the [`Engine`] updating from an [`AccountStreamEvent`], used to construct
 /// an `Engine` [`EngineAudit`].
+///
+/// `#[non_exhaustive]`: matches [`EngineOutput`], which this feeds — engine-driven observables can
+/// be added without breaking downstream exhaustive matches.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 #[allow(clippy::large_enum_variant)] // PositionExit is rare; avoiding Box keeps API simple
+#[non_exhaustive]
 pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> {
     None,
     OnDisconnect(OnDisconnect),
     PositionExit(PositionExited<AssetIndex, InstrumentKey>),
+
+    /// The event named an exchange the engine does not track; nothing was updated, and
+    /// `on_disconnect` was **not** called. See [`UntrackedExchange`].
+    UntrackedExchange(UntrackedExchange),
 }
 
 /// Output produced by the [`Engine`] updating from an [`MarketStreamEvent`], used to construct
 /// an `Engine` [`EngineAudit`].
+///
+/// `#[non_exhaustive]`: see [`UpdateFromAccountOutput`].
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
 pub enum UpdateFromMarketOutput<OnDisconnect> {
     None,
     OnDisconnect(OnDisconnect),
+
+    /// The event named an exchange the engine does not track; nothing was updated, and neither
+    /// `on_disconnect` nor any instrument state was touched. See [`UntrackedExchange`].
+    UntrackedExchange(UntrackedExchange),
 }
 
 impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>

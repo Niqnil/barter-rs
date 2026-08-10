@@ -3,7 +3,7 @@ use crate::engine::{
     state::{
         asset::{AssetStates, filter::AssetFilter},
         builder::EngineStateBuilder,
-        connectivity::ConnectivityStates,
+        connectivity::{ConnectivityStates, UntrackedExchange},
         instrument::{
             InstrumentStates, data::InstrumentDataState, filter::InstrumentFilter,
             generate_unindexed_instrument_account_snapshot,
@@ -200,16 +200,27 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///   [`InstrumentState::update_from_market`](instrument::InstrumentState::update_from_market),
     ///   which updates its [`InstrumentDataState`] and then, for each open position, re-computes
     ///   `pnl_unrealised` and advances `time_exchange_update` from the new market price.
+    ///
+    /// # Errors
+    /// Returns [`UntrackedExchange`](connectivity::UntrackedExchange) if the event is tagged with an
+    /// exchange the engine was not built against. Nothing is mutated and the event is dropped —
+    /// see that type for why the instrument update is skipped too, rather than merely the
+    /// connectivity one.
     pub fn update_from_market(
         &mut self,
         event: &MarketEvent<InstrumentIndex, InstrumentData::MarketEventKind>,
-    ) where
+    ) -> Result<(), UntrackedExchange>
+    where
         GlobalData:
             for<'a> Processor<&'a MarketEvent<InstrumentIndex, InstrumentData::MarketEventKind>>,
         InstrumentData: InstrumentDataState,
     {
-        // Set exchange market data connectivity to Healthy if it was Reconnecting
-        self.connectivity.update_from_market_event(&event.exchange);
+        // Set exchange market data connectivity to Healthy if it was Reconnecting. Resolved first,
+        // and propagated rather than logged: the `InstrumentIndex` on an event from an untracked
+        // exchange is not ours to trust either, and `instrument_index_mut` below is a positional
+        // lookup that would panic on it -- or silently credit the print to another instrument.
+        self.connectivity
+            .update_from_market_event(&event.exchange)?;
 
         let instrument_state = self.instruments.instrument_index_mut(&event.instrument);
 
@@ -218,6 +229,8 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         // `pnl_unrealised` + advances `time_exchange_update` — previously only `data.process` ran,
         // leaving `pnl_unrealised` stale between fills despite its documented per-tick contract.
         instrument_state.update_from_market(event);
+
+        Ok(())
     }
 }
 
