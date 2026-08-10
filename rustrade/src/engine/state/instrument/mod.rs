@@ -85,6 +85,13 @@ pub(crate) struct SplitPlan {
     /// One entry per registered option on the underlying (held OR unheld) for a **standard** split;
     /// empty for a non-standard split (which touches no option state).
     pub(crate) options: Vec<OptionSplitPlan>,
+    /// Registered options on the underlying that already carry this action's `id` in their own
+    /// `corporate_actions_processed` set, and are therefore **excluded** from `options` — this
+    /// action already adjusted them, so re-adjusting would double-divide the strike.
+    ///
+    /// Carried (rather than dropped) purely so the live handler can surface each suppression as an
+    /// observable; the audit replica mirrors state, not outputs, and ignores it.
+    pub(crate) options_already_adjusted: Vec<InstrumentIndex>,
 }
 
 /// The pre-computed standard-split adjustment for a single option instrument on the splitting
@@ -155,12 +162,22 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
     /// Single-sourced so the live handler and the audit replica reach the identical decision — and
     /// the identical pre-computed values — by construction, not by hand-mirrored vigilance. Checks,
     /// in the same order the handler commits:
+    /// - `equity` is the **unique** split-eligible instrument on its `(base, quote, exchange)`
+    ///   underlying identity ⇒ otherwise [`UnsupportedCorporateActionReason::AmbiguousSplitTarget`]
+    ///   (see that variant for why a second eligible instrument makes the option scan unsound);
     /// - every open position on the splitting `equity` rescales without `Decimal` overflow (equity
     ///   quantities may legitimately be fractional, so there is no integer check here);
     /// - iff `adjust_options_in_place` (a standard, whole-number forward split), for every registered
     ///   option on the same underlying (held **or** unheld): its **strike** divides by `ratio`
     ///   without `Decimal` overflow, and — for each **held** position — the contract count is an
     ///   **integer** (a non-integer count is state corruption) and rescales without overflow.
+    ///
+    /// # Per-option idempotency
+    /// An option that already carries `id` in its **own** `corporate_actions_processed` set was
+    /// already adjusted by this action, so it is excluded from [`SplitPlan::options`] (and listed in
+    /// [`SplitPlan::options_already_adjusted`] for the caller to surface) rather than having its
+    /// strike divided a second time. The target's own set is *not* consulted here — the caller
+    /// guards that before calling.
     ///
     /// The strike check is why unheld options are pre-computed here at all: the handler divides the
     /// strike of *every* registered option in place (so a position opened later settles against the
@@ -171,14 +188,36 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
     /// failure, or the [`SplitPlan`] to commit when the whole action can be applied.
     pub(crate) fn prepare_corporate_action_split(
         &self,
+        id: &SmolStr,
         equity: &InstrumentIndex,
         ratio: SplitRatio,
         policy: SplitRoundingPolicy,
         adjust_options_in_place: bool,
     ) -> Result<SplitPlan, UnsupportedCorporateActionReason> {
+        let equity_state = self.instrument_index(equity);
+
+        // The underlying identity every option scan below (and the handler's non-standard signal)
+        // resolves against. Derived from the TARGET, so it is only a sound proxy for "this option
+        // chain" while the target is the sole split-eligible instrument carrying it — which is
+        // exactly what the next guard establishes.
+        let base = equity_state.instrument.underlying.base;
+        let quote = equity_state.instrument.underlying.quote;
+        let exchange = equity_state.instrument.exchange;
+
+        // Guard: the target must be the UNIQUE split-eligible instrument on that identity. A second
+        // one is an equally valid trigger for adjusting the whole option chain, so the same chain
+        // could be adjusted once per eligible instrument — each pass silent for unheld options and
+        // recorded only against its own trigger. Reject the ambiguity instead of picking a winner:
+        // nothing here can tell which instrument the chain is actually written on. Runs FIRST so an
+        // ambiguous target is reported as such even when the arithmetic below would also fail.
+        if self.0.values().any(|state| {
+            state.key != *equity && state.is_split_eligible_on_underlying(&base, &quote, &exchange)
+        }) {
+            return Err(UnsupportedCorporateActionReason::AmbiguousSplitTarget);
+        }
+
         // Equity positions: overflow only. A fractional equity quantity is legitimate (fractional-
         // share brokers), so there is no integer invariant to check here — unlike option contracts.
-        let equity_state = self.instrument_index(equity);
         let mut equity_positions = Vec::with_capacity(equity_state.position.positions.len());
         for (pos_id, position) in &equity_state.position.positions {
             // Match the variant explicitly (not `|_|`): the irrefutable `|SplitError::Overflow|`
@@ -201,6 +240,7 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
             return Ok(SplitPlan {
                 equity_positions,
                 options: Vec::new(),
+                options_already_adjusted: Vec::new(),
             });
         }
 
@@ -208,16 +248,23 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
         // pre-compute, for EVERY registered option on the underlying (held OR unheld), the checked
         // post-split strike (`strike ÷ ratio`) plus the integer-contract invariant + overflow-safe
         // rescale of every HELD option position — all BEFORE the handler mutates any of them.
-        let base = equity_state.instrument.underlying.base;
-        let quote = equity_state.instrument.underlying.quote;
-        let exchange = equity_state.instrument.exchange;
         let ratio_decimal = ratio.get();
         let mut options = Vec::new();
+        let mut options_already_adjusted = Vec::new();
         for option_state in self
             .0
             .values()
             .filter(|state| state.is_option_on_underlying(&base, &quote, &exchange))
         {
+            // Per-option idempotency: this action already adjusted this option (strike, and any
+            // held positions), so re-running it would divide the strike a second time. Exclude it
+            // from the plan and hand the key back for the caller to surface — a deliberate
+            // no-op, not a failure, so it does not reject the action.
+            if option_state.corporate_actions_processed.contains(id) {
+                options_already_adjusted.push(option_state.key);
+                continue;
+            }
+
             // Strike overflow: pre-check the `strike ÷ ratio` the handler applies in place to every
             // registered option, held OR unheld — the fix for the previously unchecked strike
             // `DivAssign` (which could panic on a degenerate-but-positive ratio and was never
@@ -264,6 +311,7 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
         Ok(SplitPlan {
             equity_positions,
             options,
+            options_already_adjusted,
         })
     }
 
@@ -460,12 +508,26 @@ pub struct InstrumentState<
     /// A `CorporateAction` event carries a caller-assigned unique `id`; the handler records it
     /// here once applied and skips (with a warning) any `id` already present. Scope is
     /// per-instrument — naturally bounded by the number of corporate actions an instrument sees,
-    /// so no global store / LRU is required. This per-instrument-set keyed on `id` alone is
-    /// intentional and sufficient for stock splits (a split event targets a single instrument);
-    /// revisit for future multi-instrument actions (e.g. spin-offs).
+    /// so no global store / LRU is required.
     ///
-    /// Rejected actions (unsupported instrument/action kind) are deliberately **not** recorded,
-    /// so they remain retryable once support is added.
+    /// # Recorded on every instrument the action mutated, not only its target
+    /// A stock split names one target instrument but also adjusts the strike of every registered
+    /// option on that underlying, so the `id` is recorded on the target **and** on each option it
+    /// adjusted. Each option's set is consulted independently before adjusting it, which is what
+    /// makes a second trigger for the same `id` a no-op on the chain rather than a second strike
+    /// division. Two consequences worth knowing:
+    /// - an option carrying an `id` is evidence *that option* was adjusted — not that it was the
+    ///   action's target;
+    /// - a (nonsensical) action re-using that `id` and targeting the option directly is reported as
+    ///   an idempotent skip rather than an unsupported instrument kind, because the option genuinely
+    ///   did process that action.
+    ///
+    /// Revisit for future multi-instrument actions (e.g. spin-offs), which may need to record
+    /// participation more richly than a flat `id` set.
+    ///
+    /// Rejected actions (unsupported instrument/action kind, ambiguous target, failed
+    /// pre-validation) are deliberately **not** recorded, so they remain retryable once the
+    /// blocking condition is resolved.
     ///
     /// A hash set (insertion order is never read — only `contains`/`insert`), consistent with the
     /// sibling `FnvHashMap` routing fields below.
@@ -549,7 +611,45 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         ExchangeKey: PartialEq,
     {
         matches!(&self.instrument.kind, InstrumentKind::Option(_))
-            && self.instrument.underlying.base == *base
+            && self.is_on_underlying(base, quote, exchange)
+    }
+
+    /// `true` if this instrument is itself **split-eligible** (the deliverable equity — see
+    /// [`InstrumentKind::is_split_eligible`]) on the underlying `(base, quote)` traded on
+    /// `exchange`.
+    ///
+    /// Used to establish that a corporate action's target is the **only** such instrument on that
+    /// identity. It has to be, because the option chain is resolved by that identity alone: a
+    /// second eligible instrument carrying it would be an equally valid trigger for adjusting the
+    /// same options, with nothing in the state able to say which of the two the chain is written
+    /// on. Shared by the live handler and the audit replica via
+    /// [`InstrumentStates::prepare_corporate_action_split`].
+    pub(crate) fn is_split_eligible_on_underlying(
+        &self,
+        base: &AssetKey,
+        quote: &AssetKey,
+        exchange: &ExchangeKey,
+    ) -> bool
+    where
+        AssetKey: PartialEq,
+        ExchangeKey: PartialEq,
+    {
+        self.instrument.kind.is_split_eligible() && self.is_on_underlying(base, quote, exchange)
+    }
+
+    /// `true` if this instrument's underlying pair is `(base, quote)` **and** it trades on
+    /// `exchange` — the identity match shared by the kind-specific predicates above, with no
+    /// [`InstrumentKind`] constraint of its own.
+    ///
+    /// Both `base` AND `quote` are matched: [`Underlying`](rustrade_instrument::instrument::Underlying)
+    /// is a full pair identity, so without the quote filter a BTC/USDT action would also reach
+    /// BTC/USDC instruments.
+    fn is_on_underlying(&self, base: &AssetKey, quote: &AssetKey, exchange: &ExchangeKey) -> bool
+    where
+        AssetKey: PartialEq,
+        ExchangeKey: PartialEq,
+    {
+        self.instrument.underlying.base == *base
             && self.instrument.underlying.quote == *quote
             && self.instrument.exchange == *exchange
     }

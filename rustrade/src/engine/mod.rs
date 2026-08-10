@@ -721,7 +721,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///    instrument, not the (supported) kind:
     ///    - target instrument is not `Spot` ⇒ [`UnsupportedCorporateActionReason::InstrumentKindNotSupported`];
     ///    - action kind is not a stock split ⇒ [`UnsupportedCorporateActionReason::ActionKindNotSupported`]
-    ///      (the compiler-mandated arm for the `#[non_exhaustive]` [`CorporateActionKind`]).
+    ///      (the compiler-mandated arm for the `#[non_exhaustive]` [`CorporateActionKind`]);
+    ///    - another registered instrument is also split-eligible on the target's
+    ///      `(base, quote, exchange)` ⇒ [`UnsupportedCorporateActionReason::AmbiguousSplitTarget`],
+    ///      because the option chain below is resolved by that identity alone.
     /// 3. Snapshot resting orders into [`EngineOutput::OpenOrdersAtSplit`] (no cancellation).
     /// 4. Apply the split to every open position — the same per-position rescale as
     ///    [`Position::apply_split`](crate::engine::state::position::Position::apply_split), but the
@@ -746,7 +749,13 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///      **cannot** adjust them (the OCC assigns a new contract identity), so it emits
     ///      [`EngineOutput::OptionPositionsRequireIdentityChange`] and leaves them at pre-split
     ///      terms. The equity split is applied and the `id` recorded **regardless**.
-    /// 6. Record `id` in `corporate_actions_processed`.
+    ///
+    ///    On the **standard** path `id` is recorded in each adjusted option's *own*
+    ///    `corporate_actions_processed`, so an option already carrying it is skipped rather than
+    ///    strike-divided twice — surfaced as a per-option
+    ///    [`EngineOutput::CorporateActionAlreadyProcessed`]. The non-standard path mutates no option
+    ///    state and therefore records nothing on the options.
+    /// 6. Record `id` in the **target's** `corporate_actions_processed`.
     ///
     /// # Missing last price
     /// If the instrument's last price is unavailable the split is **still applied** and the `id`
@@ -872,6 +881,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // below carry no overflow error path — the previous per-position `apply_split` `unreachable!`
         // arms are gone by construction.
         let split_plan = match self.state.instruments.prepare_corporate_action_split(
+            id,
             key,
             ratio,
             policy,
@@ -883,9 +893,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     %id,
                     instrument = ?key,
                     ?reason,
-                    "CorporateAction: split failed pre-validation (applying it would mutate \
-                     positions non-atomically) — emitting UnsupportedCorporateAction; id NOT \
-                     recorded (retryable once the blocking condition is resolved)."
+                    "CorporateAction rejected by pre-validation (an ambiguous target, or a \
+                     mutation that could not be applied atomically) — nothing was mutated. \
+                     Emitting UnsupportedCorporateAction; id NOT recorded (retryable once the \
+                     blocking condition is resolved)."
                 );
                 outputs.push(EngineOutput::UnsupportedCorporateAction {
                     instrument: *key,
@@ -1017,6 +1028,30 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // checked. `true` ⇒ adjust the options in place (standard split); `false` ⇒ signal a
         // downstream identity change (see [`option_split_adjust_in_place`]).
         if adjust_options_in_place {
+            // Surface every option this action had ALREADY adjusted (its own
+            // `corporate_actions_processed` carries `id`), which pre-validation excluded from the
+            // plan so the strike is not divided twice. Reported as the same non-mutating
+            // `CorporateActionAlreadyProcessed` the target-level guard emits — same meaning, per
+            // instrument — so a consumer watching only the stream can tell a suppressed re-adjust
+            // from an option that simply had nothing to adjust. One aggregate warning, not one per
+            // option: a full chain can be large.
+            if !split_plan.options_already_adjusted.is_empty() {
+                warn!(
+                    %id,
+                    instrument = ?key,
+                    count = split_plan.options_already_adjusted.len(),
+                    "CorporateAction: options on the splitting underlying already carry this id \
+                     and were skipped (idempotent) — they were adjusted by an earlier delivery of \
+                     this same action."
+                );
+                outputs.extend(split_plan.options_already_adjusted.into_iter().map(
+                    |option_instrument| EngineOutput::CorporateActionAlreadyProcessed {
+                        instrument: option_instrument,
+                        kind: kind.clone(),
+                        id: id.clone(),
+                    },
+                ));
+            }
             self.commit_standard_option_split(id, ratio, split_plan.options, &mut outputs);
         } else {
             self.emit_option_identity_change(id, key, ratio, &mut outputs);
@@ -1049,6 +1084,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// carrying the CHECKED post-split strike and a `PreparedSplit` for every held position. No
     /// re-scan and no in-place `strike /=` (that previously-unchecked division is overflow-checked
     /// while preparing the plan) — the plan is authoritative, so this commit phase is infallible.
+    /// Options this action had already adjusted are absent from the plan (see
+    /// [`SplitPlan::options_already_adjusted`](crate::engine::state::instrument::SplitPlan)), so
+    /// every entry reaching this loop is one to mutate.
+    ///
+    /// Each adjusted option records `id` in its **own** `corporate_actions_processed`, which is what
+    /// makes that exclusion possible on a later delivery of the same action.
     fn commit_standard_option_split<OnTradingDisabled, OnDisconnect>(
         &mut self,
         id: &SmolStr,
@@ -1074,6 +1115,13 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             let strike_pre_split = contract.strike;
             contract.strike = opt_plan.strike_post_split;
             let strike_post_split = opt_plan.strike_post_split;
+
+            // Record `id` on the OPTION's own set, not just the target's: this option's strike has
+            // now been divided, and only its own record can stop a second trigger for the same
+            // action from dividing it again. Written here — before the unheld early-out below — so
+            // an unheld option, whose adjustment is otherwise a silent registry fix with no
+            // position event, carries the same evidence a held one does.
+            option_state.corporate_actions_processed.insert(id.clone());
 
             // Snapshot the option's resting orders as an observable BEFORE the unheld early-out
             // and before adjusting any positions — a broker price-adjusts them, so the engine
@@ -1582,12 +1630,21 @@ pub enum EngineOutput<
     /// correctly ignored" from "a successful split on an instrument with nothing to adjust" — both
     /// otherwise produce no mutation observables.
     ///
-    /// **No state was mutated** and no other observable accompanies this one. A consumer that folds
+    /// **`instrument` was not mutated.** A consumer that folds
     /// [`SplitRemainder`](Self::SplitRemainder) / [`PositionExit`](Self::PositionExit) /
     /// [`OptionPositionAdjustedForSplit`](Self::OptionPositionAdjustedForSplit) into a mutation
     /// tally must **not** count this variant.
+    ///
+    /// # Two emitters — read `instrument`, not the variant
+    /// - The **target** guard: the action named `instrument` and its `id` was already applied
+    ///   there. Nothing was mutated anywhere, and this is the only output of the event.
+    /// - The **per-option** guard on a standard split: `instrument` is an *option* on the splitting
+    ///   underlying that this same `id` had already adjusted, so its strike was not divided again.
+    ///   The rest of the action still proceeds, so this arrives **alongside** the target's mutation
+    ///   observables — one per suppressed option.
     CorporateActionAlreadyProcessed {
-        /// The instrument the duplicate action targeted.
+        /// The instrument that was skipped — the duplicate action's target, or an option on the
+        /// splitting underlying this action had already adjusted (see above).
         instrument: InstrumentKey,
         /// The re-submitted action's market-fact kind (carried verbatim for the consumer). This is
         /// the kind of the duplicate event, which — should a caller violate the idempotency contract
@@ -1661,6 +1718,22 @@ pub enum UnsupportedCorporateActionReason {
     /// read-only pre-validation pass, so **no** position was mutated. Indicates a corrupt or
     /// adversarial feed rather than a transient condition.
     ArithmeticOverflow,
+    /// The action's target is **not the unique split-eligible instrument** on its
+    /// `(base, quote, exchange)` underlying identity — at least one other registered instrument is
+    /// also split-eligible on the same identity.
+    ///
+    /// The option chain a split must adjust is resolved by that identity alone — every
+    /// [`InstrumentState`](crate::engine::state::instrument::InstrumentState) whose underlying pair
+    /// and exchange match the target's — so a second eligible instrument is an equally valid
+    /// trigger for adjusting the *same* chain:
+    /// nothing in the engine state can say which of the two the options are actually written on.
+    /// Applying the split anyway would divide every strike on the chain once per trigger, silently
+    /// for unheld options. The action is rejected before any mutation and the `id` is not recorded.
+    ///
+    /// **Not** self-healing on retry: the instrument set is fixed at construction, so resolving it
+    /// means constructing the engine with one deliverable instrument per underlying identity — the
+    /// registry is wrong, not the action.
+    AmbiguousSplitTarget,
 }
 
 /// Output produced by the [`Engine`] updating from an [`TradingState`], used to construct
