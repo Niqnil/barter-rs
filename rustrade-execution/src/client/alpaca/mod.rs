@@ -62,8 +62,10 @@ use itertools::Itertools as _;
 use lru::LruCache;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use rustrade_integration::protocol::websocket::{WebSocket, WsMessage};
 use serde::{Deserialize, Serialize};
@@ -1120,6 +1122,14 @@ async fn rest_delete_with_retry(
 
 impl ExecutionClient for AlpacaClient {
     const EXCHANGE: ExchangeId = ExchangeId::AlpacaBroker;
+
+    // Equities and crypto are both `Spot` here — Alpaca settles each as an outright holding, and
+    // the client separates them only by symbol shape. `Option` is genuinely routed: OCC symbols
+    // are detected to derive the `position_intent` that Alpaca requires on options orders.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
+        InstrumentKindDiscriminant::Spot,
+        InstrumentKindDiscriminant::Option,
+    ];
     type Config = AlpacaConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 

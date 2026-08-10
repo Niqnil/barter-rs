@@ -73,8 +73,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::Deserialize;
 use smol_str::format_smolstr;
@@ -515,6 +517,11 @@ async fn paginate_my_trades(
 
 impl ExecutionClient for BinanceSpot {
     const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
+
+    // Binance Spot trades spot pairs only; its derivatives live on separate USD-M/COIN-M venues
+    // with their own APIs, which this client does not speak.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] =
+        &[InstrumentKindDiscriminant::Spot];
     type Config = BinanceSpotConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 

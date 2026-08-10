@@ -42,7 +42,9 @@ use crate::{
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use rustrade_instrument::{
-    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use std::future::Future;
 
@@ -72,6 +74,24 @@ where
     Self: Clone,
 {
     const EXCHANGE: ExchangeId;
+
+    /// The [`InstrumentKindDiscriminant`]s this client can trade.
+    ///
+    /// A client works off [`InstrumentNameExchange`] strings and never inspects an instrument's
+    /// kind, so nothing downstream can infer this from the implementation — routing a `Future`
+    /// through a spot-only venue produces a rejected or, worse, misinterpreted order rather than a
+    /// type error. Declaring the set here lets [`ExecutionBuilder`] reject an unsupported
+    /// instrument set at build time, before any order is sent.
+    ///
+    /// Declare what the *venue and this implementation together* can actually route, not what the
+    /// exchange's product catalogue advertises. A kind the exchange offers but this client builds
+    /// no request for does not belong in the set.
+    ///
+    /// There is deliberately no default. A new client must state its capabilities rather than
+    /// inherit a permissive set that would silently admit every kind.
+    ///
+    /// [`ExecutionBuilder`]: https://docs.rs/rustrade/latest/rustrade/execution/builder/struct.ExecutionBuilder.html
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant];
 
     type Config: Clone;
     // `+ Send` required so generic code (e.g. ExecutionManager) can pass

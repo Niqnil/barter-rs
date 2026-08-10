@@ -103,8 +103,11 @@ use order::{
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId, ibkr::ContractRegistry,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    ibkr::ContractRegistry,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
 use smol_str::format_smolstr;
@@ -982,6 +985,18 @@ fn make_all_inactive_bracket(
 
 impl ExecutionClient for IbkrClient {
     const EXCHANGE: ExchangeId = ExchangeId::Ibkr;
+
+    // Mirrors the security types `ContractConfig::to_contract` can build: `STK` and `CASH` (forex)
+    // are both outright holdings and so map to `Spot`, `FUT` to `Future`, `OPT` to `Option`.
+    //
+    // `Cfd` is absent deliberately. IBKR does offer CFDs, but this client builds no `SecurityType`
+    // for them, so a CFD instrument would fail `to_contract` with `UnrecognizedSecurityType` at
+    // registration rather than trade.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
+        InstrumentKindDiscriminant::Spot,
+        InstrumentKindDiscriminant::Future,
+        InstrumentKindDiscriminant::Option,
+    ];
 
     type Config = IbkrConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;

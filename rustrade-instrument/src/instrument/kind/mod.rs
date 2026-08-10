@@ -10,6 +10,7 @@ use crate::instrument::{
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 
 /// Defines an [`PerpetualContract`].
 pub mod perpetual;
@@ -42,7 +43,51 @@ pub enum InstrumentKind<AssetKey> {
     Cfd(CfdContract<AssetKey>),
 }
 
+/// Names an [`InstrumentKind`] variant without its contract payload.
+///
+/// [`InstrumentKind`] carries per-contract data (`contract_size`, `settlement_asset`, expiry,
+/// strike) and is generic over `AssetKey`, so it can be neither named in a `const` nor compared
+/// without first constructing a contract. This is the payload-free spelling of *which* kind, which
+/// is what a venue needs in order to declare the kinds it can trade as a `const` capability set —
+/// see `ExecutionClient::SUPPORTED_KINDS` in `rustrade-execution`.
+///
+/// Deliberately distinct from [`MarketDataInstrumentKind`], which is not payload-free: its `Future`
+/// and `Option` variants carry the expiry and strike that bind a subscription. That type answers
+/// "which contract is this stream for"; this one answers "which family is this instrument".
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentKindDiscriminant {
+    Spot,
+    Perpetual,
+    Future,
+    Option,
+    Cfd,
+}
+
+impl Display for InstrumentKindDiscriminant {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            InstrumentKindDiscriminant::Spot => "spot",
+            InstrumentKindDiscriminant::Perpetual => "perpetual",
+            InstrumentKindDiscriminant::Future => "future",
+            InstrumentKindDiscriminant::Option => "option",
+            InstrumentKindDiscriminant::Cfd => "cfd",
+        })
+    }
+}
+
 impl<AssetKey> InstrumentKind<AssetKey> {
+    /// Returns the [`InstrumentKindDiscriminant`] naming this variant, discarding contract detail.
+    pub fn discriminant(&self) -> InstrumentKindDiscriminant {
+        match self {
+            InstrumentKind::Spot => InstrumentKindDiscriminant::Spot,
+            InstrumentKind::Perpetual(_) => InstrumentKindDiscriminant::Perpetual,
+            InstrumentKind::Future(_) => InstrumentKindDiscriminant::Future,
+            InstrumentKind::Option(_) => InstrumentKindDiscriminant::Option,
+            InstrumentKind::Cfd(_) => InstrumentKindDiscriminant::Cfd,
+        }
+    }
+
     /// Returns the `contract_size` value for the `InstrumentKind`.
     ///
     /// Note that `Spot` is always `Decimal::ONE`.

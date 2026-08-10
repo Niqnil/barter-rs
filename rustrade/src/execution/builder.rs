@@ -29,13 +29,13 @@ use rustrade_instrument::{
     index::IndexedInstruments,
     instrument::{
         Instrument, InstrumentIndex,
-        kind::{InstrumentKind, cfd::CfdContract},
+        kind::{InstrumentKind, InstrumentKindDiscriminant, cfd::CfdContract},
         name::InstrumentNameExchange,
         spec::{InstrumentSpec, InstrumentSpecQuantity, OrderQuantityUnits},
     },
 };
 use rustrade_integration::channel::{Channel, UnboundedTx, mpsc_unbounded};
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc},
     task::{AbortHandle, JoinError, JoinHandle},
@@ -89,21 +89,23 @@ impl<'a> ExecutionBuilder<'a> {
     /// The provided [`MockExecutionConfig`] is used to configure the [`MockExchange`] and provide
     /// the initial account state.
     ///
-    /// # Panics
-    /// Despite returning a `Result`, this **panics** if any indexed instrument on `mocked_exchange`
-    /// has an [`InstrumentKind`] other than `Spot` or `Cfd`. `MockExchange` models no expiry,
-    /// funding or contract chain, so a `Perpetual`, `Future` or `Option` has no faithful
-    /// projection. The panic happens here, at build time, rather than at first order — an
-    /// unbacktestable instrument set is a configuration error, and deferring it would surface as a
-    /// rejected order mid-run.
+    /// # Errors
+    /// Returns [`BarterError::ExecutionBuilder`] if any indexed instrument executed on
+    /// `mocked_exchange` has an [`InstrumentKind`] other than `Spot` or `Cfd`, per
+    /// [`MockExecution::SUPPORTED_KINDS`]. `MockExchange` models no expiry, funding or contract
+    /// chain, so a `Perpetual`, `Future` or `Option` has no faithful projection. This is rejected
+    /// here, at build time, rather than at first order — an unbacktestable instrument set is a
+    /// configuration error, and deferring it would surface as a rejected order mid-run.
     ///
-    /// It also panics if an instrument references a settlement asset absent from the index, which
+    /// # Panics
+    /// Panics if an instrument references a settlement asset absent from the index, which
     /// [`IndexedInstruments`] construction already rules out.
     ///
     /// [`InstrumentKind`]: rustrade_instrument::instrument::kind::InstrumentKind
+    /// [`MockExecution::SUPPORTED_KINDS`]: rustrade_execution::client::ExecutionClient::SUPPORTED_KINDS
     /// [`IndexedInstruments`]: rustrade_instrument::index::IndexedInstruments
     pub fn add_mock<Clock>(
-        mut self,
+        self,
         config: MockExecutionConfig,
         clock: Clock,
     ) -> Result<Self, BarterError>
@@ -123,15 +125,22 @@ impl<'a> ExecutionBuilder<'a> {
             event_rx,
         };
 
-        // Register MockExchange init Future
-        let mock_exchange_future = self.init_mock_exchange(config, request_rx, event_tx);
-        self.mock_exchange_futures.push(mock_exchange_future);
-
-        self.add_execution::<MockExecution<_>>(
+        // `add_execution` runs first so its supported-kind check rejects an unbacktestable
+        // instrument set before `init_mock_exchange` projects it. The projection panics on a kind
+        // the mock cannot model, so building it first would turn a returnable `Err` into an abort.
+        // The two futures are collected into separate queues, so their relative order is
+        // immaterial to the built infrastructure.
+        let mut this = self.add_execution::<MockExecution<_>>(
             mock_execution_client_config.mocked_exchange,
             mock_execution_client_config,
             DUMMY_EXECUTION_REQUEST_TIMEOUT,
-        )
+        )?;
+
+        // Register MockExchange init Future
+        let mock_exchange_future = this.init_mock_exchange(config, request_rx, event_tx);
+        this.mock_exchange_futures.push(mock_exchange_future);
+
+        Ok(this)
     }
 
     fn init_mock_exchange(
@@ -170,6 +179,8 @@ impl<'a> ExecutionBuilder<'a> {
         Client::AccountStream: Send,
         Client::Config: Send,
     {
+        validate_supported_instrument_kinds(self.instruments, exchange, Client::SUPPORTED_KINDS)?;
+
         let instrument_map = generate_execution_instrument_map(self.instruments, exchange)?;
 
         let (execution_tx, execution_rx) = mpsc_unbounded();
@@ -426,6 +437,11 @@ impl IntoIterator for ExecutionHandles {
 /// limit of the mock — it fills at price × quantity with no expiry, settlement or contract chain —
 /// not a statement about which kinds are executable in general.
 ///
+/// The same limit is declared as `MockExecution::SUPPORTED_KINDS`, which
+/// [`ExecutionBuilder::add_mock`] checks first, so through the builder an unsupported kind is a
+/// returned error and this panic is unreachable. Keep the two in step: widening `SUPPORTED_KINDS`
+/// without widening the match below converts that error back into a panic.
+///
 /// `Cfd` is supported because the mock accounts for a cash-settled position directly: it applies
 /// `contract_size` to the notional and the fee, and debits the **quote** asset in both directions.
 /// Without it every CFD-quoted dataset would panic at execution-build time and be unbacktestable.
@@ -435,7 +451,8 @@ impl IntoIterator for ExecutionHandles {
 /// why, and for the balances a caller must fund.
 ///
 /// [`MockExchange`]: rustrade_execution::exchange::mock::MockExchange
-#[allow(clippy::unwrap_used)] // Invariant: IndexedInstruments - all referenced assets exist; panics for unsupported InstrumentKind
+#[allow(clippy::unwrap_used)]
+// Invariant: IndexedInstruments - all referenced assets exist; panics for unsupported InstrumentKind
 fn generate_mock_exchange_instruments(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,
@@ -480,6 +497,12 @@ fn generate_mock_exchange_instruments(
                             .name_exchange
                             .clone(),
                     }),
+                    // Unreachable through `ExecutionBuilder`: `add_execution` rejects a kind
+                    // outside `MockExecution::SUPPORTED_KINDS` before this projection runs. Kept as
+                    // an assertion rather than a silent skip so that a `SUPPORTED_KINDS` widened
+                    // past what this match can project fails loudly here instead of dropping the
+                    // instrument from the mock exchange, which would look like a venue that simply
+                    // never fills it.
                     unsupported => {
                         panic!("MockExchange does not support: {unsupported:?}")
                     }
@@ -561,6 +584,52 @@ fn generate_mock_exchange_instruments(
             },
         )
         .collect()
+}
+
+/// Rejects an instrument set containing a kind the execution client for `exchange` cannot trade.
+///
+/// An [`ExecutionClient`] addresses instruments by [`InstrumentNameExchange`] and never inspects
+/// their [`InstrumentKind`], so an unsupported kind cannot fail at the type level. Left unchecked
+/// it surfaces at the first order, as a venue rejection or — where the wrong contract is nameable
+/// on the venue — as a fill against something the strategy did not intend to trade. Both are worse
+/// than refusing to build.
+///
+/// Only instruments whose **execution** venue is `exchange` are considered. An instrument merely
+/// priced on `exchange` (see [`Instrument::data_exchange`]) is never ordered through this client,
+/// so its kind is not this client's concern.
+///
+/// [`Instrument::data_exchange`]: rustrade_instrument::instrument::Instrument::data_exchange
+fn validate_supported_instrument_kinds(
+    instruments: &IndexedInstruments,
+    exchange: ExchangeId,
+    supported: &[InstrumentKindDiscriminant],
+) -> Result<(), BarterError> {
+    // BTreeSet so a set with many offending instruments reports each distinct kind once, in a
+    // deterministic order.
+    let unsupported = instruments
+        .instruments()
+        .iter()
+        .filter(|keyed| keyed.value.exchange.value == exchange)
+        .map(|keyed| keyed.value.kind.discriminant())
+        .filter(|kind| !supported.contains(kind))
+        .collect::<BTreeSet<_>>();
+
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    Err(BarterError::ExecutionBuilder(format!(
+        "{exchange} execution client cannot trade instrument kind(s): {}. It supports: {}",
+        join_kinds(unsupported.iter().copied()),
+        join_kinds(supported.iter().copied()),
+    )))
+}
+
+fn join_kinds(kinds: impl Iterator<Item = InstrumentKindDiscriminant>) -> String {
+    kinds
+        .map(|kind| kind.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -676,16 +745,14 @@ mod tests {
         assert_eq!(instrument.kind, InstrumentKind::Spot);
     }
 
-    /// The capability limit is real, not incidental: kinds the mock cannot fill still panic, so
-    /// adding `Cfd` did not quietly widen the mock to everything.
+    /// The projection's own assertion, reached here by calling it directly. Through
+    /// `ExecutionBuilder` this input is rejected earlier — see
+    /// `add_mock_rejects_an_unsupported_kind_without_panicking` — so this pins the inner guard
+    /// against a future `SUPPORTED_KINDS` that outgrows what the match can project.
     #[test]
     #[should_panic(expected = "MockExchange does not support")]
     fn mock_instruments_panic_on_an_unsupported_kind() {
-        let instruments = instruments(InstrumentKind::Future(FutureContract {
-            contract_size: dec!(1),
-            settlement_asset: asset("usd"),
-            expiry: at("2025-06-27T00:00:00Z"),
-        }));
+        let instruments = instruments(future());
 
         let _ = generate_mock_exchange_instruments(&instruments, EXCHANGE);
     }
@@ -699,5 +766,100 @@ mod tests {
         let mocked = generate_mock_exchange_instruments(&instruments, ExchangeId::BinanceSpot);
 
         assert!(mocked.is_empty());
+    }
+
+    fn future() -> InstrumentKind<Asset> {
+        InstrumentKind::Future(FutureContract {
+            contract_size: dec!(1),
+            settlement_asset: asset("usd"),
+            expiry: at("2025-06-27T00:00:00Z"),
+        })
+    }
+
+    /// The behaviour `SUPPORTED_KINDS` exists to produce: a kind the mock cannot model is a
+    /// returnable configuration error, not an abort. Asserting on `add_mock` rather than the
+    /// validator is deliberate — it pins the ordering against `init_mock_exchange`, whose
+    /// projection still panics on the same input.
+    #[test]
+    fn add_mock_rejects_an_unsupported_kind_without_panicking() {
+        let instruments = instruments(future());
+
+        // `ExecutionBuilder` has no `Debug`, so the success arm cannot be unwrapped via
+        // `expect_err`.
+        let Err(error) = ExecutionBuilder::new(&instruments).add_mock(
+            mock_config(),
+            HistoricalClock::new(at("2025-03-24T22:00:00Z")),
+        ) else {
+            panic!("a Future instrument is not backtestable on MockExchange")
+        };
+
+        let BarterError::ExecutionBuilder(message) = error else {
+            panic!("expected an ExecutionBuilder error, got {error:?}")
+        };
+        assert!(
+            message.contains("future"),
+            "the error must name the offending kind, got: {message}"
+        );
+        assert!(
+            message.contains("spot") && message.contains("cfd"),
+            "the error must name the kinds that would work, got: {message}"
+        );
+    }
+
+    /// Only the *execution* venue's instruments are the client's concern. An instrument executed
+    /// elsewhere but priced here must not be judged against this client's capabilities — otherwise
+    /// adding a data venue could break an execution setup that trades nothing on it.
+    #[test]
+    fn validation_ignores_instruments_executed_on_another_exchange() {
+        let instruments = instruments(future());
+
+        validate_supported_instrument_kinds(
+            &instruments,
+            ExchangeId::BinanceSpot,
+            &[InstrumentKindDiscriminant::Spot],
+        )
+        .expect("the Future is executed on EXCHANGE, not on the venue being validated");
+    }
+
+    /// Each distinct offending kind is reported once, in a deterministic order, rather than once
+    /// per instrument.
+    #[test]
+    fn validation_reports_each_unsupported_kind_once() {
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(Instrument::new(
+                EXCHANGE,
+                "a",
+                "a",
+                Underlying::new(asset("spx500"), asset("usd")),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                future(),
+                None,
+            ))
+            .add_instrument(Instrument::new(
+                EXCHANGE,
+                "b",
+                "b",
+                Underlying::new(asset("ftse100"), asset("usd")),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                future(),
+                None,
+            ))
+            .build();
+
+        let error = validate_supported_instrument_kinds(
+            &instruments,
+            EXCHANGE,
+            &[InstrumentKindDiscriminant::Spot],
+        )
+        .expect_err("both instruments are Futures on a spot-only client");
+
+        let BarterError::ExecutionBuilder(message) = error else {
+            panic!("expected an ExecutionBuilder error, got {error:?}")
+        };
+        assert_eq!(
+            message.matches("future").count(),
+            1,
+            "the offending kind must be deduplicated, got: {message}"
+        );
     }
 }
