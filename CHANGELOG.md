@@ -1540,6 +1540,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fmt::Pointer` impl for `Atomic`/`Shared` when the underlying pointer is null). A transitive
   dependency (via `ibapi` and, in dev builds, `rayon`/`criterion`); the bump is a `Cargo.lock`-only
   patch within the existing `0.9` constraint.
+- Updated `lru` to 0.18.2 to clear RUSTSEC-2026-0253 (`LruCache::pop()` was not panic-safe: a
+  panicking key `Drop` skipped `detach()`, leaving a dangling pointer in the internal linked list
+  for a later eviction to write through — use-after-free and potential double-free). `lru` backs
+  the WebSocket event-deduplication cache behind the `alpaca` and `binance` features; reaching the
+  bug additionally requires `catch_unwind` around a panicking key `Drop`, and the cache is keyed on
+  plain owned data, so the workspace could not trigger it. The bump is a `Cargo.lock`-only patch
+  within the existing `0.18` constraint.
 
 ## [0.5.0] - 2026-06-19
 
