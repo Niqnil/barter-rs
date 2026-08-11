@@ -1,4 +1,5 @@
 use derive_more::Constructor;
+use fnv::FnvHashSet;
 use indexmap::IndexMap;
 use rustrade_instrument::{
     exchange::{ExchangeId, ExchangeIndex},
@@ -314,11 +315,12 @@ impl VenueRole {
             (true, true) => Self::Both,
             (true, false) => Self::DataOnly,
             (false, true) => Self::ExecutionOnly,
-            // Unreachable by construction: an `IndexedInstruments` exchange is only ever registered
-            // as some `Instrument`s execution venue or as its data venue, so every indexed exchange
-            // provides at least one dimension. `Both` is the conservative fallback — it withholds
-            // `Healthy` until there is evidence, rather than declaring a venue with no known
-            // connections healthy.
+            // Reachable only as a misconfiguration, and only once execution venues are declared: a
+            // venue whose every instrument is priced elsewhere, and which was never given an
+            // execution client, provides neither dimension. `Both` is the conservative fallback — it
+            // withholds `Healthy` until there is evidence, rather than declaring a venue with no
+            // known connections healthy. The caller reports it; see
+            // `generate_empty_indexed_connectivity_states`.
             (false, false) => Self::Both,
         }
     }
@@ -383,23 +385,40 @@ impl ConnectivityState {
 /// connections initially set to [`Health::Reconnecting`].
 ///
 /// # Venue roles
-/// Each exchange's [`VenueRole`] is derived one dimension at a time, from the instruments
-/// themselves:
-/// - it has the **market data** dimension iff it is the effective data venue
-///   ([`Instrument::data_exchange`](rustrade_instrument::instrument::Instrument::data_exchange)) of
-///   at least one instrument;
-/// - it has the **account** dimension iff it is the execution venue (`Instrument::exchange`) of at
-///   least one instrument.
+/// Each exchange's [`VenueRole`] is derived one dimension at a time. Deriving them independently is
+/// what makes a split configuration converge. Were the role instead assigned per provider — "this
+/// one is the data venue, so it is `DataOnly`" — the *execution* venue of the same instrument would
+/// keep its market data dimension and wait forever on a subscription that is never made, and
+/// [`ConnectivityStates::global`] would never reach [`Health::Healthy`].
 ///
-/// Deriving both independently is what makes a split configuration converge. Were the role instead
-/// assigned per provider — "this one is the data venue, so it is `DataOnly`" — the *execution* venue
-/// of the same instrument would keep its market data dimension and wait forever on a subscription
-/// that is never made, and [`ConnectivityStates::global`] would never reach [`Health::Healthy`].
+/// The two dimensions have **different** sources of truth, and this asymmetry is the point:
+/// - **Market data** is instrument-derived: a venue has the dimension iff it is the effective data
+///   venue ([`Instrument::data_exchange`](rustrade_instrument::instrument::Instrument::data_exchange))
+///   of at least one instrument. That is exact, because subscriptions are generated from the very
+///   same field.
+/// - **Account** is *execution-derived*: a venue has the dimension iff an execution client is
+///   registered against it, since account events reach the engine only from a registered
+///   `ExecutionManager`. The instrument model cannot answer this — `Instrument::exchange` names the
+///   venue an instrument *would* be executed on, not whether anything is wired up to execute there.
+///
+/// # `execution_venues`, and what happens without it
+/// Pass `Some` set of venues that have a registered execution client whenever it is known;
+/// [`SystemBuilder`](crate::system::builder::SystemBuilder) does this automatically.
+///
+/// `None` falls back to approximating the account dimension as "is the execution venue of at least
+/// one instrument". That is correct for the common configuration where every venue holding
+/// instruments is also traded on, and it is the behaviour that predates this parameter — but it is
+/// **wrong for a venue that prices instruments without executing any**. Such a venue is assigned
+/// [`VenueRole::Both`], its account connection is then waited on forever, and
+/// [`ConnectivityStates::global`] never reaches [`Health::Healthy`]. Declaring the venues closes
+/// that gap; see [`EngineStateBuilder::execution_venues`](crate::engine::state::builder::EngineStateBuilder::execution_venues).
 ///
 /// # Arguments
 /// * `instruments` - Reference to [`IndexedInstruments`] containing what exchanges are being tracked.
+/// * `execution_venues` - Venues with a registered execution client, if known. See above.
 pub fn generate_empty_indexed_connectivity_states(
     instruments: &IndexedInstruments,
+    execution_venues: Option<&FnvHashSet<ExchangeId>>,
 ) -> ConnectivityStates {
     // Scans the instruments once per exchange rather than building a lookup: this runs once at
     // startup, and the exchange count is a handful even for large instrument collections.
@@ -414,13 +433,29 @@ pub fn generate_empty_indexed_connectivity_states(
                 .iter()
                 .any(|instrument| instrument.value.data_exchange().value == exchange);
 
-            let has_account = instruments
-                .instruments()
-                .iter()
-                .any(|instrument| instrument.value.exchange.value == exchange);
+            let has_account = match execution_venues {
+                Some(venues) => venues.contains(&exchange),
+                None => instruments
+                    .instruments()
+                    .iter()
+                    .any(|instrument| instrument.value.exchange.value == exchange),
+            };
 
             let role = VenueRole::from_dimensions(has_market_data, has_account);
-            info!(%exchange, ?role, "EngineState tracking exchange connectivity");
+
+            if has_market_data || has_account {
+                info!(%exchange, ?role, "EngineState tracking exchange connectivity");
+            } else {
+                // Every instrument on this venue is priced elsewhere and nothing executes here, so
+                // there is no connection it could ever report healthy. Said out loud rather than
+                // left to be inferred from a `global` that never leaves `Reconnecting`.
+                warn!(
+                    %exchange,
+                    ?role,
+                    "EngineState tracking an exchange that provides neither market data nor \
+                     execution - global connectivity cannot reach Healthy while it is tracked"
+                );
+            }
 
             (exchange, ConnectivityState::new(role))
         })
@@ -451,7 +486,7 @@ mod tests {
 
     #[test]
     fn a_split_configuration_gives_each_venue_only_the_dimension_it_provides() {
-        let states = generate_empty_indexed_connectivity_states(&split_venue_instruments());
+        let states = generate_empty_indexed_connectivity_states(&split_venue_instruments(), None);
 
         assert_eq!(states.exchanges.len(), 2);
         assert_eq!(states.connectivity(&DATA).role, VenueRole::DataOnly);
@@ -465,7 +500,7 @@ mod tests {
     #[test]
     fn a_single_venue_instrument_leaves_its_venue_providing_both_dimensions() {
         let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
-        let states = generate_empty_indexed_connectivity_states(&instruments);
+        let states = generate_empty_indexed_connectivity_states(&instruments, None);
 
         assert_eq!(states.exchanges.len(), 1);
         assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::Both);
@@ -477,13 +512,88 @@ mod tests {
             instrument(EXECUTION, "btc", "usdt").with_data_venue(DataVenue::new_same_name(DATA)),
             instrument(DATA, "eth", "usdt"),
         ]);
-        let states = generate_empty_indexed_connectivity_states(&instruments);
+        let states = generate_empty_indexed_connectivity_states(&instruments, None);
 
         assert_eq!(states.connectivity(&DATA).role, VenueRole::Both);
         assert_eq!(
             states.connectivity(&EXECUTION).role,
             VenueRole::ExecutionOnly
         );
+    }
+
+    /// The two-instrument pattern: one instrument priced on `DATA` and never traded, a *different*
+    /// instrument traded on `EXECUTION`. Nothing executes on `DATA`.
+    fn two_instrument_pattern() -> IndexedInstruments {
+        IndexedInstruments::new([
+            instrument(DATA, "xau", "usd"),
+            instrument(EXECUTION, "btc", "usdt"),
+        ])
+    }
+
+    #[test]
+    fn a_venue_that_prices_instruments_without_executing_any_is_data_only() {
+        let instruments = two_instrument_pattern();
+        let states = generate_empty_indexed_connectivity_states(
+            &instruments,
+            Some(&FnvHashSet::from_iter([EXECUTION])),
+        );
+
+        // `DATA` is the `Instrument::exchange` of the priced instrument, so the instrument model
+        // alone claims it holds an account. Only the declared execution venues can say otherwise.
+        assert_eq!(states.connectivity(&DATA).role, VenueRole::DataOnly);
+        assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::Both);
+    }
+
+    #[test]
+    fn without_declared_execution_venues_a_pricing_only_venue_is_approximated_as_both() {
+        // Pins the documented fallback, and is exactly the configuration it gets wrong: `DATA` is
+        // handed an account dimension nothing will ever satisfy. Declaring the execution venues --
+        // as `SystemBuilder` does -- is what closes it, per the test above.
+        let instruments = two_instrument_pattern();
+        let states = generate_empty_indexed_connectivity_states(&instruments, None);
+
+        assert_eq!(states.connectivity(&DATA).role, VenueRole::Both);
+    }
+
+    #[test]
+    fn global_health_reaches_healthy_when_the_pricing_only_venue_never_reports_an_account() {
+        let instruments = two_instrument_pattern();
+        let execution_index = instruments.find_exchange_index(EXECUTION).unwrap();
+        let mut states = generate_empty_indexed_connectivity_states(
+            &instruments,
+            Some(&FnvHashSet::from_iter([EXECUTION])),
+        );
+
+        // Every connection that exists reports in. `DATA` has no account stream and never will.
+        states.update_from_market_event(&DATA).unwrap();
+        states.update_from_market_event(&EXECUTION).unwrap();
+        assert_eq!(
+            states.global,
+            Health::Reconnecting,
+            "the execution venue's account has not reported yet"
+        );
+        states.update_from_account_event(&execution_index);
+
+        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(
+            states.connectivity(&DATA).account,
+            Health::Reconnecting,
+            "the dimension it does not have stays at its default, and is simply not consulted"
+        );
+    }
+
+    #[test]
+    fn a_venue_providing_neither_dimension_conservatively_demands_both() {
+        // Misconfiguration: `EXECUTION` holds an instrument priced elsewhere, and no execution
+        // client was registered for it. Reachable only once execution venues are declared. Health
+        // is withheld rather than granted to a venue with no known connection.
+        let instruments = split_venue_instruments();
+        let states =
+            generate_empty_indexed_connectivity_states(&instruments, Some(&FnvHashSet::default()));
+
+        assert_eq!(states.connectivity(&DATA).role, VenueRole::DataOnly);
+        assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::Both);
+        assert!(!states.connectivity(&EXECUTION).all_healthy());
     }
 
     #[test]
@@ -533,7 +643,7 @@ mod tests {
         for market_data_first in [true, false] {
             let instruments = split_venue_instruments();
             let execution = instruments.find_exchange_index(EXECUTION).unwrap();
-            let mut states = generate_empty_indexed_connectivity_states(&instruments);
+            let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
 
             assert_eq!(states.global, Health::Reconnecting);
 
@@ -566,7 +676,7 @@ mod tests {
         // else was healthy, and only panicked once a reconnect dragged global back down. Reaching
         // `Healthy` first is therefore the whole point of this setup.
         let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
-        let mut states = generate_empty_indexed_connectivity_states(&instruments);
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
 
         let execution = instruments.find_exchange_index(EXECUTION).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
@@ -589,7 +699,7 @@ mod tests {
         // venues it does track -- and could never be repaired, since no later event for it can
         // restore a `ConnectivityState` that does not exist.
         let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
-        let mut states = generate_empty_indexed_connectivity_states(&instruments);
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
 
         let execution = instruments.find_exchange_index(EXECUTION).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
@@ -611,7 +721,7 @@ mod tests {
     #[test]
     fn a_tracked_exchange_disconnect_still_degrades_global_health() {
         let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
-        let mut states = generate_empty_indexed_connectivity_states(&instruments);
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
 
         let execution = instruments.find_exchange_index(EXECUTION).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();

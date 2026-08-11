@@ -237,10 +237,19 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             )?
             .build();
 
+        // Venues that actually have an execution client, which is what decides whether the engine
+        // will ever receive an AccountStream event from them. Read before `execution_tx_map` is
+        // moved into the Engine below.
+        let execution_venues = (&execution.execution_tx_map)
+            .into_iter()
+            .filter_map(|(exchange, tx)| tx.as_ref().map(|_| *exchange))
+            .collect::<Vec<_>>();
+
         // Build EngineState
         let state = EngineStateBuilder::new(instruments, global_data, instrument_data_init)
             .time_engine_start(clock.time())
             .trading_state(trading_state)
+            .execution_venues(execution_venues)
             .balances(
                 balances
                     .into_iter()

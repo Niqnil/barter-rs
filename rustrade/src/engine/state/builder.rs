@@ -11,7 +11,7 @@ use crate::{
     statistic::summary::asset::BalanceBasis,
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use rustrade_execution::balance::{AssetBalance, Balance};
 use rustrade_instrument::{
     Keyed,
@@ -43,6 +43,9 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     /// [`BalanceBasis::NetAsset`] to compute drawdown and end-of-session balance from net asset
     /// value on margin accounts — see its docs for the net-must-stay-positive precondition.
     balance_basis: BalanceBasis,
+    /// Venues with a registered execution client, if known — see
+    /// [`EngineStateBuilder::execution_venues`].
+    execution_venues: Option<FnvHashSet<ExchangeId>>,
 }
 
 impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
@@ -67,7 +70,34 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             instrument_data_init,
             oms_mode: OmsMode::Netting,
             balance_basis: BalanceBasis::default(),
+            execution_venues: None,
         }
+    }
+
+    /// Declare which venues have a registered execution client.
+    ///
+    /// Only these venues are given an account connection to wait on. Without this, the account
+    /// dimension is approximated from the instrument model — "is the execution venue of at least one
+    /// instrument" — which is correct whenever every venue holding instruments is also traded on,
+    /// and wrong for a venue that supplies prices without executing anything.
+    ///
+    /// That distinction matters for any configuration that prices an instrument on one venue and
+    /// trades a *different* instrument on another: the pricing venue would otherwise be assigned
+    /// [`VenueRole::Both`](crate::engine::state::connectivity::VenueRole::Both), wait forever on an
+    /// account connection nothing will ever establish, and hold
+    /// [`ConnectivityStates::global`](crate::engine::state::connectivity::ConnectivityStates::global)
+    /// at [`Health::Reconnecting`](crate::engine::state::connectivity::Health::Reconnecting) for the
+    /// life of the run.
+    ///
+    /// [`SystemBuilder`](crate::system::builder::SystemBuilder) calls this for you from the
+    /// execution clients it registers. Provide it by hand when constructing an `EngineState`
+    /// directly — eg/ for [`backtest`](crate::backtest::backtest), which takes a pre-built state.
+    pub fn execution_venues<Iter>(mut self, venues: Iter) -> Self
+    where
+        Iter: IntoIterator<Item = ExchangeId>,
+    {
+        self.execution_venues = Some(venues.into_iter().collect());
+        self
     }
 
     /// Optionally provide the initial `TradingState`.
@@ -168,6 +198,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             instrument_data_init,
             oms_mode,
             balance_basis,
+            execution_venues,
         } = self;
 
         // Default if not provided
@@ -178,7 +209,8 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         let trading = trading_state.unwrap_or_default();
 
         // Construct empty ConnectivityStates
-        let connectivity = generate_empty_indexed_connectivity_states(instruments);
+        let connectivity =
+            generate_empty_indexed_connectivity_states(instruments, execution_venues.as_ref());
 
         // Update empty AssetStates from provided exchange asset Balances
         let mut assets = generate_empty_indexed_asset_states(instruments, balance_basis);
