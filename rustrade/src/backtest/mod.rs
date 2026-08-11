@@ -76,7 +76,10 @@ pub struct BacktestArgsConstant<MarketData, SummaryInterval, State, AuxEvents = 
     pub market_data: MarketData,
     /// Time interval for aggregating and reporting summary statistics.
     pub summary_interval: SummaryInterval,
-    /// EngineState.
+    /// The [`EngineState`] every backtest in the batch starts from.
+    ///
+    /// Built by the caller, and never modified here — see the `# Connectivity` section on
+    /// [`backtest`] for the one declaration this shifts onto the caller.
     pub engine_state: State,
     /// Source of auxiliary (non-market) `EngineEvent`s to interleave with the market data in
     /// simulated-time order (e.g. corporate actions, contract expiries).
@@ -260,6 +263,21 @@ where
 /// failed page fetch — **aborts the run**: the engine is shut down and that error is returned in
 /// place of a result. No partial [`BacktestSummary`] is ever produced, because statistics computed
 /// over a prefix of the dataset are indistinguishable from statistics over all of it.
+///
+/// # Connectivity: a caller obligation
+/// `backtest` takes a **pre-built** [`EngineState`] it cannot reach into, so it cannot declare which
+/// venues have an execution client — unlike [`SystemBuilder`], which does it for you. Build the state
+/// with [`EngineStateBuilder::execution_venues`] whenever some venue in the instrument collection is
+/// not traded on: an instrument registered purely so its prices are available, with nothing executing
+/// there, otherwise has that venue approximated as [`VenueRole::Both`] and waits forever on an account
+/// connection nothing will establish. `ConnectivityStates::global` then never leaves
+/// [`Health::Reconnecting`], and anything a strategy gates on global health stays gated for the whole
+/// run. Nothing errors — the run completes, having done nothing.
+///
+/// [`SystemBuilder`]: crate::system::builder::SystemBuilder
+/// [`EngineStateBuilder::execution_venues`]: crate::engine::state::builder::EngineStateBuilder::execution_venues
+/// [`VenueRole::Both`]: crate::engine::state::connectivity::VenueRole::Both
+/// [`Health::Reconnecting`]: crate::engine::state::connectivity::Health::Reconnecting
 pub async fn backtest<
     MarketData,
     SummaryInterval,

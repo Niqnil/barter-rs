@@ -303,3 +303,102 @@ pub trait BracketOrderClient: ExecutionClient {
         request: BracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
     ) -> impl Future<Output = BracketOrderResult> + Send;
 }
+
+/// The capability table, pinned.
+///
+/// [`ExecutionClient::SUPPORTED_KINDS`] is a `const`: widening one, or adding a kind a client builds
+/// no request for, compiles and passes clippy. The only thing it changes is which instruments
+/// [`ExecutionBuilder`](https://docs.rs/rustrade/latest/rustrade/execution/builder/struct.ExecutionBuilder.html)
+/// admits — so the failure mode is not a broken build but an instrument reaching a venue that cannot
+/// encode it, as a silently wrong order. These assertions exist so that changing a client's declared
+/// capabilities is a deliberate edit to a test that says what the venue can route, rather than a
+/// one-word diff nothing observes.
+///
+/// The real-client cases are each gated on their own feature, matching the module gates above; the
+/// mock case is ungated, like its module. So with `default = []`, a bare
+/// `cargo test -p rustrade-execution` compiles only the mock assertion — pinning a real client's
+/// capabilities requires `--features <name>` or `--all-features`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::mock::MockExecution;
+
+    #[test]
+    fn mock_supports_only_the_kinds_it_can_model() {
+        // No expiry, funding schedule or contract chain in `MockExchange`, so `Perpetual`, `Future`
+        // and `Option` have no faithful projection onto it. Kept in step with the projection in
+        // `generate_mock_exchange_instruments`, which panics on a kind it cannot project.
+        assert_eq!(
+            <MockExecution<fn() -> DateTime<Utc>> as ExecutionClient>::SUPPORTED_KINDS,
+            &[
+                InstrumentKindDiscriminant::Spot,
+                InstrumentKindDiscriminant::Cfd
+            ]
+        );
+    }
+
+    #[cfg(feature = "binance")]
+    #[test]
+    fn binance_spot_and_margin_are_spot_only() {
+        use crate::client::binance::{BinanceMargin, BinanceSpot};
+
+        assert_eq!(
+            BinanceSpot::SUPPORTED_KINDS,
+            &[InstrumentKindDiscriminant::Spot]
+        );
+        // Cross margin trades the same spot instruments on borrowed funds -- the leverage is in the
+        // account, not the instrument kind.
+        assert_eq!(
+            BinanceMargin::SUPPORTED_KINDS,
+            &[InstrumentKindDiscriminant::Spot]
+        );
+    }
+
+    #[cfg(feature = "hyperliquid")]
+    #[test]
+    fn hyperliquid_splits_perpetual_and_spot_across_two_clients() {
+        use crate::client::hyperliquid::{HyperliquidClient, spot::HyperliquidSpotClient};
+
+        assert_eq!(
+            HyperliquidClient::SUPPORTED_KINDS,
+            &[InstrumentKindDiscriminant::Perpetual]
+        );
+        assert_eq!(
+            HyperliquidSpotClient::SUPPORTED_KINDS,
+            &[InstrumentKindDiscriminant::Spot]
+        );
+    }
+
+    #[cfg(feature = "alpaca")]
+    #[test]
+    fn alpaca_trades_equities_and_options() {
+        use crate::client::alpaca::AlpacaClient;
+
+        assert_eq!(
+            AlpacaClient::SUPPORTED_KINDS,
+            &[
+                InstrumentKindDiscriminant::Spot,
+                InstrumentKindDiscriminant::Option
+            ]
+        );
+    }
+
+    #[cfg(feature = "ibkr")]
+    #[test]
+    fn ibkr_omits_cfd_because_it_builds_no_contract_for_one() {
+        use crate::client::ibkr::IbkrClient;
+
+        // `ContractConfig::to_contract` builds `STK`, `FUT`, `OPT` and `CASH` and nothing else, so a
+        // CFD routed here would be encoded as some other security type -- exactly the silent
+        // wrong-symbol order this const exists to reject. Adding `Cfd` to the list requires adding
+        // the arm first.
+        assert_eq!(
+            IbkrClient::SUPPORTED_KINDS,
+            &[
+                InstrumentKindDiscriminant::Spot,
+                InstrumentKindDiscriminant::Future,
+                InstrumentKindDiscriminant::Option
+            ]
+        );
+    }
+}

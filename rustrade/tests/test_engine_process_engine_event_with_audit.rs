@@ -21,7 +21,7 @@ use rustrade::{
         state::{
             EngineState,
             asset::AssetStates,
-            connectivity::Health,
+            connectivity::{ConnectivityDimension, Health, UntrackedExchange},
             global::DefaultGlobalData,
             instrument::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
@@ -4999,6 +4999,51 @@ fn test_corporate_action_ambiguous_split_target_rejected_without_mutating() {
         )),
         "a rejected split must emit no mutation observable"
     );
+
+    // The attack the per-option `id` record alone does NOT close: a wrapper emitting a DISTINCT id
+    // per held instrument defeats every idempotency guard, because no guard has seen that id before.
+    // Naming the *other* listing with a different id is the same ambiguity wearing a different hat,
+    // and must be rejected on the same grounds -- the uniqueness check reads only
+    // `(base, quote, exchange)`, never the id, which is what makes it immune here.
+    let audit_tick = process_with_audit(
+        &mut engine,
+        EngineEvent::CorporateAction {
+            id: "BTCUSD-2-1-split-listing-2".into(),
+            instrument: InstrumentIndex(2),
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(dec!(2)).unwrap(),
+            },
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+        },
+    );
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::UnsupportedCorporateAction {
+                instrument,
+                reason: UnsupportedCorporateActionReason::AmbiguousSplitTarget,
+                ..
+            } if *instrument == InstrumentIndex(2)
+        )),
+        "a fresh id against the second ambiguous listing must be rejected on the same grounds"
+    );
+
+    // Still untouched -- in particular the option chain, which a second silent pass would have
+    // adjusted a second time.
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(50_000));
 }
 
 /// A **held** option adjusted by a standard split records that action's `id` in its **own**
@@ -5335,4 +5380,65 @@ fn test_corporate_action_option_replica_parity_suppressed_readjust() {
         panic!("instrument 0 must be an option");
     };
     assert_eq!(contract.strike, dec!(25_000));
+}
+
+/// A `Reconnecting` event for an exchange the engine was never built against is **reported**, and
+/// nothing else happens: no `on_disconnect`, no connectivity mutation, no new tracked exchange.
+///
+/// `ConnectivityStates` is unit-tested at its own seam; this pins the two layers above it, which are
+/// where the decision actually lands. `Engine::update_from_{market,account}_stream` matches on the
+/// `Result` to choose between calling `Strategy::on_disconnect` and reporting, and `ProcessAudit`
+/// translates that choice into an `EngineOutput`. Swap those arms — fire `on_disconnect` for a venue
+/// the strategy has no link to, or drop the report instead of emitting it — and every other test in
+/// this suite still passes, because none of them names an exchange the engine does not track.
+#[test]
+fn test_untracked_exchange_reconnecting_is_reported_without_disconnect_or_mutation() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    // The engine is built from `BinanceSpot` instruments only. Nothing about this event is
+    // malformed — it is the shape a misconfigured subscription or execution client produces.
+    const UNTRACKED: ExchangeId = ExchangeId::Coinbase;
+    let tracked_before = engine.state.connectivity.clone();
+
+    let event = EngineEvent::Market(MarketStreamEvent::Reconnecting(UNTRACKED));
+    let audit = process_with_audit(&mut engine, event.clone());
+
+    assert_eq!(
+        audit.event,
+        EngineAudit::process_with_output(
+            event,
+            EngineOutput::UntrackedExchange(UntrackedExchange::new(
+                UNTRACKED,
+                ConnectivityDimension::MarketData
+            ))
+        ),
+        "the market-data dimension must be named, and no MarketDisconnect emitted"
+    );
+
+    let event = EngineEvent::Account(AccountStreamEvent::Reconnecting(UNTRACKED));
+    let audit = process_with_audit(&mut engine, event.clone());
+
+    assert_eq!(
+        audit.event,
+        EngineAudit::process_with_output(
+            event,
+            EngineOutput::UntrackedExchange(UntrackedExchange::new(
+                UNTRACKED,
+                ConnectivityDimension::Account
+            ))
+        ),
+        "the account dimension must be named, and no AccountDisconnect emitted"
+    );
+
+    // Reporting is the whole effect: an untracked exchange is not silently adopted into the
+    // collection, and the venues the engine does track are left exactly as they were.
+    assert_eq!(
+        engine.state.connectivity, tracked_before,
+        "an untracked exchange must not mutate connectivity state"
+    );
+    assert!(
+        !engine.state.connectivity.exchanges.contains_key(&UNTRACKED),
+        "an untracked exchange must not become tracked by reporting it"
+    );
 }

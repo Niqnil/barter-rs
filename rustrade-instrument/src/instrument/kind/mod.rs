@@ -394,4 +394,25 @@ mod tests {
         let actual = serde_json::from_str::<InstrumentKind<&str>>(&json).unwrap();
         assert_eq!(actual, kind);
     }
+
+    #[test]
+    fn test_discriminant_names_each_variant() {
+        // The match in `discriminant` is exhaustive, so a *missing* arm cannot compile -- but a
+        // transposed one (`Future(_) => Discriminant::Option`) compiles, passes clippy, and silently
+        // inverts every `ExecutionClient::SUPPORTED_KINDS` guard built on it: an instrument of a kind
+        // a venue cannot encode would be admitted, and one it can would be rejected. Nothing but this
+        // test stands between a typo here and the wrong-symbol order the capability set exists to
+        // prevent, so each pairing is asserted individually rather than by round-tripping a list.
+        assert_eq!(spot().discriminant(), InstrumentKindDiscriminant::Spot);
+        assert_eq!(
+            perpetual().discriminant(),
+            InstrumentKindDiscriminant::Perpetual
+        );
+        assert_eq!(future(1).discriminant(), InstrumentKindDiscriminant::Future);
+        assert_eq!(
+            option(1, Decimal::ONE).discriminant(),
+            InstrumentKindDiscriminant::Option
+        );
+        assert_eq!(cfd().discriminant(), InstrumentKindDiscriminant::Cfd);
+    }
 }

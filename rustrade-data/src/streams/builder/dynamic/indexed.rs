@@ -113,20 +113,26 @@ pub fn generate_indexed_market_data_subscription_batches(
 /// * `instruments` - Collection of `IndexedInstruments` used for indexing
 /// * `batches` - Iterator of `Subscription` batches to be indexed
 ///
-/// # Limitation: instruments carrying a [`DataVenue`] are not indexable here
+/// # Limitation: this function cannot honour a [`DataVenue`]
 /// Both lookups below resolve against `Subscription::exchange` as the instrument's **execution**
 /// venue — its assets via `find_asset_index`, and the instrument itself via `exchange.value ==
-/// exchange`. An instrument with a
-/// [`DataVenue`](rustrade_instrument::instrument::data_venue::DataVenue) is priced by one venue and
-/// executed on another, and its assets are registered only under the latter, so neither lookup can
-/// match it: naming the data venue fails to resolve the assets, and naming the execution venue
-/// finds an instrument the caller did not mean to subscribe to on that feed.
+/// exchange`. An instrument carrying a [`DataVenue`] is priced by one venue and executed on another,
+/// and its assets are registered only under the latter, so **hand-written subscriptions do not
+/// support dual-venue instruments**. The two spellings fail differently, and only one of them fails
+/// loudly:
 ///
-/// This returns [`DataError`] rather than mis-indexing — a caller cannot get the wrong
-/// `InstrumentIndex` out of it — but it does mean **hand-written subscriptions do not support
-/// dual-venue instruments**. Use
-/// [`generate_indexed_market_data_subscription_batches`] for those; it reads the data venue
+/// - Naming the **data venue** returns [`DataError`]: that venue has no registered assets, so
+///   `find_asset_index` cannot resolve the base or quote.
+/// - Naming the **execution venue** returns `Ok`. The `InstrumentIndex` is the right one for that
+///   instrument — a caller cannot get the *wrong* instrument out of this function — but the
+///   subscription it is attached to names the execution venue's feed and symbol, which is the venue
+///   the `DataVenue` exists to say the instrument is *not* priced on. Nothing here can detect that:
+///   the lookup is by `(exchange, kind, base, quote)` and every one of those matches.
+///
+/// Use [`generate_indexed_market_data_subscription_batches`] instead; it reads the data venue
 /// directly off each instrument and needs no name-based reverse lookup.
+///
+/// [`DataVenue`]: rustrade_instrument::instrument::data_venue::DataVenue
 pub fn index_market_data_subscription_batches<SubBatchIter, SubIter, Sub>(
     instruments: &IndexedInstruments,
     batches: SubBatchIter,
@@ -300,12 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn hand_written_subscriptions_reject_a_dual_venue_instrument_rather_than_mis_indexing_it() {
-        // Pins the documented limitation. The value here is the *shape* of the failure: a caller
-        // must not be able to receive an `InstrumentIndex` that resolves to an instrument priced
-        // by a venue other than the one they subscribed to, because every downstream event would
-        // then be attributed to the wrong instrument's state. An error is the correct outcome
-        // until the reverse lookup is redesigned to understand data venues.
+    fn hand_written_subscription_naming_the_data_venue_is_rejected() {
+        // Half the documented limitation -- the half that fails loudly. Assets are registered under
+        // the execution venue only, so LSE resolves neither leg. The value here is the *shape* of
+        // the failure: a caller must not be able to receive an `InstrumentIndex` that resolves to an
+        // instrument priced by a venue other than the one they subscribed to, because every
+        // downstream event would then be attributed to the wrong instrument's state.
         let instruments = IndexedInstruments::new([bp_priced_by_lse()]);
 
         let subscription = Subscription::new(
@@ -318,7 +324,44 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "a dual-venue instrument must not be indexable through the name-based path: {result:?}"
+            "the data venue registers no assets, so neither leg can resolve: {result:?}"
+        );
+    }
+
+    /// KNOWN GAP, pinned so that fixing it is a visible test change rather than a silent one.
+    ///
+    /// The other half of the limitation, and the half the rustdoc has to spell out because it does
+    /// *not* fail loudly: naming the execution venue matches on every component of the lookup key,
+    /// so the caller gets `Ok` and a subscription pointed at the venue the `DataVenue` exists to say
+    /// this instrument is not priced on. Rework this function to understand data venues and this
+    /// assertion should be inverted -- the caller cannot express "IBKR's feed for an LSE-priced
+    /// instrument" meaningfully, so `Err` is the defensible answer once the lookup can tell.
+    #[test]
+    fn hand_written_subscription_naming_the_execution_venue_succeeds_on_the_wrong_feed() {
+        let instruments = IndexedInstruments::new([bp_priced_by_lse()]);
+
+        let subscription = Subscription::new(
+            ExchangeId::Ibkr,
+            MarketDataInstrument::new("bp", "usd", MarketDataInstrumentKind::Spot),
+            SubKind::PublicTrades,
+        );
+
+        let batches = index_market_data_subscription_batches(&instruments, [[subscription]])
+            .expect(
+                "naming the execution venue resolves: its assets and instrument are registered",
+            );
+
+        let indexed = &batches[0][0];
+
+        // The instrument is the right one -- the documented guarantee that survives.
+        assert_eq!(indexed.instrument.key, InstrumentIndex(0));
+
+        // The feed is not. This is the wrong-feed subscription the rustdoc warns about.
+        assert_eq!(indexed.exchange, ExchangeId::Ibkr);
+        assert_ne!(
+            indexed.exchange,
+            instruments.instruments()[0].value.data_exchange().value,
+            "the subscription names a venue the instrument is explicitly not priced on"
         );
     }
 }

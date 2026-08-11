@@ -1,10 +1,10 @@
 use derive_more::Constructor;
 use fnv::FnvHashSet;
-use indexmap::IndexMap;
 use rustrade_instrument::{
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
 };
+use rustrade_integration::collection::FnvIndexMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -19,7 +19,10 @@ pub struct ConnectivityStates {
     pub global: Health,
 
     /// Connectivity `Health` of market data and account connections by exchange.
-    pub exchanges: IndexMap<ExchangeId, ConnectivityState>,
+    ///
+    /// Fnv-hashed: this is read on every market event, and `ExchangeId` is a fieldless enum — a key
+    /// small enough that SipHash's fixed per-call cost dominates. Insertion-ordered either way.
+    pub exchanges: FnvIndexMap<ExchangeId, ConnectivityState>,
 }
 
 impl ConnectivityStates {
@@ -337,9 +340,13 @@ pub struct ConnectivityState {
     /// Status of market data connection.
     ///
     /// Only meaningful when [`Self::role`] says market data is sourced from this venue. A
-    /// [`VenueRole::ExecutionOnly`] venue has no market data connection to establish, so this stays
-    /// at its [`Health::Reconnecting`] default indefinitely — read health via [`Self::all_healthy`],
-    /// or consult the role first, rather than this field alone.
+    /// [`VenueRole::ExecutionOnly`] venue has no market data connection to establish, so nothing is
+    /// expected to move this off its [`Health::Reconnecting`] default — read health via
+    /// [`Self::all_healthy`], or consult the role first, rather than this field alone.
+    ///
+    /// That is an expectation, not an invariant: [`ConnectivityStates::update_from_market_event`]
+    /// sets this `Healthy` for any *tracked* exchange, role notwithstanding. A market event arriving
+    /// for a venue declared `ExecutionOnly` means the role is wrong, and this field will say so.
     pub market_data: Health,
 
     /// Status of the account and execution connection.

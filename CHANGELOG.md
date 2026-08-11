@@ -380,27 +380,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `assets`, since a data-only venue holds no balances and registering it would seed balance
   state for a venue that can never report one — and market-data subscription batching groups by
   `data_exchange()`. Migration: `Instrument::new` / `Instrument::spot` are unchanged and set the
-  field to `None`, so only struct literals and destructuring patterns need touching. The field is
-  declared **last** deliberately: `Instrument` derives `Ord` and `IndexedInstrumentsBuilder` sorts
+  field to `None`, so only struct literals and destructuring patterns need touching. The same field
+  is added to `system::config::InstrumentConfig`, which has no constructor to shield literals from
+  it — it is `#[serde(default)]`, so configs written before it existed still deserialise. The field
+  is declared **last** deliberately: `Instrument` derives `Ord` and `IndexedInstrumentsBuilder` sorts
   before assigning `InstrumentIndex`, so appending renumbers no existing configuration.
-  *Known limitation:* `index_market_data_subscription_batches` resolves assets and instrument against
-  the **execution** venue, so it cannot index a dual-venue instrument. It fails loudly (`IndexError`)
-  rather than mis-resolving, and its rustdoc states the gap.
+  *Known limitation:* `index_market_data_subscription_batches` resolves both the assets and the
+  instrument against the **execution** venue, so it cannot honour a `DataVenue`. Naming the data
+  venue fails loudly (`IndexError`), since that venue holds no registered assets. Naming the
+  execution venue **succeeds** — the returned `InstrumentIndex` is correct, but the subscription it
+  is attached to names the wrong feed, and the function has no way to tell that the instrument is
+  priced elsewhere. Its rustdoc states both cases, and a test pins each.
 
-- **`VenueRole` — venues declare which connection dimensions they provide** (`rustrade`).
-  `ConnectivityState` gains `role: VenueRole { DataOnly, ExecutionOnly, Both }` and a
-  `ConnectivityState::new(role)` constructor; `all_healthy()` now consults only the dimensions a
-  venue actually has. Without this, any venue supplying market data without an account — which the
-  new `data_venue` makes ordinary — would hold its `account` at `Reconnecting` forever, so
-  `ConnectivityStates::global` could never reach `Healthy`, and everything gated on global health
-  would be permanently degraded. The role is derived per dimension rather than per provider, which
-  matters: marking only the data venue `DataOnly` fixes half the trap, leaving the *execution* venue
-  waiting on a market-data subscription that is never made. The field is `#[serde(default)]` to
-  `Both` — the semantics that predate it — so state persisted earlier deserialises unchanged.
+- **`VenueRole { DataOnly, ExecutionOnly, Both }`** (`rustrade`), naming which connection dimensions
+  a venue provides, alongside a `ConnectivityState::new(role)` constructor. See the **BREAKING**
+  Changed entry on `ConnectivityState` gaining the field for why it exists and how to migrate.
 
 - **`EngineStateBuilder::execution_venues`** (`rustrade`) declares which venues have a registered
   execution client, so only those are given an account connection to wait on. `SystemBuilder` calls
-  it automatically; provide it by hand when building an `EngineState` directly, as `backtest` does.
+  it automatically; provide it by hand when building an `EngineState` directly — which a `backtest`
+  caller must, precisely because `backtest` takes a pre-built state it cannot reach into.
   See the Fixed entry on the account connection dimension for what it corrects.
 
 - **`ExecutionClient::SUPPORTED_KINDS`** (`rustrade-execution`, `rustrade`), a required associated
@@ -874,6 +873,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an abort: the next poll fell through to draining the aux stream, emitting events at instants the
   market data never reached.
 
+- **BREAKING**: **`ConnectivityState` gains a `role: VenueRole` field** (`rustrade`), and
+  `all_healthy()` now consults only the dimensions that role says the venue actually has. Without
+  this, any venue supplying market data without an account — which the new `data_venue` makes
+  ordinary — would hold its `account` at `Reconnecting` forever, so `ConnectivityStates::global`
+  could never reach `Healthy`, and everything gated on global health would be permanently degraded.
+  The role is derived per dimension rather than per provider, which matters: marking only the data
+  venue `DataOnly` fixes half the trap, leaving the *execution* venue waiting on a market-data
+  subscription that is never made. Migration: struct literals and exhaustive destructuring patterns
+  must supply the field — use the new `ConnectivityState::new(role)`, or `..Default::default()`,
+  which yields the pre-existing `VenueRole::Both` semantics. The field is `#[serde(default)]` to
+  `Both`, so state persisted before it existed deserialises unchanged.
+
+- **BREAKING**: **`ConnectivityStates::exchanges` is an `FnvIndexMap`** (`rustrade`), not a
+  SipHash-keyed `indexmap::IndexMap`. It is looked up by `ExchangeId` on **every** market event now
+  that resolution precedes the global-health short-circuit (see the Fixed entry on the
+  untracked-exchange panic), and a fieldless enum key is exactly the shape SipHash's fixed
+  per-call setup cost is worst for. This also matches every sibling per-event keyed structure —
+  `InstrumentStates`, `AssetStates`, `MultiExchangeTxMap`. Iteration order is unchanged: `IndexMap`
+  is insertion-ordered regardless of hasher. Migration: the field is public, so code naming its type
+  or building one directly needs `rustrade_integration::collection::FnvIndexMap`; `IndexMap`'s API is
+  otherwise identical.
+
 - **BREAKING**: **The `ExchangeId`-keyed connectivity updates are now fallible** (`rustrade`).
   `ConnectivityStates::update_from_market_event`, `update_from_market_reconnecting` and
   `update_from_account_reconnecting` return `Result<(), UntrackedExchange>`, and
@@ -889,9 +910,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade`), as `Option<&FnvHashSet<ExchangeId>>`. Pass `None` to keep the previous
   instrument-derived behaviour. See the Fixed entry on the account connection dimension.
 
-- **BREAKING**: **`DataVenue::map_exchange_key` takes a lookup closure**, not a pre-resolved key
-  (`rustrade-instrument`). One key cannot serve two venues: the old shape could only stamp the
-  execution venue's key onto the data venue, which is wrong by construction once the two differ.
+- **BREAKING**: **`Instrument::map_exchange_key` takes a lookup closure**, not a pre-resolved key
+  (`rustrade-instrument`): `(self, exchange: NewExchangeKey)` becomes
+  `(self, find_exchange: impl Fn(&ExchangeKey) -> NewExchangeKey)`. One key cannot serve two venues:
+  the old shape could only stamp the execution venue's key onto the data venue, which is wrong by
+  construction once the two differ. Migration: pass a closure returning the key you used to pass —
+  `instrument.map_exchange_key(|_| key.clone())` reproduces the old behaviour exactly for an
+  instrument with no `data_venue`. `DataVenue::map_exchange_key` takes the same closure shape, but is
+  new API rather than a change.
 
 - **`UnindexedAccountSnapshot`s omit data-only venues instead of reporting them empty** (`rustrade`).
   `From<&EngineState> for FnvHashMap<ExchangeId, UnindexedAccountSnapshot>` iterated every tracked
