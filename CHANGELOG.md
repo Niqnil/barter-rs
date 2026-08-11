@@ -364,6 +364,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token" at fetch time. A runnable example
   (`ibkr_flex_corporate_actions`, `--features ibkr`) sketches the wrapper-side reconcile.
 
+- **BREAKING**: **A distinct market-data venue on `Instrument`** (`rustrade-instrument`,
+  `rustrade-data`, `rustrade`). `Instrument` gains `data_venue: Option<DataVenue<ExchangeKey>>`, so
+  one instrument can be priced on one venue and executed on another — the single `exchange` field
+  could not express that at all, which made live trading on a third-party price feed structurally
+  impossible. Modelling it as two separate instruments is not equivalent: position and
+  `pnl_unrealised` are strictly `InstrumentIndex`-scoped, so the traded instrument would never
+  receive the price updates landing on the other index, and its PnL would sit permanently stale.
+  `DataVenue` carries the exchange **and** an optional `name_exchange`, because two venues routinely
+  spell one instrument differently — a venue-only field would subscribe under the execution venue's
+  symbol and silently receive nothing, or another instrument's prices. Read it through the new
+  `Instrument::data_exchange()` / `data_name_exchange()` accessors, which apply the
+  fall-back-to-the-execution-venue rule in one place, and set it with `with_data_venue()`.
+  `IndexedInstrumentsBuilder` now registers both venues into `exchanges` — but deliberately **not**
+  into `assets`, since a data-only venue holds no balances and registering it would seed balance
+  state for a venue that can never report one — and market-data subscription batching groups by
+  `data_exchange()`. Migration: `Instrument::new` / `Instrument::spot` are unchanged and set the
+  field to `None`, so only struct literals and destructuring patterns need touching. The field is
+  declared **last** deliberately: `Instrument` derives `Ord` and `IndexedInstrumentsBuilder` sorts
+  before assigning `InstrumentIndex`, so appending renumbers no existing configuration.
+  *Known limitation:* `index_market_data_subscription_batches` resolves assets and instrument against
+  the **execution** venue, so it cannot index a dual-venue instrument. It fails loudly (`IndexError`)
+  rather than mis-resolving, and its rustdoc states the gap.
+
+- **`VenueRole` — venues declare which connection dimensions they provide** (`rustrade`).
+  `ConnectivityState` gains `role: VenueRole { DataOnly, ExecutionOnly, Both }` and a
+  `ConnectivityState::new(role)` constructor; `all_healthy()` now consults only the dimensions a
+  venue actually has. Without this, any venue supplying market data without an account — which the
+  new `data_venue` makes ordinary — would hold its `account` at `Reconnecting` forever, so
+  `ConnectivityStates::global` could never reach `Healthy`, and everything gated on global health
+  would be permanently degraded. The role is derived per dimension rather than per provider, which
+  matters: marking only the data venue `DataOnly` fixes half the trap, leaving the *execution* venue
+  waiting on a market-data subscription that is never made. The field is `#[serde(default)]` to
+  `Both` — the semantics that predate it — so state persisted earlier deserialises unchanged.
+
+- **`EngineStateBuilder::execution_venues`** (`rustrade`) declares which venues have a registered
+  execution client, so only those are given an account connection to wait on. `SystemBuilder` calls
+  it automatically; provide it by hand when building an `EngineState` directly, as `backtest` does.
+  See the Fixed entry on the account connection dimension for what it corrects.
+
+- **`ExecutionClient::SUPPORTED_KINDS`** (`rustrade-execution`, `rustrade`), a required associated
+  const listing the `InstrumentKindDiscriminant`s a client can trade, alongside the existing
+  `const EXCHANGE`. `rustrade-execution` had no kind guard whatsoever, so an instrument of a kind a
+  venue cannot encode reached that venue as a silent wrong-symbol order. `ExecutionBuilder::add_execution`
+  now rejects the build naming the offending client and kind. The new
+  `InstrumentKindDiscriminant { Spot, Perpetual, Future, Option, Cfd }` in `rustrade-instrument`
+  (plus `InstrumentKind::discriminant()`) exists because `InstrumentKind` carries data on four of its
+  five variants and so cannot itself be declared against; `MarketDataInstrumentKind` is deliberately
+  not reused, as it answers a different question. Declared support: Binance spot and margin `Spot`;
+  Hyperliquid perpetual `Perpetual` and spot `Spot`; Alpaca `Spot, Option`; IBKR `Spot, Future,
+  Option`; mock `Spot, Cfd`. IBKR omits `Cfd` deliberately — the client builds no security type for
+  them, so accepting one would produce exactly the silent wrong-symbol order this guards against.
+  **BREAKING** for external `ExecutionClient` implementors: the const has no default.
+
+- **`ConnectivityDimension` and `UntrackedExchange`** (`rustrade`), the reported detail when a market
+  or account event names an exchange the engine does not track — see the Fixed entry below.
+
+- **`UnsupportedCorporateActionReason::AmbiguousSplitTarget`** (`rustrade`), rejecting a stock split
+  whose target is not the unique deliverable instrument on its `(base, quote, exchange)` — see the
+  Fixed entry below. Appended last to the (`#[non_exhaustive]`) enum, which derives `Ord`.
+
 ### Changed
 
 - **Silent assumptions in the new LSE and streaming code are now observable.** None of these change
@@ -813,6 +873,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TimedMergeStream` is now **fused** and implements `FusedStream`, without which the abort was not
   an abort: the next poll fell through to draining the aux stream, emitting events at instants the
   market data never reached.
+
+- **BREAKING**: **The `ExchangeId`-keyed connectivity updates are now fallible** (`rustrade`).
+  `ConnectivityStates::update_from_market_event`, `update_from_market_reconnecting` and
+  `update_from_account_reconnecting` return `Result<(), UntrackedExchange>`, and
+  `EngineState::update_from_market` propagates it — see the Fixed entry on the untracked-exchange
+  panic. The `ExchangeIndex`-keyed accessors stay panicking, deliberately: those keys are derived
+  from the same `IndexedInstruments` the collection was built from, so an out-of-range one is a
+  library bug rather than a misconfigured input, and is not something a caller could handle.
+  `UpdateFromMarketOutput` and `UpdateFromAccountOutput` each gain an `UntrackedExchange` variant and
+  are now `#[non_exhaustive]` (adding the variant was already breaking, so the future-proofing is
+  absorbed here rather than costing a second break later).
+
+- **BREAKING**: **`generate_empty_indexed_connectivity_states` takes the execution venues**
+  (`rustrade`), as `Option<&FnvHashSet<ExchangeId>>`. Pass `None` to keep the previous
+  instrument-derived behaviour. See the Fixed entry on the account connection dimension.
+
+- **BREAKING**: **`DataVenue::map_exchange_key` takes a lookup closure**, not a pre-resolved key
+  (`rustrade-instrument`). One key cannot serve two venues: the old shape could only stamp the
+  execution venue's key onto the data venue, which is wrong by construction once the two differ.
+
+- **`UnindexedAccountSnapshot`s omit data-only venues instead of reporting them empty** (`rustrade`).
+  `From<&EngineState> for FnvHashMap<ExchangeId, UnindexedAccountSnapshot>` iterated every tracked
+  exchange, so a venue that only supplies market data produced an **empty** snapshot. The two claims
+  are not the same: an empty snapshot asserts a known, drained account, which a caller cannot
+  distinguish from a real one that has gone to zero — and seeding a `MockExecutionConfig::initial_state`
+  from it would stand up a mock account at a venue nothing trades on. A missing `ExchangeId` now means
+  "no account here", so callers must not assume every tracked exchange appears as a key.
+
+- **`EngineOutput::CorporateActionAlreadyProcessed` has two emitters** (`rustrade`), distinguished by
+  its `instrument` field: the pre-existing target-level replay suppression, and the new per-option
+  one described in the Fixed entry below. Its rustdoc previously claimed no other observable
+  accompanies it, which is no longer true — a suppressed chain adjustment emits one per skipped
+  option alongside an aggregate warning.
 
 ### Removed
 
@@ -1268,6 +1361,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bench_backtests_concurrent` groups previously panicked during setup and could not run — meaning any
   prior `--save-baseline` numbers for those two groups are not comparable across this change (they
   never completed). Benchmark-only; no library behaviour changes.
+
+- **An event from an untracked exchange is reported instead of panicking the engine** (`rustrade`).
+  A market or account event naming an exchange with no `ConnectivityState` hit
+  `panic!("ConnectivityStates does not contain: {key}")`. Worse than a panic, it was an
+  *intermittent* one: the lookup sat behind a `global == Healthy` early-return, so a misconfigured
+  exchange was silently ignored for as long as everything else stayed healthy and only brought the
+  engine down once a reconnect dragged global health back down — hours into a run. The exchange is
+  now resolved on **every** market event, including the healthy fast path, so the report fires on the
+  first event from that exchange in every run; the early-return still skips the state mutation. An
+  untracked exchange mutates nothing — including `global`, which previously went to `Reconnecting`
+  immediately before the panic — and surfaces as a non-mutating `EngineOutput::UntrackedExchange`.
+  `EngineState::update_from_market` returns before the positional `instrument_index_mut` lookup,
+  which would otherwise panic or, worse, misattribute the print to whichever instrument occupied that
+  slot. Untracked reconnects also skip `Strategy::on_disconnect`, since the strategy has no link to
+  that venue to react to. The audit replica reaches the same verdict by replaying the event rather
+  than mirroring the output. Cost of the unconditional lookup, measured rather than assumed: below
+  the noise floor of a ~50,000-market-event backtest bench (127.28 ms → 126.66 ms, within the
+  criterion noise threshold).
+
+- **The account connection dimension is derived from execution clients, not the instrument model**
+  (`rustrade`). A venue that supplies prices without executing anything was assigned
+  `VenueRole::Both`, so it waited forever on an account connection nothing would ever establish and
+  held `ConnectivityStates::global` at `Reconnecting` for the life of the run. The two dimensions
+  have different sources of truth: market data is instrument-derived and exactly so, since
+  subscriptions are generated from the same `data_exchange` field, but account events reach the
+  engine only from a registered `ExecutionManager`, and `Instrument::exchange` names the venue an
+  instrument *would* trade on — not whether anything is wired up to trade there. `SystemBuilder`
+  now reads the registered venues from the `MultiExchangeTxMap` it has already built, so the live
+  path is correct without the caller doing anything. This matters for any configuration pricing one
+  instrument on a venue it never trades on, including a strategy that decides on one instrument and
+  trades another. A venue providing neither dimension — instruments priced elsewhere, no execution
+  client registered — is reachable for the first time as a result; it stays `Both`, withholding
+  health rather than granting it to a venue with no known connection, and is reported with a warning.
+
+- **A stock split no longer double-adjusts an option chain** (`rustrade`).
+  `prepare_corporate_action_split` derived `(base, quote, exchange)` from the split target and
+  adjusted every option matching it, with nothing verifying the target was the unique deliverable
+  instrument on that underlying. Two instruments sharing that identity each acted as a valid trigger
+  for adjusting the whole chain, and the second pass was silent *and* unrecorded: unheld options took
+  the strike correction with no position event, and `corporate_actions_processed` was consulted only
+  on the target, so the mutated options carried no record at all. A re-delivered action therefore
+  halved an already-halved strike, surfacing months later as mis-settlement at contract expiry. Both
+  doors are now closed, because they are different doors — the existing idempotency guard is keyed on
+  action `id` alone and read only from the target's set, so recording alone is defeated by a distinct
+  `id` per instrument, while uniqueness alone leaves a same-`id` replay unrecorded on the options it
+  mutated:
+  - the split is rejected with `UnsupportedCorporateActionReason::AmbiguousSplitTarget` if any other
+    registered instrument is split-eligible on the target's `(base, quote, exchange)`, checked before
+    any mutation and before the ratio arithmetic, so an ambiguous target is reported as such even
+    when the arithmetic would also fail;
+  - each adjusted option records the action `id` in its **own** `corporate_actions_processed`,
+    written before the unheld early-out so a silent registry fix leaves the same evidence a held
+    position does, and the prepare pass filters options already carrying the `id` out of the plan.
+  Suppressed options are reported, not silently skipped — one
+  `EngineOutput::CorporateActionAlreadyProcessed` each plus a single aggregate warning, since a full
+  chain can be large. Dropping them would have reproduced the defect's own signature. Both guards
+  live in the shared prepare pass rather than being hand-mirrored, so the live handler and the audit
+  replica agree by construction.
 
 ### Security
 
