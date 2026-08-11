@@ -36,6 +36,37 @@ use serde::{Deserialize, Serialize};
 /// synthetic series (a CFD or index proxy) has no book at all. That basis mismatch is sound for
 /// research and paper trading, but for real capital it is a property the caller must opt into
 /// knowingly — the library cannot detect it.
+///
+/// # When a `DataVenue` is the wrong tool
+/// A `DataVenue` models **one** economic instrument that two venues both quote — the same shares,
+/// the same contract, the same pair — where all that differs is who publishes the prices and how
+/// they spell the symbol. It does not model *related but distinct* instruments: a spot-metal or
+/// index CFD against the corresponding future, a perpetual against its underlying spot, one
+/// maturity against another. Those have their own tick sizes, expiries, funding and basis;
+/// collapsing them onto one `Instrument` would mark a position against a series that is not that
+/// position's own market, and the resulting `pnl_unrealised` would be wrong rather than stale.
+///
+/// Trading one off the other is the **two-instrument pattern**, and it needs no library support:
+///
+/// 1. Register **both** as ordinary `Instrument`s — the one you price, and the one you trade. Each
+///    carries its own kind, its own underlying and its own venue. Only the traded instrument needs
+///    an execution client registered against its exchange.
+/// 2. Subscribe to market data for both, or for the priced one alone.
+/// 3. Read the priced instrument's state in the strategy, and emit orders keyed to the **traded**
+///    instrument. Nothing couples an order's instrument to the instrument whose prices motivated
+///    it — the order interface takes whatever instrument key you give it.
+/// 4. Own the conversion. Hedge ratio, contract multiplier, quantity and basis are a trading
+///    decision the library has no way to derive, and getting them wrong is silent.
+///
+/// The consequence to accept is the mirror image of the case this type exists for: the two
+/// instruments keep **separate** ledgers. Position and `pnl_unrealised` live on the traded
+/// instrument, which is correct, and the priced instrument holds no position at all. Reconciling
+/// them — treating an exposure opened against one as a hedge for a signal from the other — is the
+/// caller's, because only the caller knows the relationship.
+///
+/// This is also what makes a non-executable kind usable for live decisions. An instrument kind no
+/// execution client accepts can still price a strategy; it simply cannot be the instrument an order
+/// names.
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
