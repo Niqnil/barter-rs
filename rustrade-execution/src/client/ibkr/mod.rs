@@ -992,6 +992,13 @@ impl ExecutionClient for IbkrClient {
     // `Cfd` is absent deliberately. IBKR does offer CFDs, but this client builds no `SecurityType`
     // for them, so a CFD instrument would fail `to_contract` with `UnrecognizedSecurityType` at
     // registration rather than trade.
+    //
+    // Scope: this declares which `InstrumentKind`s the client can represent AT ALL, and is checked
+    // against `Instrument::kind`. It is NOT a check that a registered `ContractConfig` describes
+    // the instrument it is keyed to -- `security_type` is a caller-populated `String` registered
+    // independently into `ContractRegistry` and never compared against `Instrument::kind`. A
+    // registry entry naming `STK` for an instrument modelled as `Option` still builds a stock
+    // contract; this gate does not catch it.
     const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
         InstrumentKindDiscriminant::Spot,
         InstrumentKindDiscriminant::Future,

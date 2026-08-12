@@ -16,7 +16,9 @@ use crate::{
         Processor,
         clock::HistoricalClock,
         execution_tx::MultiExchangeTxMap,
-        state::{EngineState, instrument::data::InstrumentDataState},
+        state::{
+            EngineState, connectivity::reconcile_venue_roles, instrument::data::InstrumentDataState,
+        },
     },
     error::BarterError,
     risk::RiskManager,
@@ -33,6 +35,7 @@ use crate::{
     system::builder::{AuditMode, SystemBuild},
 };
 use chrono::{DateTime, Utc};
+use fnv::FnvHashSet;
 use futures::{Stream, StreamExt, future::try_join_all, stream::FusedStream};
 use rust_decimal::Decimal;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
@@ -78,8 +81,8 @@ pub struct BacktestArgsConstant<MarketData, SummaryInterval, State, AuxEvents = 
     pub summary_interval: SummaryInterval,
     /// The [`EngineState`] every backtest in the batch starts from.
     ///
-    /// Built by the caller, and never modified here — see the `# Connectivity` section on
-    /// [`backtest`] for the one declaration this shifts onto the caller.
+    /// Built by the caller, and never modified here: each run reconciles venue roles on its own
+    /// clone — see the `# Connectivity` section on [`backtest`].
     pub engine_state: State,
     /// Source of auxiliary (non-market) `EngineEvent`s to interleave with the market data in
     /// simulated-time order (e.g. corporate actions, contract expiries).
@@ -264,19 +267,26 @@ where
 /// place of a result. No partial [`BacktestSummary`] is ever produced, because statistics computed
 /// over a prefix of the dataset are indistinguishable from statistics over all of it.
 ///
-/// # Connectivity: a caller obligation
-/// `backtest` takes a **pre-built** [`EngineState`] it cannot reach into, so it cannot declare which
-/// venues have an execution client — unlike [`SystemBuilder`], which does it for you. Build the state
-/// with [`EngineStateBuilder::execution_venues`] whenever some venue in the instrument collection is
-/// not traded on: an instrument registered purely so its prices are available, with nothing executing
-/// there, otherwise has that venue approximated as [`VenueRole::Both`] and waits forever on an account
-/// connection nothing will establish. `ConnectivityStates::global` then never leaves
-/// [`Health::Reconnecting`], and anything a strategy gates on global health stays gated for the whole
-/// run. Nothing errors — the run completes, having done nothing.
+/// # Connectivity: derived, not declared
+/// Each venue's [`VenueRole`] is re-derived from the execution clients this function builds, on the
+/// clone it runs against — see [`reconcile_venue_roles`]. A venue registered purely so its prices
+/// are available, with nothing executing there, is therefore marked [`VenueRole::DataOnly`] and is
+/// never waited on for an account connection nothing would establish, whether or not the caller
+/// declared anything.
+///
+/// The supplied `engine_state` is not modified, and declaring the venues upfront with
+/// [`EngineStateBuilder::execution_venues`] remains supported: both derive the same roles from the
+/// same inputs, so a state built that way reconciles to itself.
+///
+/// One configuration still cannot converge, and is reported rather than inferred: a venue that
+/// neither prices an instrument nor has an execution client provides no connection that could
+/// report healthy, so `ConnectivityStates::global` stays [`Health::Reconnecting`] for the whole
+/// run. `reconcile_venue_roles` logs a warning naming it.
 ///
 /// [`SystemBuilder`]: crate::system::builder::SystemBuilder
 /// [`EngineStateBuilder::execution_venues`]: crate::engine::state::builder::EngineStateBuilder::execution_venues
-/// [`VenueRole::Both`]: crate::engine::state::connectivity::VenueRole::Both
+/// [`VenueRole`]: crate::engine::state::connectivity::VenueRole
+/// [`VenueRole::DataOnly`]: crate::engine::state::connectivity::VenueRole::DataOnly
 /// [`Health::Reconnecting`]: crate::engine::state::connectivity::Health::Reconnecting
 pub async fn backtest<
     MarketData,
@@ -395,9 +405,24 @@ where
         )?
         .build();
 
+    // The same derivation `SystemBuilder` performs when it builds the state itself. Read before
+    // `execution_tx_map` is moved into the Engine below.
+    let execution_venues = execution_tx_map
+        .execution_venues()
+        .collect::<FnvHashSet<_>>();
+
+    // Applied to the clone, so the caller's own `engine_state` is left untouched and every backtest
+    // in a sweep derives its roles from the clients IT was built with.
+    let mut engine_state = args_constant.engine_state.clone();
+    reconcile_venue_roles(
+        &mut engine_state.connectivity,
+        &args_constant.instruments,
+        &execution_venues,
+    );
+
     let engine = Engine::new(
         clock,
-        args_constant.engine_state.clone(),
+        engine_state,
         execution_tx_map,
         args_dynamic.strategy,
         args_dynamic.risk,

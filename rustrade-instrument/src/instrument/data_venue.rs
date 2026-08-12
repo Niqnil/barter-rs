@@ -106,3 +106,52 @@ impl<ExchangeKey> DataVenue<ExchangeKey> {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::exchange::ExchangeId;
+
+    #[test]
+    fn new_same_name_defers_the_symbol_to_the_execution_venue() {
+        let data_venue = DataVenue::new_same_name(ExchangeId::LseEquities);
+
+        assert_eq!(data_venue.exchange, ExchangeId::LseEquities);
+        assert_eq!(
+            data_venue.name_exchange, None,
+            "None is what makes `Instrument::data_name_exchange` fall back, so it must not be \
+             filled in with the execution venue's symbol here"
+        );
+    }
+
+    #[test]
+    fn map_exchange_key_rewrites_the_venue_and_carries_the_symbol_through() {
+        let data_venue = DataVenue::new(
+            ExchangeId::LseEquities,
+            Some(InstrumentNameExchange::from("BP.L")),
+        );
+
+        let mapped = data_venue.map_exchange_key(|exchange| exchange.as_str().to_string());
+
+        assert_eq!(mapped.exchange, "lse_equities");
+        assert_eq!(
+            mapped.name_exchange,
+            Some(InstrumentNameExchange::from("BP.L")),
+            "the data venue's own symbol must survive indexing - re-resolving it against the \
+             execution venue is what silently subscribes to the wrong instrument"
+        );
+    }
+
+    #[test]
+    fn a_data_venue_without_a_symbol_deserialises_from_a_payload_that_omits_the_field() {
+        // `name_exchange` is `#[serde(default)]`, so a config naming only the venue is valid.
+        let data_venue: DataVenue<ExchangeId> =
+            serde_json::from_str(r#"{"exchange":"lse_equities"}"#).unwrap();
+
+        assert_eq!(
+            data_venue,
+            DataVenue::new_same_name(ExchangeId::LseEquities)
+        );
+    }
+}

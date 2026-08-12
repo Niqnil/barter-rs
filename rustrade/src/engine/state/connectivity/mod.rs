@@ -6,7 +6,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::FnvIndexMap;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Maintains a global connection [`Health`], as well as the connection status of market data
 /// and account connections for each exchange.
@@ -297,6 +297,14 @@ pub enum VenueRole {
     ///
     /// The default, and the strictest interpretation: it is the behaviour that predates this type,
     /// so it is what a `ConnectivityState` deserialised from an older payload assumes.
+    ///
+    /// Also the conservative fallback for a venue observed to provide **neither** dimension: a
+    /// misconfiguration, and health is withheld rather than granted to a venue with no known
+    /// connection. The two cases are indistinguishable once constructed — this variant
+    /// records what is demanded of a venue, not what it was found to have. Only a warning from
+    /// whichever site derived the role — [`generate_empty_indexed_connectivity_states`] at startup,
+    /// or [`reconcile_venue_roles`] once the execution clients are known — tells them apart, and
+    /// neither is persisted.
     #[default]
     Both,
 }
@@ -322,8 +330,8 @@ impl VenueRole {
             // venue whose every instrument is priced elsewhere, and which was never given an
             // execution client, provides neither dimension. `Both` is the conservative fallback — it
             // withholds `Healthy` until there is evidence, rather than declaring a venue with no
-            // known connections healthy. The caller reports it; see
-            // `generate_empty_indexed_connectivity_states`.
+            // known connections healthy. Every caller reports it; see
+            // `generate_empty_indexed_connectivity_states` and `reconcile_venue_roles`.
             (false, false) => Self::Both,
         }
     }
@@ -435,18 +443,8 @@ pub fn generate_empty_indexed_connectivity_states(
         .map(|exchange| {
             let exchange = exchange.value;
 
-            let has_market_data = instruments
-                .instruments()
-                .iter()
-                .any(|instrument| instrument.value.data_exchange().value == exchange);
-
-            let has_account = match execution_venues {
-                Some(venues) => venues.contains(&exchange),
-                None => instruments
-                    .instruments()
-                    .iter()
-                    .any(|instrument| instrument.value.exchange.value == exchange),
-            };
+            let (has_market_data, has_account) =
+                derive_venue_dimensions(instruments, exchange, execution_venues);
 
             let role = VenueRole::from_dimensions(has_market_data, has_account);
 
@@ -471,6 +469,95 @@ pub fn generate_empty_indexed_connectivity_states(
     ConnectivityStates {
         global: Health::Reconnecting,
         exchanges,
+    }
+}
+
+/// Which connection dimensions a venue provides, as `(has_market_data, has_account)`.
+///
+/// Shared by [`generate_empty_indexed_connectivity_states`] and [`reconcile_venue_roles`] so both
+/// answer the question the same way. See the former for what each dimension is derived from, and
+/// what `execution_venues: None` approximates.
+fn derive_venue_dimensions(
+    instruments: &IndexedInstruments,
+    exchange: ExchangeId,
+    execution_venues: Option<&FnvHashSet<ExchangeId>>,
+) -> (bool, bool) {
+    let has_market_data = instruments
+        .instruments()
+        .iter()
+        .any(|instrument| instrument.value.data_exchange().value == exchange);
+
+    let has_account = match execution_venues {
+        Some(venues) => venues.contains(&exchange),
+        None => instruments
+            .instruments()
+            .iter()
+            .any(|instrument| instrument.value.exchange.value == exchange),
+    };
+
+    (has_market_data, has_account)
+}
+
+/// Re-derives the [`VenueRole`] of every tracked venue from the venues that have a registered
+/// execution client, leaving connection [`Health`] untouched.
+///
+/// For callers that must build their [`EngineState`](super::EngineState) *before* their execution
+/// clients exist — [`backtest`](crate::backtest::backtest) does, since it builds one set of clients
+/// per run from a state supplied once — this corrects the roles after the fact, rather than
+/// obliging the caller to declare venues it cannot yet know. Callers that can declare them upfront
+/// should keep using
+/// [`EngineStateBuilder::execution_venues`](super::builder::EngineStateBuilder::execution_venues);
+/// running both is harmless, since the two derive the same roles from the same inputs.
+///
+/// Only venues already present in `states` are touched — none are added or removed. The collection
+/// is keyed positionally by [`ExchangeIndex`], so inserting one here would renumber every venue
+/// after it and silently re-point the instruments indexed against them.
+///
+/// # Caller obligation
+/// `instruments` must be the collection `states` was built from. A mismatched pair fails
+/// **silently**: the dimensions are derived against the wrong collection and every venue is
+/// assigned a plausible but wrong [`VenueRole`], with no panic and no report — the `warn!` below
+/// fires only for a venue left with neither dimension, not for one merely given the wrong role.
+///
+/// # Arguments
+/// * `states` - The [`ConnectivityStates`] to correct in place.
+/// * `instruments` - The collection `states` was built from.
+/// * `execution_venues` - Venues with a registered execution client.
+pub fn reconcile_venue_roles(
+    states: &mut ConnectivityStates,
+    instruments: &IndexedInstruments,
+    execution_venues: &FnvHashSet<ExchangeId>,
+) {
+    for (exchange, state) in &mut states.exchanges {
+        let (has_market_data, has_account) =
+            derive_venue_dimensions(instruments, *exchange, Some(execution_venues));
+
+        if !has_market_data && !has_account {
+            // See `generate_empty_indexed_connectivity_states` for why this is said out loud. It
+            // is reported here too because this is the first point at which the execution clients
+            // are known, and so the first point at which it is detectable at all.
+            warn!(
+                %exchange,
+                "EngineState tracking an exchange that provides neither market data nor \
+                 execution - global connectivity cannot reach Healthy while it is tracked"
+            );
+        }
+
+        let role = VenueRole::from_dimensions(has_market_data, has_account);
+        if role == state.role {
+            continue;
+        }
+
+        // `debug!`, not `info!`: a backtest sweep shares one `BacktestArgsConstant` across every
+        // run, so each run reconciles the same state from the same clients and this fires once per
+        // run with identical content. The genuinely-wrong case above stays at `warn!`.
+        debug!(
+            %exchange,
+            previous = ?state.role,
+            ?role,
+            "EngineState correcting venue role against the registered execution clients"
+        );
+        state.role = role;
     }
 }
 
@@ -595,11 +682,17 @@ mod tests {
         // client was registered for it. Reachable only once execution venues are declared. Health
         // is withheld rather than granted to a venue with no known connection.
         let instruments = split_venue_instruments();
-        let states =
+        let mut states =
             generate_empty_indexed_connectivity_states(&instruments, Some(&FnvHashSet::default()));
 
         assert_eq!(states.connectivity(&DATA).role, VenueRole::DataOnly);
         assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::Both);
+
+        // Satisfying one dimension is not enough: `Both` demands the account connection too, which
+        // nothing will ever report for a venue with no execution client. Asserting on the state as
+        // generated would pass for every role, since both dimensions start `Reconnecting`.
+        states.connectivity_mut(&EXECUTION).market_data = Health::Healthy;
+
         assert!(!states.connectivity(&EXECUTION).all_healthy());
     }
 
@@ -629,6 +722,18 @@ mod tests {
                 market_data: Health::Reconnecting,
                 account: Health::Healthy,
                 role: VenueRole::DataOnly,
+            }
+            .all_healthy()
+        );
+
+        // The mirror of the case above, and the one that pins `has_account` as actually consulted
+        // for this role: without it, ignoring the account dimension for everything but `Both`
+        // passes every other assertion here.
+        assert!(
+            !ConnectivityState {
+                market_data: Health::Healthy,
+                account: Health::Reconnecting,
+                role: VenueRole::ExecutionOnly,
             }
             .all_healthy()
         );
@@ -742,6 +847,104 @@ mod tests {
             states.connectivity(&EXECUTION).market_data,
             Health::Reconnecting
         );
+    }
+
+    #[test]
+    fn a_tracked_account_disconnect_degrades_the_account_dimension_and_global_health() {
+        // The account twin of `a_tracked_exchange_disconnect_still_degrades_global_health`. The two
+        // update functions are near-identical, so nothing but a test per dimension catches one
+        // written to touch the other's field.
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
+
+        let execution = instruments.find_exchange_index(EXECUTION).unwrap();
+        states.update_from_market_event(&EXECUTION).unwrap();
+        states.update_from_account_event(&execution);
+        assert_eq!(states.global, Health::Healthy);
+
+        states.update_from_account_reconnecting(&EXECUTION).unwrap();
+
+        assert_eq!(
+            states.connectivity(&EXECUTION).account,
+            Health::Reconnecting
+        );
+        assert_eq!(
+            states.connectivity(&EXECUTION).market_data,
+            Health::Healthy,
+            "an account disconnect says nothing about the market data connection"
+        );
+        assert_eq!(states.global, Health::Reconnecting);
+    }
+
+    #[test]
+    fn reconciling_roles_corrects_a_venue_that_prices_without_executing() {
+        // The `backtest` path: the state is built before the execution clients exist, so `DATA` is
+        // approximated as `Both` and waits forever on an account. Reconciling against the clients
+        // that were ultimately registered is what lets global health converge.
+        let instruments = two_instrument_pattern();
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
+        assert_eq!(states.connectivity(&DATA).role, VenueRole::Both);
+
+        reconcile_venue_roles(
+            &mut states,
+            &instruments,
+            &FnvHashSet::from_iter([EXECUTION]),
+        );
+
+        assert_eq!(states.connectivity(&DATA).role, VenueRole::DataOnly);
+        assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::Both);
+    }
+
+    #[test]
+    fn reconciling_roles_preserves_health_and_the_indexed_venue_order() {
+        // `ExchangeIndex` is positional into `exchanges`, so reconciliation must correct roles in
+        // place -- never insert, remove or reorder -- and must not reset a connection that has
+        // already reported in.
+        let instruments = two_instrument_pattern();
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
+        states.update_from_market_event(&DATA).unwrap();
+
+        let order_before = states.exchanges.keys().copied().collect::<Vec<_>>();
+
+        reconcile_venue_roles(
+            &mut states,
+            &instruments,
+            &FnvHashSet::from_iter([EXECUTION]),
+        );
+
+        assert_eq!(
+            states.exchanges.keys().copied().collect::<Vec<_>>(),
+            order_before
+        );
+        assert_eq!(states.connectivity(&DATA).market_data, Health::Healthy);
+    }
+
+    #[test]
+    fn reconciling_roles_is_a_no_op_when_the_venues_were_declared_upfront() {
+        // `SystemBuilder`-style construction already derives the roles, so running both paths must
+        // agree -- otherwise the two entry points would disagree about the same configuration.
+        let instruments = two_instrument_pattern();
+        let venues = FnvHashSet::from_iter([EXECUTION]);
+        let declared = generate_empty_indexed_connectivity_states(&instruments, Some(&venues));
+
+        let mut reconciled = declared.clone();
+        reconcile_venue_roles(&mut reconciled, &instruments, &venues);
+
+        assert_eq!(reconciled, declared);
+    }
+
+    #[test]
+    fn reconciling_roles_reports_a_venue_left_with_neither_dimension() {
+        // Misconfiguration: `EXECUTION` holds an instrument priced on `DATA`, and no execution
+        // client was registered anywhere. `Both` is the conservative answer, so health stays
+        // withheld rather than being granted to a venue with no connection at all.
+        let instruments = split_venue_instruments();
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
+
+        reconcile_venue_roles(&mut states, &instruments, &FnvHashSet::default());
+
+        assert_eq!(states.connectivity(&DATA).role, VenueRole::DataOnly);
+        assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::Both);
     }
 
     #[test]

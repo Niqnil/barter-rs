@@ -643,11 +643,16 @@ mod tests {
     use rustrade_instrument::{
         asset::Asset,
         index::builder::IndexedInstrumentsBuilder,
-        instrument::{kind::future::FutureContract, quote::InstrumentQuoteAsset},
+        instrument::{
+            data_venue::DataVenue, kind::future::FutureContract, quote::InstrumentQuoteAsset,
+        },
         test_utils::asset,
     };
 
     const EXCHANGE: ExchangeId = ExchangeId::LseCfd;
+
+    /// A venue that only ever prices the fixture instrument.
+    const DATA_VENUE: ExchangeId = ExchangeId::LseEquities;
 
     fn at(raw: &str) -> DateTime<Utc> {
         raw.parse().unwrap()
@@ -655,16 +660,36 @@ mod tests {
 
     /// A single `spx500_usd` instrument of the given kind, registered on [`EXCHANGE`].
     fn instruments(kind: InstrumentKind<Asset>) -> IndexedInstruments {
+        build_instruments(kind, None)
+    }
+
+    /// As [`instruments`], but priced on [`DATA_VENUE`] while still executed on [`EXCHANGE`], so
+    /// the two venues are distinguishable.
+    fn instruments_priced_on_another_venue(kind: InstrumentKind<Asset>) -> IndexedInstruments {
+        build_instruments(kind, Some(DATA_VENUE))
+    }
+
+    fn build_instruments(
+        kind: InstrumentKind<Asset>,
+        data_venue: Option<ExchangeId>,
+    ) -> IndexedInstruments {
+        let instrument = Instrument::new(
+            EXCHANGE,
+            "spx500_usd",
+            "spx500_usd",
+            Underlying::new(asset("spx500"), asset("usd")),
+            InstrumentQuoteAsset::UnderlyingQuote,
+            kind,
+            None,
+        );
+
+        let instrument = match data_venue {
+            Some(exchange) => instrument.with_data_venue(DataVenue::new_same_name(exchange)),
+            None => instrument,
+        };
+
         IndexedInstrumentsBuilder::default()
-            .add_instrument(Instrument::new(
-                EXCHANGE,
-                "spx500_usd",
-                "spx500_usd",
-                Underlying::new(asset("spx500"), asset("usd")),
-                InstrumentQuoteAsset::UnderlyingQuote,
-                kind,
-                None,
-            ))
+            .add_instrument(instrument)
             .build()
     }
 
@@ -800,8 +825,15 @@ mod tests {
             message.contains("future"),
             "the error must name the offending kind, got: {message}"
         );
+        // Asserted on the tail alone, after the "It supports: " marker. `EXCHANGE` renders as
+        // "lse_cfd" and the message leads with it, so a bare `contains("cfd")` over the whole
+        // string passes on the venue name even if the client declared no `Cfd` support at all.
+        let supported = message
+            .split_once("It supports: ")
+            .expect("the error must name the supported kinds")
+            .1;
         assert!(
-            message.contains("spot") && message.contains("cfd"),
+            supported.contains("spot") && supported.contains("cfd"),
             "the error must name the kinds that would work, got: {message}"
         );
     }
@@ -811,14 +843,27 @@ mod tests {
     /// adding a data venue could break an execution setup that trades nothing on it.
     #[test]
     fn validation_ignores_instruments_executed_on_another_exchange() {
-        let instruments = instruments(future());
+        // The instrument is priced on `DATA_VENUE` and executed on `EXCHANGE`, so the two
+        // predicates disagree: filtering on `data_exchange()` instead of `exchange` would reject
+        // this build. A fixture with no `DataVenue` cannot tell them apart, since its
+        // `data_exchange()` IS its execution venue.
+        let instruments = instruments_priced_on_another_venue(future());
 
         validate_supported_instrument_kinds(
             &instruments,
-            ExchangeId::BinanceSpot,
+            DATA_VENUE,
             &[InstrumentKindDiscriminant::Spot],
         )
         .expect("the Future is executed on EXCHANGE, not on the venue being validated");
+
+        // The other half of the same rule: at its execution venue it very much is this client's
+        // concern, so the filter must not be inert.
+        validate_supported_instrument_kinds(
+            &instruments,
+            EXCHANGE,
+            &[InstrumentKindDiscriminant::Spot],
+        )
+        .expect_err("the Future is executed on EXCHANGE, so it must be judged there");
     }
 
     /// Each distinct offending kind is reported once, in a deterministic order, rather than once

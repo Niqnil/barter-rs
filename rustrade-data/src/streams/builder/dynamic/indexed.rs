@@ -193,6 +193,7 @@ mod tests {
     use rustrade_instrument::{
         Underlying,
         asset::Asset,
+        index::error::IndexError,
         instrument::{
             Instrument, data_venue::DataVenue, market_data::kind::MarketDataInstrumentKind,
             name::InstrumentNameExchange,
@@ -322,8 +323,11 @@ mod tests {
 
         let result = index_market_data_subscription_batches(&instruments, [[subscription]]);
 
+        // The *variant* is the claim, not merely that it failed. Were assets later registered under
+        // the data venue, the instrument lookup would fail instead and a bare `is_err` would keep
+        // passing with the rationale above silently false.
         assert!(
-            result.is_err(),
+            matches!(result, Err(DataError::Index(IndexError::AssetIndex(_)))),
             "the data venue registers no assets, so neither leg can resolve: {result:?}"
         );
     }

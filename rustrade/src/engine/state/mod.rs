@@ -326,6 +326,11 @@ mod tests {
         );
         assert_eq!(snapshots.len(), 1);
 
+        // The property below only bites while the skipped venue sorts FIRST, and `ExchangeId`
+        // orders by declaration position — so assert it rather than assume it. Were the two to
+        // invert, this test would keep passing while guarding nothing.
+        assert!(DATA < EXECUTION, "the skipped venue must sort first");
+
         // Guards the enumerate-before-filter ordering: `DATA` sorts ahead of `EXECUTION`, so
         // numbering the surviving venues instead would hand `EXECUTION` the skipped venue's
         // `ExchangeIndex` and its instrument list would come back empty.

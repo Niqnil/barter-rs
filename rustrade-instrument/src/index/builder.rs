@@ -151,15 +151,13 @@ impl IndexedInstrumentsBuilder {
                 // colliding instruments frequently share that name: a spot and a CFD on one symbol
                 // is the collision this check most plausibly catches, and reporting it as
                 // "AAPL and AAPL" asserts they are distinct while printing nothing that
-                // distinguishes them. `kind` is what does.
+                // distinguishes them. `describe_collision` is what does.
                 return Err(IndexError::DuplicateInstrumentNameInternal(format!(
-                    "{} is shared by the distinct instruments {} ({:?}) and {} ({:?}) on {} - \
+                    "{} is shared by the distinct instruments {} and {} on {} - \
                      every Instrument requires a unique name_internal",
                     instrument.name_internal,
-                    previous.name_exchange,
-                    previous.kind,
-                    instrument.name_exchange,
-                    instrument.kind,
+                    describe_collision(previous),
+                    describe_collision(instrument),
                     // `as_str`, not `Display`: the canonical snake_case spelling users write in
                     // configs, rather than the bare variant name.
                     instrument.exchange.as_str(),
@@ -223,6 +221,25 @@ impl IndexedInstrumentsBuilder {
             instruments,
             assets,
         })
+    }
+}
+
+/// Renders the axes two `Instrument`s sharing a `name_internal` can legitimately differ on while
+/// still sharing a `name_exchange`: `kind` (a spot and a CFD on one symbol) and `data_venue` (one
+/// symbol priced on two venues). Both are compared by the full-equality dedup, so a pair differing
+/// only in one of them survives it and reaches the uniqueness check — where naming neither reads as
+/// "AAPL and AAPL".
+fn describe_collision(instrument: &Instrument<ExchangeId, Asset>) -> String {
+    match &instrument.data_venue {
+        // `as_str`, not `Display`: the canonical snake_case spelling users write in configs,
+        // rather than the bare variant name.
+        Some(data_venue) => format!(
+            "{} ({:?}, priced on {})",
+            instrument.name_exchange,
+            instrument.kind,
+            data_venue.exchange.as_str(),
+        ),
+        None => format!("{} ({:?})", instrument.name_exchange, instrument.kind),
     }
 }
 
@@ -385,6 +402,48 @@ mod tests {
         // actionable.
         assert!(message.contains("Spot"), "{message}");
         assert!(message.contains("Cfd"), "{message}");
+    }
+
+    #[test]
+    fn test_duplicate_name_internal_message_distinguishes_instruments_sharing_everything_but_a_data_venue()
+     {
+        // The other axis a colliding pair can differ on while sharing `name_exchange` AND `kind`:
+        // one symbol configured twice, priced on a different venue each time. `data_venue` is part
+        // of `Instrument`s equality, so the dedup does not collapse these either -- and a message
+        // built from `name_exchange` and `kind` alone would read "AAPL (Spot) and AAPL (Spot)".
+        let shared_name = "ibkr-aapl";
+
+        let build = |data_venue| {
+            Instrument::new(
+                ExchangeId::Ibkr,
+                shared_name,
+                "AAPL",
+                Underlying::new(
+                    Asset::new_from_exchange("aapl"),
+                    Asset::new_from_exchange("usd"),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Spot,
+                None,
+            )
+            .with_data_venue(DataVenue::new_same_name(data_venue))
+        };
+
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(build(ExchangeId::LseEquities))
+            .add_instrument(build(ExchangeId::BinanceSpot))
+            .try_build()
+            .expect_err("duplicate name_internal must be rejected");
+
+        let IndexError::DuplicateInstrumentNameInternal(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+
+        assert!(message.contains(shared_name), "{message}");
+        // The data venue is the only field that differs, so naming both is the only thing that
+        // tells the operator which of the two configured entries to change.
+        assert!(message.contains("lse_equities"), "{message}");
+        assert!(message.contains("binance_spot"), "{message}");
     }
 
     /// Builds a one-instrument collection whose only variable is the CFD multiplier.
@@ -714,11 +773,22 @@ mod tests {
         // Degenerate but legal: stating the data venue explicitly when it is the same venue. The
         // exchange dedup must absorb it, or the venue would be indexed twice and every later
         // ExchangeIndex would shift.
-        let indexed = IndexedInstrumentsBuilder::default()
-            .add_instrument(
-                instrument(ExchangeId::BinanceSpot, "btc", "usdt")
-                    .with_data_venue(DataVenue::new_same_name(ExchangeId::BinanceSpot)),
-            )
+        let builder = IndexedInstrumentsBuilder::default().add_instrument(
+            instrument(ExchangeId::BinanceSpot, "btc", "usdt")
+                .with_data_venue(DataVenue::new_same_name(ExchangeId::BinanceSpot)),
+        );
+
+        // Asserted before the build, because the post-build count alone would also hold if
+        // `add_instrument` never registered the data venue at all -- which is the bug this test
+        // must not pass through. The registration is unconditional; the dedup is what makes the
+        // degenerate case harmless.
+        assert_eq!(
+            builder.exchanges,
+            vec![ExchangeId::BinanceSpot; 2],
+            "the data venue is registered unconditionally, whatever venue it names",
+        );
+
+        let indexed = builder
             .try_build()
             .expect("a self-referential data venue is valid, if redundant");
 

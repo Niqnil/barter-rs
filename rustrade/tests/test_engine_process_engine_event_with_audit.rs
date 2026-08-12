@@ -5382,6 +5382,63 @@ fn test_corporate_action_option_replica_parity_suppressed_readjust() {
     assert_eq!(contract.strike, dec!(25_000));
 }
 
+/// A market `Item` from an exchange the engine was never built against is **reported**, and its
+/// `InstrumentIndex` is never dereferenced.
+///
+/// This is the ordering `EngineState::update_from_market` exists to enforce: the exchange is
+/// resolved, and the result propagated, *before* `instrument_index_mut`. An event from an untracked
+/// exchange carries an `InstrumentIndex` from a collection the engine does not share, so the
+/// positional lookup would either panic on an out-of-range index or credit the print to whichever
+/// instrument occupies that slot — a wrong price on a real position, reported nowhere. Move the `?`
+/// below the lookup and only this test fails.
+#[test]
+fn test_untracked_exchange_market_item_is_reported_without_resolving_its_instrument() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    // The engine tracks two `BinanceSpot` instruments, indices 0 and 1.
+    const UNTRACKED: ExchangeId = ExchangeId::Coinbase;
+    let out_of_range = InstrumentIndex(99);
+
+    let connectivity_before = engine.state.connectivity.clone();
+    let instruments_before = engine.state.instruments.clone();
+
+    let event = EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
+        time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+        time_received: time_plus_days(STARTING_TIMESTAMP, 1),
+        exchange: UNTRACKED,
+        instrument: out_of_range,
+        kind: DataKind::Trade(PublicTrade {
+            id: "untracked".into(),
+            price: dec!(10_000),
+            amount: Decimal::ONE,
+            side: Some(Side::Buy),
+        }),
+    }));
+
+    let audit = process_with_audit(&mut engine, event.clone());
+
+    assert_eq!(
+        audit.event,
+        EngineAudit::process_with_output(
+            event,
+            EngineOutput::UntrackedExchange(UntrackedExchange::new(
+                UNTRACKED,
+                ConnectivityDimension::MarketData
+            ))
+        ),
+        "the market-data dimension must be named"
+    );
+    assert_eq!(
+        engine.state.connectivity, connectivity_before,
+        "an untracked exchange must not mutate connectivity state"
+    );
+    assert_eq!(
+        engine.state.instruments, instruments_before,
+        "no instrument state may be read or written for an untrusted InstrumentIndex"
+    );
+}
+
 /// A `Reconnecting` event for an exchange the engine was never built against is **reported**, and
 /// nothing else happens: no `on_disconnect`, no connectivity mutation, no new tracked exchange.
 ///

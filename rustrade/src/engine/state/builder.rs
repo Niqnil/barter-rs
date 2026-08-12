@@ -90,8 +90,9 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     /// life of the run.
     ///
     /// [`SystemBuilder`](crate::system::builder::SystemBuilder) calls this for you from the
-    /// execution clients it registers. Provide it by hand when constructing an `EngineState`
-    /// directly — eg/ for [`backtest`](crate::backtest::backtest), which takes a pre-built state.
+    /// execution clients it registers, and [`backtest`](crate::backtest::backtest) reconciles the
+    /// roles itself against the clients it builds per run. Provide it by hand when constructing an
+    /// `EngineState` for an engine you drive directly, where neither of those applies.
     pub fn execution_venues<Iter>(mut self, venues: Iter) -> Self
     where
         Iter: IntoIterator<Item = ExchangeId>,
@@ -248,7 +249,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
 mod tests {
     use super::*;
     use crate::{
-        engine::state::EngineState,
+        engine::state::{EngineState, connectivity::VenueRole},
         statistic::{summary::TradingSummaryGenerator, time::Annual365},
     };
     use rust_decimal::Decimal;
@@ -284,5 +285,59 @@ mod tests {
         );
 
         assert_eq!(generator.generate(Annual365).basis, BalanceBasis::NetAsset);
+    }
+
+    /// End-to-end seam for [`EngineStateBuilder::execution_venues`]: the declared set has to reach
+    /// [`generate_empty_indexed_connectivity_states`] for the built state's roles to differ from
+    /// the instrument-model approximation. The generator is unit-tested at its own seam; this pins
+    /// the threading between the two, which is otherwise verified nowhere.
+    #[test]
+    fn declared_execution_venues_reach_the_built_connectivity_states() {
+        const DATA: ExchangeId = ExchangeId::BinanceSpot;
+        const EXECUTION: ExchangeId = ExchangeId::Coinbase;
+
+        // Two-instrument pattern: `DATA` prices an instrument that is never traded, `EXECUTION`
+        // trades a different one. Both are some instrument's `exchange`, so the instrument model
+        // alone claims both hold an account.
+        let instruments = IndexedInstruments::builder()
+            .add_instrument(Instrument::spot(
+                DATA,
+                "data_venue_xau_usd",
+                "XAUUSD",
+                Underlying::new("xau", "usd"),
+                None,
+            ))
+            .add_instrument(Instrument::spot(
+                EXECUTION,
+                "execution_venue_btc_usdt",
+                "BTCUSDT",
+                Underlying::new("btc", "usdt"),
+                None,
+            ))
+            .build();
+
+        let declared: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
+            .execution_venues([EXECUTION])
+            .build();
+
+        assert_eq!(
+            declared.connectivity.connectivity(&DATA).role,
+            VenueRole::DataOnly,
+            "the declared set is what says nothing executes on the pricing venue"
+        );
+        assert_eq!(
+            declared.connectivity.connectivity(&EXECUTION).role,
+            VenueRole::Both
+        );
+
+        // Non-vacuous: without the declaration the same collection approximates `DATA` as `Both`,
+        // so the assertion above can only pass if the set was actually threaded through.
+        let approximated: EngineState<(), ()> =
+            EngineState::builder(&instruments, (), |_| ()).build();
+
+        assert_eq!(
+            approximated.connectivity.connectivity(&DATA).role,
+            VenueRole::Both
+        );
     }
 }

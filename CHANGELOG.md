@@ -398,9 +398,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`EngineStateBuilder::execution_venues`** (`rustrade`) declares which venues have a registered
   execution client, so only those are given an account connection to wait on. `SystemBuilder` calls
-  it automatically; provide it by hand when building an `EngineState` directly — which a `backtest`
-  caller must, precisely because `backtest` takes a pre-built state it cannot reach into.
+  it automatically, and `backtest` reconciles the roles itself (see the entry below); provide it by
+  hand when building an `EngineState` for an engine you drive directly.
   See the Fixed entry on the account connection dimension for what it corrects.
+
+- **`connectivity::reconcile_venue_roles`** (`rustrade`) re-derives every tracked venue's
+  `VenueRole` from the venues that have a registered execution client, leaving connection `Health`
+  and the positional `ExchangeIndex` order untouched. For callers that must build an `EngineState`
+  before their execution clients exist — `backtest` builds one set of clients per run from a state
+  supplied once — this corrects the roles after the fact instead of obliging the caller to declare
+  venues it cannot yet know.
 
 - **`ExecutionClient::SUPPORTED_KINDS`** (`rustrade-execution`, `rustrade`), a required associated
   const listing the `InstrumentKindDiscriminant`s a client can trade, alongside the existing
@@ -413,7 +420,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not reused, as it answers a different question. Declared support: Binance spot and margin `Spot`;
   Hyperliquid perpetual `Perpetual` and spot `Spot`; Alpaca `Spot, Option`; IBKR `Spot, Future,
   Option`; mock `Spot, Cfd`. IBKR omits `Cfd` deliberately — the client builds no security type for
-  them, so accepting one would produce exactly the silent wrong-symbol order this guards against.
+  them, so a CFD could only ever reach that venue as some other contract. Scope: the guard is
+  checked against `Instrument::kind`, so it catches a kind a client can never represent; it does
+  **not** validate a client's own symbol registry against the instrument model — IBKR's
+  `ContractConfig.security_type`, for one, stays caller-supplied and unchecked.
   **BREAKING** for external `ExecutionClient` implementors: the const has no default.
 
 - **`ConnectivityDimension` and `UntrackedExchange`** (`rustrade`), the reported detail when a market
@@ -951,6 +961,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **`backtest` now derives venue roles from the execution clients it builds** (`rustrade`), instead
+  of requiring the caller to declare them on the state it is handed. A backtest that priced an
+  instrument on one venue and executed on another had that pricing venue approximated as
+  `VenueRole::Both` unless the caller passed `EngineStateBuilder::execution_venues`, so it waited
+  forever on an account connection nothing would establish, held `ConnectivityStates::global` at
+  `Health::Reconnecting`, and gated every strategy that consults global health for the entire run —
+  without erroring. `backtest` builds its own execution clients per run, so it now reconciles the
+  roles on its own clone of the state (see `reconcile_venue_roles`); the caller's `engine_state` is
+  still never modified, and declaring the venues upfront remains supported and reconciles to
+  itself. A venue that neither prices an instrument nor has an execution client still cannot
+  converge — it is now reported with a warning naming it, rather than left to be inferred from a
+  `global` that never leaves `Reconnecting`.
 
 - **LSE candle pages are now checked for ordering and resolution instead of assumed correct**
   (`rustrade-data`, `lse` feature). Two provider behaviours the module compensates for were pinned

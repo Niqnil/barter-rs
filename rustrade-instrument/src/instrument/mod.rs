@@ -94,6 +94,9 @@ pub struct Instrument<ExchangeKey, AssetKey> {
     /// an `ExchangeKey: Default` bound on the whole `Deserialize` impl, which `Keyed<ExchangeIndex,
     /// ExchangeId>` — the key every *indexed* `Instrument` carries — does not satisfy. Naming the
     /// path keeps the bound off.
+    ///
+    /// Enforced by the compiler rather than by a test: reverting to the bare form fails to *build*
+    /// wherever an indexed `Instrument` is deserialised, so no runtime test below pins it.
     #[serde(default = "Option::default")]
     pub data_venue: Option<DataVenue<ExchangeKey>>,
 }
@@ -335,7 +338,11 @@ impl<ExchangeKey> From<&Instrument<ExchangeKey, Asset>> for MarketDataInstrument
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::exchange::ExchangeId;
+    use crate::{
+        exchange::ExchangeId,
+        instrument::spec::{InstrumentSpecNotional, InstrumentSpecPrice},
+    };
+    use rust_decimal::Decimal;
 
     /// An `AAPL` traded on one venue, optionally priced by another.
     fn instrument(data_venue: Option<DataVenue<ExchangeId>>) -> Instrument<ExchangeId, Asset> {
@@ -354,6 +361,37 @@ mod tests {
             Some(data_venue) => instrument.with_data_venue(data_venue),
             None => instrument,
         }
+    }
+
+    /// `data_venue` is declared **last**, and that is load-bearing rather than stylistic:
+    /// `Instrument` derives `Ord` from field order and `IndexedInstrumentsBuilder` sorts the
+    /// collection before assigning each `InstrumentIndex`, so the field's *position* is part of how
+    /// instruments are numbered. Move it above `spec` and this test fails while every existing
+    /// collection silently renumbers — indices that are serialized into engine state, the audit
+    /// replica and backtest replay streams.
+    #[test]
+    fn data_venue_sorts_last_so_it_renumbers_no_existing_collection() {
+        // Identical up to `spec`, which is declared BEFORE `data_venue`. `Option: None < Some`, so
+        // each field on its own would order these opposite ways: `spec` puts the specless
+        // instrument first, `data_venue` puts the venueless one first. Only one of them can decide,
+        // and it must be the earlier field.
+        let no_spec_with_data_venue =
+            instrument(Some(DataVenue::new_same_name(ExchangeId::LseEquities)));
+        let mut spec_without_data_venue = instrument(None);
+        spec_without_data_venue.spec = Some(InstrumentSpec::new(
+            InstrumentSpecPrice::new(Decimal::ONE, Decimal::ONE),
+            InstrumentSpecQuantity::new(OrderQuantityUnits::Quote, Decimal::ONE, Decimal::ONE),
+            InstrumentSpecNotional::new(Decimal::ONE),
+        ));
+
+        assert!(
+            no_spec_with_data_venue < spec_without_data_venue,
+            "an earlier field must decide the order, whatever `data_venue` says"
+        );
+
+        // And among instruments equal in every earlier field, it is the tie-break — so declaring it
+        // appends to the sort key rather than displacing any part of it.
+        assert!(instrument(None) < no_spec_with_data_venue);
     }
 
     #[test]
