@@ -407,7 +407,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the positional `ExchangeIndex` order untouched. For callers that must build an `EngineState`
   before their execution clients exist — `backtest` builds one set of clients per run from a state
   supplied once — this corrects the roles after the fact instead of obliging the caller to declare
-  venues it cannot yet know.
+  venues it cannot yet know. Its one caller obligation — that `instruments` is the collection
+  `states` was built from — is `debug_assert!`ed by comparing the venue keys in `ExchangeIndex`
+  order, so a mismatched pair is caught in debug rather than silently assigning every venue a
+  plausible but wrong role. A pair holding the *same* venues with different instruments is not
+  detectable this way, but also misaligns every `InstrumentIndex` in the engine, so venue roles are
+  not the symptom that surfaces first.
 
 - **`ExecutionClient::SUPPORTED_KINDS`** (`rustrade-execution`, `rustrade`), a required associated
   const listing the `InstrumentKindDiscriminant`s a client can trade, alongside the existing

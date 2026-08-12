@@ -514,10 +514,16 @@ fn derive_venue_dimensions(
 /// after it and silently re-point the instruments indexed against them.
 ///
 /// # Caller obligation
-/// `instruments` must be the collection `states` was built from. A mismatched pair fails
-/// **silently**: the dimensions are derived against the wrong collection and every venue is
-/// assigned a plausible but wrong [`VenueRole`], with no panic and no report — the `warn!` below
-/// fires only for a venue left with neither dimension, not for one merely given the wrong role.
+/// `instruments` must be the collection `states` was built from. A mismatched pair derives every
+/// dimension against the wrong collection and assigns every venue a plausible but wrong
+/// [`VenueRole`] — the `warn!` below fires only for a venue left with neither dimension, not for
+/// one merely given the wrong role.
+///
+/// A `debug_assert!` catches the detectable half of that: `states` holding a different venue set,
+/// or holding it in a different order. It cannot catch a collection carrying the *same* venues
+/// with different instruments, since the venue keys are then identical — but such a pair also
+/// misaligns every [`InstrumentIndex`](rustrade_instrument::index::InstrumentIndex) in the engine,
+/// so venue roles are not the symptom that surfaces first.
 ///
 /// # Arguments
 /// * `states` - The [`ConnectivityStates`] to correct in place.
@@ -528,6 +534,26 @@ pub fn reconcile_venue_roles(
     instruments: &IndexedInstruments,
     execution_venues: &FnvHashSet<ExchangeId>,
 ) {
+    // Compared in `ExchangeIndex` order — the order `states` is indexed by — rather than as sets,
+    // so a state whose venues were reordered or reindexed is caught too, not merely one holding a
+    // different venue set. `debug_assert!` and not a `Result`: passing a mismatched pair is a
+    // caller-contract violation (a library-usage bug) rather than a handleable input, and the
+    // comparison then costs nothing in release.
+    debug_assert!(
+        states.exchanges.keys().eq(instruments
+            .exchanges()
+            .iter()
+            .map(|exchange| &exchange.value)),
+        "reconcile_venue_roles: `states` was not built from `instruments` — states: {:?}, \
+         instruments: {:?}",
+        states.exchanges.keys().collect::<Vec<_>>(),
+        instruments
+            .exchanges()
+            .iter()
+            .map(|exchange| exchange.value)
+            .collect::<Vec<_>>(),
+    );
+
     for (exchange, state) in &mut states.exchanges {
         let (has_market_data, has_account) =
             derive_venue_dimensions(instruments, *exchange, Some(execution_venues));
@@ -945,6 +971,25 @@ mod tests {
 
         assert_eq!(states.connectivity(&DATA).role, VenueRole::DataOnly);
         assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::Both);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)] // The guard under test compiles out in release
+    #[should_panic(expected = "was not built from")]
+    fn reconciling_roles_rejects_a_state_built_from_a_different_collection() {
+        // The caller obligation, violated: `states` built from one instrument collection and
+        // reconciled against another. Every venue would otherwise be handed a plausible role
+        // derived from instruments it was never built from, with nothing reported.
+        let mut states = generate_empty_indexed_connectivity_states(
+            &IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]),
+            None,
+        );
+
+        reconcile_venue_roles(
+            &mut states,
+            &two_instrument_pattern(),
+            &FnvHashSet::from_iter([EXECUTION]),
+        );
     }
 
     #[test]

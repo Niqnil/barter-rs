@@ -184,8 +184,19 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
     /// correct strike), and that division is otherwise unchecked. A non-standard split touches no
     /// option state, so only the equity positions are pre-computed for it.
     ///
+    /// # Preconditions
+    /// `equity` must already have been established as split-eligible
+    /// ([`InstrumentKind::is_split_eligible`]) by the caller — this function **assumes** it rather
+    /// than checking it, and `debug_assert!`s the assumption. It is a precondition and not a
+    /// returned [`UnsupportedCorporateActionReason::InstrumentKindNotSupported`] because both
+    /// callers must reject an ineligible target *before* the action kind is matched, so that a
+    /// split delivered against an option is attributed to the instrument rather than to the
+    /// action — an ordering this function is called too late to produce.
+    ///
     /// Returns the [`UnsupportedCorporateActionReason`] the caller should surface on the first
     /// failure, or the [`SplitPlan`] to commit when the whole action can be applied.
+    ///
+    /// [`InstrumentKind::is_split_eligible`]: rustrade_instrument::instrument::kind::InstrumentKind::is_split_eligible
     pub(crate) fn prepare_corporate_action_split(
         &self,
         id: &SmolStr,
@@ -195,6 +206,17 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
         adjust_options_in_place: bool,
     ) -> Result<SplitPlan, UnsupportedCorporateActionReason> {
         let equity_state = self.instrument_index(equity);
+
+        // Asserted, not checked: see `# Preconditions`. It earns an assertion because an ineligible
+        // target is not inert here — the underlying identity below is derived FROM the target, so a
+        // derivative reaching this function would have its own positions rescaled through the equity
+        // leg (bypassing the option path's integer-contract check), and an option target would then
+        // match its own scan and be adjusted a second time.
+        debug_assert!(
+            equity_state.instrument.kind.is_split_eligible(),
+            "prepare_corporate_action_split: target is not split-eligible: {:?}",
+            equity_state.instrument.kind
+        );
 
         // The underlying identity every option scan below (and the handler's non-standard signal)
         // resolves against. Derived from the TARGET, so it is only a sound proxy for "this option

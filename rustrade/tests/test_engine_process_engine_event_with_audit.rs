@@ -5046,6 +5046,93 @@ fn test_corporate_action_ambiguous_split_target_rejected_without_mutating() {
     assert_eq!(contract.strike, dec!(50_000));
 }
 
+/// A target that is **both** ambiguous and arithmetically un-rescalable is reported as
+/// `AmbiguousSplitTarget`, pinning the order the two guards run in.
+///
+/// `prepare_corporate_action_split` scans for a second split-eligible listing *before* it walks the
+/// equity positions, so the reason a caller receives names the condition it can actually act on:
+/// the instrument registry is ambiguous, and no rescaling arithmetic — overflowing or not — was
+/// ever reachable. Reversed, the same action would be reported as `ArithmeticOverflow`, sending a
+/// caller after a position quantity when the registry is what needs correcting. Every other split
+/// fixture triggers exactly one guard, so nothing else distinguishes the two orderings.
+#[test]
+fn test_corporate_action_ambiguity_is_reported_ahead_of_overflow() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_position_on(
+        &mut engine,
+        1,
+        Side::Buy,
+        dec!(50_000),
+        dec!(3),
+        "spot-open",
+    );
+
+    // Plant the same adversarial quantity as `test_corporate_action_pre_validation_rejects_
+    // arithmetic_overflow`, so the equity-position pass would overflow if it were ever reached.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .position
+        .positions
+        .values_mut()
+        .next()
+        .expect("spot position should exist")
+        .quantity_abs = Decimal::MAX;
+
+    let audit_tick = process_with_audit(
+        &mut engine,
+        EngineEvent::CorporateAction {
+            id: "BTCUSD-2-1-split-ambiguous-and-overflowing".into(),
+            instrument: InstrumentIndex(1),
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(dec!(2)).unwrap(),
+            },
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+        },
+    );
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    let rejections: Vec<_> = outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::UnsupportedCorporateAction {
+                instrument, reason, ..
+            } => Some((*instrument, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejections.len(), 1, "expected exactly one rejection");
+    assert_eq!(rejections[0].0, InstrumentIndex(1));
+    assert_eq!(
+        rejections[0].1,
+        UnsupportedCorporateActionReason::AmbiguousSplitTarget,
+        "the ambiguity guard must run before the position arithmetic"
+    );
+
+    // Atomic on both counts: the planted quantity is left exactly as planted.
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .position
+            .positions
+            .values()
+            .next()
+            .unwrap()
+            .quantity_abs,
+        Decimal::MAX
+    );
+}
+
 /// A **held** option adjusted by a standard split records that action's `id` in its **own**
 /// `corporate_actions_processed`, and a second delivery of the same `id` therefore leaves it alone.
 ///
