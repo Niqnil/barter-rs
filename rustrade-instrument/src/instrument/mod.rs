@@ -84,11 +84,17 @@ pub struct Instrument<ExchangeKey, AssetKey> {
     /// [`Self::data_name_exchange`] so the fallback to `exchange`/`name_exchange` is applied in
     /// one place.
     ///
-    /// Declared **last** deliberately. `Instrument` derives `Ord`, and `IndexedInstrumentsBuilder`
-    /// sorts the collection before assigning each `InstrumentIndex` — so field order is part of
-    /// how indices are numbered. Appending keeps the sort key's prefix identical to what it was
-    /// before this field existed, which means adding it renumbers nothing for the existing
-    /// (`None`) instruments that make up every collection built to date.
+    /// Declared **last** by convention, not by necessity — worth stating precisely so a future
+    /// maintainer does not infer a tighter constraint than exists. `Instrument` derives `Ord` and
+    /// `IndexedInstrumentsBuilder` sorts the collection before assigning each `InstrumentIndex`, so
+    /// field order is in principle part of how indices are numbered; this field is nonetheless
+    /// unreachable as a sort key in both of the cases that matter. A collection whose instruments
+    /// all carry `None` — every collection built before this field existed — compares `Equal` here
+    /// wherever the field sits, so adding it renumbers nothing regardless of position. And
+    /// `IndexedInstrumentsBuilder::try_build` rejects a duplicate `name_internal`, so in any
+    /// collection that builds at all, `Ord` between two distinct instruments is already decided by
+    /// an earlier field and never reaches this one to break a tie. Last is simply the least
+    /// surprising place for it.
     ///
     /// `default = "Option::default"` rather than a bare `default`: the bare form makes serde infer
     /// an `ExchangeKey: Default` bound on the whole `Deserialize` impl, which `Keyed<ExchangeIndex,

@@ -1306,6 +1306,19 @@ fn build_option_engine_with_oms(
             Underlying::new("btc", "usd"),
             None,
         ))
+        // index 2 (after sort): a second split-eligible Spot on the same base and exchange but a
+        // DIFFERENT quote. Present in every test on this fixture so the split-target uniqueness
+        // guard is continuously exercised against a near-miss, rather than only against instruments
+        // that share a full `(base, quote, exchange)` identity — see
+        // `test_corporate_action_split_is_not_ambiguous_across_a_quote_boundary`. Inert otherwise:
+        // it is never priced, never traded, and carries no position.
+        .add_instrument(Instrument::spot(
+            ExchangeId::BinanceSpot,
+            "binance_spot_btc_usdc",
+            "BTCUSDC",
+            Underlying::new("btc", "usdc"),
+            None,
+        ))
         .build();
 
     let clock = HistoricalClock::new(STARTING_TIMESTAMP);
@@ -5298,6 +5311,87 @@ fn test_corporate_action_unheld_option_strike_not_divided_twice_by_the_same_id()
         )),
         "the suppressed strike fix must be surfaced"
     );
+}
+
+/// A second split-eligible instrument on the same `(base, exchange)` but a **different quote** must
+/// not trip the split-target uniqueness guard.
+///
+/// The guard scans the entire instrument registry, so it is only as narrow as the identity match it
+/// applies. `is_on_underlying`'s own doc warns that "without the quote filter a BTC/USDT action
+/// would also reach BTC/USDC instruments" — drop that filter and a perfectly resolvable action is
+/// rejected as ambiguous, blocking a legitimate corporate action outright. No fixture whose
+/// instruments all share one `Underlying` can detect that, since base and quote agree everywhere;
+/// this one holds `btc/usd` and `btc/usdc` side by side and asserts the `btc/usd` split still
+/// applies in full.
+#[test]
+fn test_corporate_action_split_is_not_ambiguous_across_a_quote_boundary() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // `BTCUSDC` (index 2) is `Spot`, so split-eligible, and shares the target's base and exchange.
+    // Only its quote differs.
+    let usdc_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(2));
+    assert_eq!(usdc_state.instrument.underlying.quote, AssetIndex(2));
+    assert!(
+        matches!(usdc_state.instrument.kind, InstrumentKind::Spot),
+        "the near-miss instrument must itself be split-eligible, or this proves nothing"
+    );
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    let audit_tick = process_with_audit(
+        &mut engine,
+        EngineEvent::CorporateAction {
+            id: "BTCUSD-2-1-split".into(),
+            instrument: InstrumentIndex(1),
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(dec!(2)).unwrap(),
+            },
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+        },
+    );
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::UnsupportedCorporateAction {
+                reason: UnsupportedCorporateActionReason::AmbiguousSplitTarget,
+                ..
+            }
+        )),
+        "a differing quote is a different underlying - the target is still unique"
+    );
+
+    // The split applied in full, not merely "was not rejected".
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+
+    // ...and the near-miss instrument was left entirely alone by an action on its neighbour.
+    let usdc_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(2));
+    assert!(
+        usdc_state.corporate_actions_processed.is_empty(),
+        "an instrument on a different quote must not record the action"
+    );
+    assert!(usdc_state.position.positions.is_empty());
 }
 
 /// Live engine vs audit-replica parity for the **rejection** path: an ambiguous split target must

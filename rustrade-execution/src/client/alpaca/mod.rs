@@ -1124,8 +1124,11 @@ impl ExecutionClient for AlpacaClient {
     const EXCHANGE: ExchangeId = ExchangeId::AlpacaBroker;
 
     // Equities and crypto are both `Spot` here — Alpaca settles each as an outright holding, and
-    // the client separates them only by symbol shape. `Option` is genuinely routed: OCC symbols
-    // are detected to derive the `position_intent` that Alpaca requires on options orders.
+    // the client separates them only by symbol shape. `Option` is genuinely routed: the
+    // `position_intent` Alpaca requires on options orders is derived from that same shape test,
+    // which is `is_options_or_equity_symbol` — a not-a-crypto-pair check (`!symbol.contains('/')`),
+    // not OCC format validation. Equities take the branch too, harmlessly: `position_intent` is
+    // accepted on an equity order.
     const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
         InstrumentKindDiscriminant::Spot,
         InstrumentKindDiscriminant::Option,

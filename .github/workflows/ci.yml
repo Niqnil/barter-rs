@@ -153,7 +153,7 @@ jobs:
           shared-key: "rustrade-ci-check"
 
       # Nothing else compiles rustdoc's link graph, so a doc link that stops resolving ships green
-      # and renders as dead text on docs.rs -- which is how four of them accumulated before this job
+      # and renders as dead text on docs.rs -- which is how six of them accumulated before this job
       # existed. All three lints are warn-by-default, so denying them here is what makes them a gate.
       # `--all-features` is load-bearing: `rustrade-execution` has `default = []` with every client
       # feature-gated, so a bare `cargo doc` would document none of that code and pass vacuously.

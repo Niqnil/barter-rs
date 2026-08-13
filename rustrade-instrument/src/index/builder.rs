@@ -23,6 +23,33 @@ impl IndexedInstrumentsBuilder {
         Self::default()
     }
 
+    /// Registers an [`Instrument`], together with the exchanges and assets it implies.
+    ///
+    /// Nothing is validated here — duplicates are tolerated and de-duplicated, and every invariant
+    /// (unique `name_internal`, positive contract multipliers, resolvable asset references) is
+    /// enforced by [`Self::try_build`].
+    ///
+    /// # What a `data_venue` registers, and what it deliberately does not
+    /// An instrument carrying a [`DataVenue`](crate::instrument::data_venue::DataVenue) registers
+    /// **two** exchanges — the one it executes on and the one it is priced on. So
+    /// [`IndexedInstruments::exchanges`] is wider than the set of `Instrument::exchange` values, and
+    /// a data-only venue receives the [`ExchangeIndex`] it needs in order to carry connectivity
+    /// state; without one, the first market event from that venue has no state to resolve.
+    ///
+    /// Its **assets are not registered**. Every asset an instrument implies — underlying base and
+    /// quote, settlement asset, and any `OrderQuantityUnits::Asset` — is registered against the
+    /// *execution* venue alone, so a data-only venue contributes zero entries to
+    /// [`IndexedInstruments::assets`]. An [`ExchangeAsset`] keys balance state, and a venue that
+    /// only publishes prices holds no balance to key.
+    ///
+    /// That asymmetry is load bearing in both directions, and worth knowing before relying on
+    /// either half:
+    /// - It is why a data-only venue seeds no phantom balances it could never report, and why the
+    ///   asset index space is not doubled for every dual-venue instrument.
+    /// - It is also why any lookup that reaches an instrument *through* its assets cannot honour a
+    ///   data venue. `index_market_data_subscription_batches` is the one in tree: asked for a data
+    ///   venue it fails with an asset-index error, and asked for the execution venue it succeeds
+    ///   with the correct instrument index against the wrong feed.
     pub fn add_instrument(mut self, instrument: Instrument<ExchangeId, Asset>) -> Self {
         // Add ExchangeId
         self.exchanges.push(instrument.exchange);

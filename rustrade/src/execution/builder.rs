@@ -451,8 +451,8 @@ impl IntoIterator for ExecutionHandles {
 /// why, and for the balances a caller must fund.
 ///
 /// [`MockExchange`]: rustrade_execution::exchange::mock::MockExchange
-#[allow(clippy::unwrap_used)]
 // Invariant: IndexedInstruments - all referenced assets exist; panics for unsupported InstrumentKind
+#[allow(clippy::unwrap_used)]
 fn generate_mock_exchange_instruments(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,

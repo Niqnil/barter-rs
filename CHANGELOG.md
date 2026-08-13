@@ -408,9 +408,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before their execution clients exist — `backtest` builds one set of clients per run from a state
   supplied once — this corrects the roles after the fact instead of obliging the caller to declare
   venues it cannot yet know. Its one caller obligation — that `instruments` is the collection
-  `states` was built from — is `debug_assert!`ed by comparing the venue keys in `ExchangeIndex`
-  order, so a mismatched pair is caught in debug rather than silently assigning every venue a
-  plausible but wrong role. A pair holding the *same* venues with different instruments is not
+  `states` was built from — is `assert!`ed by comparing the venue keys in `ExchangeIndex`
+  order. **This panics in release builds too**, deliberately: the failure it guards is silent, in
+  the same way `assert_aux_events_sorted`'s is. Every venue would otherwise be handed a plausible
+  but wrong role, `global` is re-derived from those roles, and a strategy gated on global health
+  then trades against a link that never came up. A pair holding the *same* venues with different
+  instruments is not
   detectable this way, but also misaligns every `InstrumentIndex` in the engine, so venue roles are
   not the symptom that surfaces first.
 
@@ -1024,6 +1027,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   short-circuits on the cached aggregate and returns before writing, so a role error whose first
   market event arrives later is not observable through this field. Documentation only — no behaviour
   change.
+
+- **A disconnect on a dimension a venue does not provide no longer wedges global connectivity**
+  (`rustrade`). `ConnectivityStates::update_from_account_reconnecting` and
+  `update_from_market_reconnecting` checked only that the `ExchangeId` was *tracked*, then wrote
+  `ConnectivityStates::global = Health::Reconnecting` unconditionally, without consulting the
+  venue's `VenueRole`. In a split configuration both venues are single-dimension, so a
+  `MarketStreamEvent::Reconnecting` naming the **execution** venue — or an
+  `AccountStreamEvent::Reconnecting` naming the **data** venue — degraded global health over a
+  connection that venue never had, and nothing could then restore it: no event can arrive for a
+  dimension a venue does not provide, and `update_from_account_event` / `update_from_market_event`
+  each return early once their own dimension is already `Healthy`, so the convergence check never
+  re-ran. Every strategy gated on global health stayed gated for the remainder of the session, after
+  a single `warn!` line. Both paths now re-derive `global` through `ConnectivityState::all_healthy`,
+  which does not consult a dimension the role does not own, and `warn!` the role mismatch itself as
+  a misconfiguration in its own right. The market-side case is reachable without any wrong role at
+  all: a `SystemBuild`'s market stream is caller-supplied and forwarded verbatim, so one built per
+  `IndexedInstruments::exchanges()` rather than per *data* venue emits exactly this on its first
+  reconnect.
+  The aggregate is now derived in **one** place, shared by both disconnect paths, both event paths
+  and `reconcile_venue_roles`, so the cached value cannot disagree with the states it summarises.
+  One log change follows from that: a `global` transition is reported as
+  `"EngineState updating global connectivity"` with its previous and new value, in both directions,
+  replacing a message emitted only on the transition to `Healthy`.
 
 - **The three `UntrackedExchange` rejection paths now log** (`rustrade`). Each returned
   `Err(UntrackedExchange)` silently, while the *routine* disconnect on the adjacent line logged a
