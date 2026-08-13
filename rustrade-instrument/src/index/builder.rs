@@ -23,9 +23,51 @@ impl IndexedInstrumentsBuilder {
         Self::default()
     }
 
+    /// Registers an [`Instrument`], together with the exchanges and assets it implies.
+    ///
+    /// Nothing is validated here — duplicates are tolerated and de-duplicated, and every invariant
+    /// (unique `name_internal`, positive contract multipliers, resolvable asset references) is
+    /// enforced by [`Self::try_build`].
+    ///
+    /// # What a `data_venue` registers, and what it deliberately does not
+    /// An instrument carrying a [`DataVenue`](crate::instrument::data_venue::DataVenue) registers
+    /// **two** exchanges — the one it executes on and the one it is priced on. So
+    /// [`IndexedInstruments::exchanges`] is wider than the set of `Instrument::exchange` values, and
+    /// a data-only venue receives the [`ExchangeIndex`] it needs in order to carry connectivity
+    /// state; without one, the first market event from that venue has no state to resolve.
+    ///
+    /// Its **assets are not registered**. Every asset an instrument implies — underlying base and
+    /// quote, settlement asset, and any `OrderQuantityUnits::Asset` — is registered against the
+    /// *execution* venue alone, so a data-only venue contributes zero entries to
+    /// [`IndexedInstruments::assets`]. An [`ExchangeAsset`] keys balance state, and a venue that
+    /// only publishes prices holds no balance to key.
+    ///
+    /// That asymmetry is load bearing in both directions, and worth knowing before relying on
+    /// either half:
+    /// - It is why a data-only venue seeds no phantom balances it could never report, and why the
+    ///   asset index space is not doubled for every dual-venue instrument.
+    /// - It is also why any lookup that reaches an instrument *through* its assets cannot honour a
+    ///   data venue. `index_market_data_subscription_batches` is the one in tree: asked for a data
+    ///   venue it fails with an asset-index error, and asked for the execution venue it succeeds
+    ///   with the correct instrument index against the wrong feed.
     pub fn add_instrument(mut self, instrument: Instrument<ExchangeId, Asset>) -> Self {
         // Add ExchangeId
         self.exchanges.push(instrument.exchange);
+
+        // Add the market-data venue, when the instrument is priced somewhere other than where it
+        // is executed. Registering it is what gives a data-only venue an `ExchangeIndex`, and
+        // therefore an entry in `ConnectivityStates` -- without which the first market event from
+        // that venue hits a missing-exchange lookup.
+        //
+        // Its ASSETS are deliberately NOT registered. An `ExchangeAsset` keys balance state
+        // (`generate_empty_indexed_asset_states`), and a data-only venue holds no balances: it
+        // publishes prices and has no account. Registering them would seed phantom balances for a
+        // venue that can never report one, and double the asset index space for every dual-venue
+        // instrument. The instrument's own asset keys resolve against its execution venue, which
+        // is where its balances actually live.
+        if let Some(data_venue) = &instrument.data_venue {
+            self.exchanges.push(data_venue.exchange);
+        }
 
         // Add Underlying base
         self.assets.push(ExchangeAsset::new(
@@ -136,15 +178,13 @@ impl IndexedInstrumentsBuilder {
                 // colliding instruments frequently share that name: a spot and a CFD on one symbol
                 // is the collision this check most plausibly catches, and reporting it as
                 // "AAPL and AAPL" asserts they are distinct while printing nothing that
-                // distinguishes them. `kind` is what does.
+                // distinguishes them. `describe_collision` is what does.
                 return Err(IndexError::DuplicateInstrumentNameInternal(format!(
-                    "{} is shared by the distinct instruments {} ({:?}) and {} ({:?}) on {} - \
+                    "{} is shared by the distinct instruments {} and {} on {} - \
                      every Instrument requires a unique name_internal",
                     instrument.name_internal,
-                    previous.name_exchange,
-                    previous.kind,
-                    instrument.name_exchange,
-                    instrument.kind,
+                    describe_collision(previous),
+                    describe_collision(instrument),
                     // `as_str`, not `Display`: the canonical snake_case spelling users write in
                     // configs, rather than the bare variant name.
                     instrument.exchange.as_str(),
@@ -175,12 +215,17 @@ impl IndexedInstrumentsBuilder {
             .enumerate()
             .map(|(index, instrument)| {
                 let exchange_id = instrument.exchange;
-                #[allow(clippy::expect_used)]
-                // Invariant: add_instrument populates exchanges alongside each instrument
-                let exchange_key = find_exchange_by_exchange_id(&exchanges, &exchange_id)
-                    .expect("every exchange related to every instrument has been added");
 
-                let instrument = instrument.map_exchange_key(Keyed::new(exchange_key, exchange_id));
+                // Applied to the execution venue AND to any `DataVenue`, so a data-only venue is
+                // indexed on the same terms. Holds because `add_instrument` registers both.
+                let instrument = instrument.map_exchange_key(|id| {
+                    #[allow(clippy::expect_used)]
+                    // Invariant: add_instrument populates exchanges alongside each instrument
+                    let exchange_key = find_exchange_by_exchange_id(&exchanges, id)
+                        .expect("every exchange related to every instrument has been added");
+
+                    Keyed::new(exchange_key, *id)
+                });
 
                 #[allow(clippy::expect_used)]
                 // Invariant: add_instrument populates assets alongside each instrument
@@ -206,6 +251,25 @@ impl IndexedInstrumentsBuilder {
     }
 }
 
+/// Renders the axes two `Instrument`s sharing a `name_internal` can legitimately differ on while
+/// still sharing a `name_exchange`: `kind` (a spot and a CFD on one symbol) and `data_venue` (one
+/// symbol priced on two venues). Both are compared by the full-equality dedup, so a pair differing
+/// only in one of them survives it and reaches the uniqueness check — where naming neither reads as
+/// "AAPL and AAPL".
+fn describe_collision(instrument: &Instrument<ExchangeId, Asset>) -> String {
+    match &instrument.data_venue {
+        // `as_str`, not `Display`: the canonical snake_case spelling users write in configs,
+        // rather than the bare variant name.
+        Some(data_venue) => format!(
+            "{} ({:?}, priced on {})",
+            instrument.name_exchange,
+            instrument.kind,
+            data_venue.exchange.as_str(),
+        ),
+        None => format!("{} ({:?})", instrument.name_exchange, instrument.kind),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -213,6 +277,7 @@ mod tests {
     use crate::{
         Underlying,
         instrument::{
+            data_venue::DataVenue,
             kind::{InstrumentKind, cfd::CfdContract, perpetual::PerpetualContract},
             name::{InstrumentNameExchange, InstrumentNameInternal},
             quote::InstrumentQuoteAsset,
@@ -255,6 +320,7 @@ mod tests {
             indexed.instruments()[0].value,
             Instrument {
                 exchange: Keyed::new(ExchangeIndex(0), ExchangeId::BinanceSpot),
+                data_venue: None,
                 name_exchange: InstrumentNameExchange::new("btc_usdt"),
                 name_internal: InstrumentNameInternal::new("binance_spot-btc_usdt"),
                 underlying: Underlying {
@@ -363,6 +429,48 @@ mod tests {
         // actionable.
         assert!(message.contains("Spot"), "{message}");
         assert!(message.contains("Cfd"), "{message}");
+    }
+
+    #[test]
+    fn test_duplicate_name_internal_message_distinguishes_instruments_sharing_everything_but_a_data_venue()
+     {
+        // The other axis a colliding pair can differ on while sharing `name_exchange` AND `kind`:
+        // one symbol configured twice, priced on a different venue each time. `data_venue` is part
+        // of `Instrument`s equality, so the dedup does not collapse these either -- and a message
+        // built from `name_exchange` and `kind` alone would read "AAPL (Spot) and AAPL (Spot)".
+        let shared_name = "ibkr-aapl";
+
+        let build = |data_venue| {
+            Instrument::new(
+                ExchangeId::Ibkr,
+                shared_name,
+                "AAPL",
+                Underlying::new(
+                    Asset::new_from_exchange("aapl"),
+                    Asset::new_from_exchange("usd"),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Spot,
+                None,
+            )
+            .with_data_venue(DataVenue::new_same_name(data_venue))
+        };
+
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(build(ExchangeId::LseEquities))
+            .add_instrument(build(ExchangeId::BinanceSpot))
+            .try_build()
+            .expect_err("duplicate name_internal must be rejected");
+
+        let IndexError::DuplicateInstrumentNameInternal(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+
+        assert!(message.contains(shared_name), "{message}");
+        // The data venue is the only field that differs, so naming both is the only thing that
+        // tells the operator which of the two configured entries to change.
+        assert!(message.contains("lse_equities"), "{message}");
+        assert!(message.contains("binance_spot"), "{message}");
     }
 
     /// Builds a one-instrument collection whose only variable is the CFD multiplier.
@@ -593,6 +701,127 @@ mod tests {
         assert_eq!(indexed.instruments().len(), 1);
     }
 
+    /// An `AAPL` executed on Alpaca but priced by LSE — the same-kind data-venue substitution the
+    /// field exists for.
+    fn dual_venue_instrument() -> Instrument<ExchangeId, Asset> {
+        Instrument::spot(
+            ExchangeId::AlpacaBroker,
+            "alpaca_broker-aapl",
+            "AAPL",
+            Underlying::new(
+                Asset::new_from_exchange("aapl"),
+                Asset::new_from_exchange("usd"),
+            ),
+            None,
+        )
+        .with_data_venue(DataVenue::new_same_name(ExchangeId::LseEquities))
+    }
+
+    #[test]
+    fn a_data_only_venue_is_indexed_so_it_can_carry_connectivity_state() {
+        // The registration that makes a data-only venue expressible at all: it appears on no
+        // instrument's `exchange`, so without this it would have no `ExchangeIndex` and no
+        // `ConnectivityState`, and its first market event would hit a missing-exchange lookup.
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(dual_venue_instrument())
+            .try_build()
+            .expect("a dual-venue instrument is a valid collection");
+
+        let exchanges = indexed
+            .exchanges()
+            .iter()
+            .map(|keyed| keyed.value)
+            .collect::<Vec<_>>();
+
+        assert!(
+            exchanges.contains(&ExchangeId::AlpacaBroker),
+            "{exchanges:?}"
+        );
+        assert!(
+            exchanges.contains(&ExchangeId::LseEquities),
+            "{exchanges:?}"
+        );
+    }
+
+    #[test]
+    fn a_data_only_venue_contributes_no_assets() {
+        // A data-only venue holds no balances, and `ExchangeAsset` keys balance state. Registering
+        // its assets would seed balances for an account that does not exist, and double the asset
+        // index space for every dual-venue instrument.
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(dual_venue_instrument())
+            .try_build()
+            .expect("a dual-venue instrument is a valid collection");
+
+        // AAPL and USD, on the execution venue only.
+        assert_eq!(indexed.assets().len(), 2);
+        assert!(
+            indexed
+                .assets()
+                .iter()
+                .all(|keyed| keyed.value.exchange == ExchangeId::AlpacaBroker),
+            "{:?}",
+            indexed.assets()
+        );
+    }
+
+    #[test]
+    fn a_dual_venue_instrument_carries_the_data_venues_own_exchange_index() {
+        // The indexing must resolve the data venue against the data venue -- stamping the
+        // execution venue's key onto it would point market-data state at the wrong exchange, with
+        // nothing at runtime to signal it.
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(dual_venue_instrument())
+            .try_build()
+            .expect("a dual-venue instrument is a valid collection");
+
+        let instrument = &indexed.instruments()[0].value;
+
+        let data_venue = instrument
+            .data_venue
+            .as_ref()
+            .expect("the data venue survives indexing");
+
+        assert_eq!(data_venue.exchange.value, ExchangeId::LseEquities);
+        assert_ne!(data_venue.exchange.key, instrument.exchange.key);
+
+        // And the key is the one the exchange index actually assigned to LSE.
+        let expected = indexed
+            .exchanges()
+            .iter()
+            .find(|keyed| keyed.value == ExchangeId::LseEquities)
+            .expect("LSE is indexed")
+            .key;
+        assert_eq!(data_venue.exchange.key, expected);
+    }
+
+    #[test]
+    fn a_data_venue_pointing_at_the_execution_venue_does_not_duplicate_the_exchange() {
+        // Degenerate but legal: stating the data venue explicitly when it is the same venue. The
+        // exchange dedup must absorb it, or the venue would be indexed twice and every later
+        // ExchangeIndex would shift.
+        let builder = IndexedInstrumentsBuilder::default().add_instrument(
+            instrument(ExchangeId::BinanceSpot, "btc", "usdt")
+                .with_data_venue(DataVenue::new_same_name(ExchangeId::BinanceSpot)),
+        );
+
+        // Asserted before the build, because the post-build count alone would also hold if
+        // `add_instrument` never registered the data venue at all -- which is the bug this test
+        // must not pass through. The registration is unconditional; the dedup is what makes the
+        // degenerate case harmless.
+        assert_eq!(
+            builder.exchanges,
+            vec![ExchangeId::BinanceSpot; 2],
+            "the data venue is registered unconditionally, whatever venue it names",
+        );
+
+        let indexed = builder
+            .try_build()
+            .expect("a self-referential data venue is valid, if redundant");
+
+        assert_eq!(indexed.exchanges().len(), 1);
+    }
+
     #[test]
     fn test_builder_multiple_exchanges() {
         // Add instruments from different exchanges
@@ -681,6 +910,7 @@ mod tests {
             indexed.instruments()[0].value,
             Instrument {
                 exchange: Keyed::new(ExchangeIndex(0), ExchangeId::BinanceSpot),
+                data_venue: None,
                 name_exchange: InstrumentNameExchange::new("BTC_USDT"),
                 name_internal: InstrumentNameInternal::new("binance_spot-btc_usdt"),
                 underlying: Underlying {
@@ -697,6 +927,7 @@ mod tests {
             indexed.instruments()[1].value,
             Instrument {
                 exchange: Keyed::new(ExchangeIndex(1), ExchangeId::Coinbase),
+                data_venue: None,
                 name_exchange: InstrumentNameExchange::new("ETH_USD"),
                 name_internal: InstrumentNameInternal::new("coinbase-eth_usd"),
                 underlying: Underlying {

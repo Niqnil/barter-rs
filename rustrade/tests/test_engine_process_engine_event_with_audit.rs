@@ -21,7 +21,7 @@ use rustrade::{
         state::{
             EngineState,
             asset::AssetStates,
-            connectivity::Health,
+            connectivity::{ConnectivityDimension, Health, UntrackedExchange},
             global::DefaultGlobalData,
             instrument::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
@@ -1304,6 +1304,19 @@ fn build_option_engine_with_oms(
             "binance_spot_btc_usd",
             "BTCUSD",
             Underlying::new("btc", "usd"),
+            None,
+        ))
+        // index 2 (after sort): a second split-eligible Spot on the same base and exchange but a
+        // DIFFERENT quote. Present in every test on this fixture so the split-target uniqueness
+        // guard is continuously exercised against a near-miss, rather than only against instruments
+        // that share a full `(base, quote, exchange)` identity — see
+        // `test_corporate_action_split_is_not_ambiguous_across_a_quote_boundary`. Inert otherwise:
+        // it is never priced, never traded, and carries no position.
+        .add_instrument(Instrument::spot(
+            ExchangeId::BinanceSpot,
+            "binance_spot_btc_usdc",
+            "BTCUSDC",
+            Underlying::new("btc", "usdc"),
             None,
         ))
         .build();
@@ -4777,5 +4790,1000 @@ fn test_corporate_action_floor_to_zero_prunes_hedging_routing() {
             .positions
             .contains_key(&PositionId::new(exchange_id.0.clone())),
         "the late fill opens a fresh slot under the raw order id (no-mapping fallback)"
+    );
+}
+
+/// Engine whose instrument set contains **two** split-eligible (`Spot`) instruments on the *same*
+/// `(exchange, base, quote)` identity, plus one option written on that underlying.
+///
+/// Post-sort indices (instruments on one exchange sort by `name_internal`):
+/// - `0` — the option `BTC-50000-C`
+/// - `1` — spot `BTCUSD`
+/// - `2` — spot `BTCUSD.ALT`, the second deliverable on the identical underlying
+///
+/// This is the registry shape a corporate action cannot be resolved against: either spot is an
+/// equally valid trigger for adjusting index 0, and nothing in the state says which one the option
+/// is written on.
+fn build_ambiguous_underlying_engine(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+) -> TestEngine {
+    let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let instruments = IndexedInstruments::builder()
+        .add_instrument(Instrument::new(
+            ExchangeId::BinanceSpot,
+            "binance_btc_call_50k",
+            "BTC-50000-C",
+            Underlying::new("btc", "usd"),
+            rustrade_instrument::instrument::quote::InstrumentQuoteAsset::UnderlyingQuote,
+            InstrumentKind::Option(OptionContract {
+                contract_size: dec!(1),
+                settlement_asset: "usd".into(),
+                kind: OptionKind::Call,
+                exercise: OptionExercise::European,
+                expiry,
+                strike: dec!(50_000),
+            }),
+            None,
+        ))
+        .add_instrument(Instrument::spot(
+            ExchangeId::BinanceSpot,
+            "binance_spot_btc_usd",
+            "BTCUSD",
+            Underlying::new("btc", "usd"),
+            None,
+        ))
+        // Same exchange, same underlying pair, different listing — the ambiguity under test.
+        .add_instrument(Instrument::spot(
+            ExchangeId::BinanceSpot,
+            "binance_spot_btc_usd_alt",
+            "BTCUSD.ALT",
+            Underlying::new("btc", "usd"),
+            None,
+        ))
+        .build();
+
+    let clock = HistoricalClock::new(STARTING_TIMESTAMP);
+
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
+        DefaultInstrumentMarketData::default()
+    })
+    .time_engine_start(STARTING_TIMESTAMP)
+    .trading_state(trading_state)
+    .oms_mode(OmsMode::Netting)
+    .balances([
+        (ExchangeId::BinanceSpot, "usd", STARTING_BALANCE_USDT),
+        (ExchangeId::BinanceSpot, "btc", STARTING_BALANCE_BTC),
+    ])
+    .build();
+
+    let execution_txs =
+        MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]);
+
+    Engine::new(
+        clock,
+        state,
+        execution_txs,
+        TestBuyAndHoldStrategy { id: strategy_id() },
+        DefaultRiskManager::default(),
+    )
+}
+
+/// Open a position on an arbitrary instrument index (the option helpers above are pinned to idx0).
+fn open_position_on(
+    engine: &mut TestEngine,
+    instrument: usize,
+    side: Side,
+    price: Decimal,
+    quantity: Decimal,
+    tag: &str,
+) {
+    let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade {
+            id: TradeId::new(tag),
+            order_id: OrderId::new(tag),
+            instrument: InstrumentIndex(instrument),
+            strategy: strategy_id(),
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+            side,
+            price,
+            quantity,
+            // Quote asset of every instrument in the ambiguous fixture is usd = AssetIndex(1).
+            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        }),
+    }));
+    engine.process(event);
+}
+
+/// A split whose target is **not the unique** split-eligible instrument on its
+/// `(base, quote, exchange)` is rejected with `AmbiguousSplitTarget` before anything is mutated.
+///
+/// The option chain a split must adjust is resolved by that identity alone, so a second deliverable
+/// listing is an equally valid trigger for adjusting the *same* chain — applying either would divide
+/// every strike on it once per trigger, silently for unheld options and recorded only against
+/// whichever instrument happened to be named. Rejecting is the only sound answer: nothing in the
+/// state can say which listing the options are written on.
+#[test]
+fn test_corporate_action_ambiguous_split_target_rejected_without_mutating() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+
+    // Pin the post-sort layout the assertions below index by.
+    assert!(matches!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .instrument
+            .kind,
+        InstrumentKind::Option(_)
+    ));
+
+    // Marks for the option (idx0) and both spot listings (idx1, idx2).
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    engine.process(market_event_trade(1, 2, dec!(60_000)));
+
+    // Held positions on the option and on the targeted spot, so a partial application would show.
+    open_position_on(&mut engine, 0, Side::Buy, dec!(1_000), dec!(2), "opt-open");
+    open_position_on(
+        &mut engine,
+        1,
+        Side::Buy,
+        dec!(50_000),
+        dec!(3),
+        "spot-open",
+    );
+
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // Rejected, attributed to the named target, with the ambiguity reason.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::UnsupportedCorporateAction {
+                instrument,
+                reason: UnsupportedCorporateActionReason::AmbiguousSplitTarget,
+                ..
+            } if *instrument == InstrumentIndex(1)
+        )),
+        "an ambiguous split target must be rejected as AmbiguousSplitTarget"
+    );
+
+    // Nothing was mutated — not the targeted equity's position ...
+    let spot_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(1));
+    let spot_position = spot_state.position.positions.values().next().unwrap();
+    assert_eq!(spot_position.quantity_abs, dec!(3));
+    assert_eq!(spot_position.price_entry_average, dec!(50_000));
+
+    // ... nor the option chain the ambiguity makes unresolvable.
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(50_000));
+    let option_position = option_state.position.positions.values().next().unwrap();
+    assert_eq!(option_position.quantity_abs, dec!(2));
+
+    // The `id` is recorded nowhere, so the action stays retryable once the registry is corrected.
+    for idx in [InstrumentIndex(0), InstrumentIndex(1), InstrumentIndex(2)] {
+        assert!(
+            !engine
+                .state
+                .instruments
+                .instrument_index(&idx)
+                .corporate_actions_processed
+                .contains("BTCUSD-2-1-split"),
+            "a rejected action must record its id nowhere ({idx:?})"
+        );
+    }
+
+    // And no mutation observable was emitted alongside the rejection.
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OptionPositionAdjustedForSplit { .. }
+                | EngineOutput::SplitRemainder { .. }
+                | EngineOutput::OpenOrdersAtSplit { .. }
+                | EngineOutput::OptionPositionsRequireIdentityChange { .. }
+        )),
+        "a rejected split must emit no mutation observable"
+    );
+
+    // The attack the per-option `id` record alone does NOT close: a wrapper emitting a DISTINCT id
+    // per held instrument defeats every idempotency guard, because no guard has seen that id before.
+    // Naming the *other* listing with a different id is the same ambiguity wearing a different hat,
+    // and must be rejected on the same grounds -- the uniqueness check reads only
+    // `(base, quote, exchange)`, never the id, which is what makes it immune here.
+    let audit_tick = process_with_audit(
+        &mut engine,
+        EngineEvent::CorporateAction {
+            id: "BTCUSD-2-1-split-listing-2".into(),
+            instrument: InstrumentIndex(2),
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(dec!(2)).unwrap(),
+            },
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+        },
+    );
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::UnsupportedCorporateAction {
+                instrument,
+                reason: UnsupportedCorporateActionReason::AmbiguousSplitTarget,
+                ..
+            } if *instrument == InstrumentIndex(2)
+        )),
+        "a fresh id against the second ambiguous listing must be rejected on the same grounds"
+    );
+
+    // Still untouched -- in particular the option chain, which a second silent pass would have
+    // adjusted a second time.
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(50_000));
+}
+
+/// A target that is **both** ambiguous and arithmetically un-rescalable is reported as
+/// `AmbiguousSplitTarget`, pinning the order the two guards run in.
+///
+/// `prepare_corporate_action_split` scans for a second split-eligible listing *before* it walks the
+/// equity positions, so the reason a caller receives names the condition it can actually act on:
+/// the instrument registry is ambiguous, and no rescaling arithmetic — overflowing or not — was
+/// ever reachable. Reversed, the same action would be reported as `ArithmeticOverflow`, sending a
+/// caller after a position quantity when the registry is what needs correcting. Every other split
+/// fixture triggers exactly one guard, so nothing else distinguishes the two orderings.
+#[test]
+fn test_corporate_action_ambiguity_is_reported_ahead_of_overflow() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_position_on(
+        &mut engine,
+        1,
+        Side::Buy,
+        dec!(50_000),
+        dec!(3),
+        "spot-open",
+    );
+
+    // Plant the same adversarial quantity as `test_corporate_action_pre_validation_rejects_
+    // arithmetic_overflow`, so the equity-position pass would overflow if it were ever reached.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .position
+        .positions
+        .values_mut()
+        .next()
+        .expect("spot position should exist")
+        .quantity_abs = Decimal::MAX;
+
+    let audit_tick = process_with_audit(
+        &mut engine,
+        EngineEvent::CorporateAction {
+            id: "BTCUSD-2-1-split-ambiguous-and-overflowing".into(),
+            instrument: InstrumentIndex(1),
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(dec!(2)).unwrap(),
+            },
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+        },
+    );
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    let rejections: Vec<_> = outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::UnsupportedCorporateAction {
+                instrument, reason, ..
+            } => Some((*instrument, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejections.len(), 1, "expected exactly one rejection");
+    assert_eq!(rejections[0].0, InstrumentIndex(1));
+    assert_eq!(
+        rejections[0].1,
+        UnsupportedCorporateActionReason::AmbiguousSplitTarget,
+        "the ambiguity guard must run before the position arithmetic"
+    );
+
+    // Atomic on both counts: the planted quantity is left exactly as planted.
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .position
+            .positions
+            .values()
+            .next()
+            .unwrap()
+            .quantity_abs,
+        Decimal::MAX
+    );
+}
+
+/// A **held** option adjusted by a standard split records that action's `id` in its **own**
+/// `corporate_actions_processed`, and a second delivery of the same `id` therefore leaves it alone.
+///
+/// The target's set is cleared in between to reproduce the door this closes: a same-`id` replay
+/// whose record survived on the options but not on the equity (e.g. state restored from a snapshot
+/// taken before the field existed). Without the per-option record the chain is re-adjusted —
+/// strike divided twice, contracts doubled twice — with the equity's guard powerless to stop it.
+#[test]
+fn test_corporate_action_option_already_carrying_the_id_is_not_readjusted() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+
+    // First delivery: the option is adjusted in place AND records the id itself.
+    process_with_audit(&mut engine, ca_event.clone());
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+    assert!(
+        option_state
+            .corporate_actions_processed
+            .contains("BTCUSD-2-1-split"),
+        "an adjusted option must record the action id on its own set"
+    );
+
+    // Lose the TARGET's record only — its idempotency guard can no longer fire.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .corporate_actions_processed
+        .clear();
+
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // The option is untouched by the second pass: strike NOT halved again, contracts NOT doubled.
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+    let position = option_state.position.positions.values().next().unwrap();
+    assert_eq!(position.quantity_abs, dec!(4));
+    assert_eq!(position.price_entry_average, dec!(500));
+
+    // The suppression is observable, not silent — per skipped option.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::CorporateActionAlreadyProcessed { instrument, .. }
+                if *instrument == InstrumentIndex(0)
+        )),
+        "a suppressed option re-adjust must be surfaced, not silently dropped"
+    );
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::OptionPositionAdjustedForSplit { .. })),
+        "a suppressed option must emit no adjustment observable"
+    );
+
+    // The equity leg still ran (its own guard was cleared) — the option protection is independent
+    // of the target's record, which is the whole point of keeping it per-option.
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .corporate_actions_processed
+            .contains("BTCUSD-2-1-split")
+    );
+}
+
+/// The same per-option record protects an **unheld** option — the case the original defect made
+/// silent, since an unheld option's strike fix emits no position observable at all. A second
+/// delivery of the same `id` must not divide its strike a second time (50_000 → 25_000, never
+/// → 12_500), or every position opened on it later mis-settles at expiry.
+#[test]
+fn test_corporate_action_unheld_option_strike_not_divided_twice_by_the_same_id() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // No option position is opened — the strike fix is the option's whole adjustment.
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+
+    process_with_audit(&mut engine, ca_event.clone());
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .corporate_actions_processed
+            .contains("BTCUSD-2-1-split"),
+        "an unheld option's silent strike fix must still record the action id"
+    );
+
+    // Lose the target's record, then re-deliver the same action.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .corporate_actions_processed
+        .clear();
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(
+        contract.strike,
+        dec!(25_000),
+        "the unheld option's strike must not be divided a second time"
+    );
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::CorporateActionAlreadyProcessed { instrument, .. }
+                if *instrument == InstrumentIndex(0)
+        )),
+        "the suppressed strike fix must be surfaced"
+    );
+}
+
+/// A second split-eligible instrument on the same `(base, exchange)` but a **different quote** must
+/// not trip the split-target uniqueness guard.
+///
+/// The guard scans the entire instrument registry, so it is only as narrow as the identity match it
+/// applies. `is_on_underlying`'s own doc warns that "without the quote filter a BTC/USDT action
+/// would also reach BTC/USDC instruments" — drop that filter and a perfectly resolvable action is
+/// rejected as ambiguous, blocking a legitimate corporate action outright. No fixture whose
+/// instruments all share one `Underlying` can detect that, since base and quote agree everywhere;
+/// this one holds `btc/usd` and `btc/usdc` side by side and asserts the `btc/usd` split still
+/// applies in full.
+#[test]
+fn test_corporate_action_split_is_not_ambiguous_across_a_quote_boundary() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // `BTCUSDC` (index 2) is `Spot`, so split-eligible, and shares the target's base and exchange.
+    // Only its quote differs.
+    let usdc_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(2));
+    assert_eq!(usdc_state.instrument.underlying.quote, AssetIndex(2));
+    assert!(
+        matches!(usdc_state.instrument.kind, InstrumentKind::Spot),
+        "the near-miss instrument must itself be split-eligible, or this proves nothing"
+    );
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    let audit_tick = process_with_audit(
+        &mut engine,
+        EngineEvent::CorporateAction {
+            id: "BTCUSD-2-1-split".into(),
+            instrument: InstrumentIndex(1),
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(dec!(2)).unwrap(),
+            },
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+        },
+    );
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::UnsupportedCorporateAction {
+                reason: UnsupportedCorporateActionReason::AmbiguousSplitTarget,
+                ..
+            }
+        )),
+        "a differing quote is a different underlying - the target is still unique"
+    );
+
+    // The split applied in full, not merely "was not rejected".
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+
+    // ...and the near-miss instrument was left entirely alone by an action on its neighbour.
+    let usdc_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(2));
+    assert!(
+        usdc_state.corporate_actions_processed.is_empty(),
+        "an instrument on a different quote must not record the action"
+    );
+    assert!(usdc_state.position.positions.is_empty());
+}
+
+/// Live engine vs audit-replica parity for the **rejection** path: an ambiguous split target must
+/// be refused identically by both, or the replica applies a split the live engine never did. Full
+/// `InstrumentState` equality across the whole ambiguous registry.
+#[test]
+fn test_corporate_action_replica_parity_ambiguous_split_target() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_position_on(&mut engine, 0, Side::Buy, dec!(1_000), dec!(2), "opt-open");
+    open_position_on(
+        &mut engine,
+        1,
+        Side::Buy,
+        dec!(50_000),
+        dec!(3),
+        "spot-open",
+    );
+
+    let pre_split_state = engine.state.clone();
+
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event.clone());
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_split_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event, &outputs);
+
+    for idx in [InstrumentIndex(0), InstrumentIndex(1), InstrumentIndex(2)] {
+        let live = engine.state.instruments.instrument_index(&idx);
+        let replica = replica_manager
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&idx);
+        assert_eq!(replica, live, "replica/live divergence at {idx:?}");
+    }
+
+    // Non-vacuous: the live engine really did reject, leaving the option chain at pre-split terms.
+    let InstrumentKind::Option(contract) = &engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .instrument
+        .kind
+    else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(50_000));
+}
+
+/// Live engine vs audit-replica parity for the **per-option idempotency** path. The replica records
+/// the action `id` on each option it adjusts, exactly as the live handler does, so a re-delivered
+/// action is suppressed on both sides. A replica missing that record would divide the strike twice
+/// and diverge — which the strike assertion at the end makes non-vacuous.
+#[test]
+fn test_corporate_action_option_replica_parity_suppressed_readjust() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    let pre_split_state = engine.state.clone();
+
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_split_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    // First delivery, driven through both.
+    let first_tick = process_with_audit(&mut engine, ca_event.clone());
+    let first_outputs = match &first_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event.clone(), &first_outputs);
+
+    // Lose the TARGET's record on both sides, mirroring a snapshot restored without it.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .corporate_actions_processed
+        .clear();
+    replica_manager
+        .state_replica
+        .event
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .corporate_actions_processed
+        .clear();
+
+    // Second delivery of the same action.
+    let second_tick = process_with_audit(&mut engine, ca_event.clone());
+    let second_outputs = match &second_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event, &second_outputs);
+
+    for idx in [InstrumentIndex(0), InstrumentIndex(1)] {
+        let live = engine.state.instruments.instrument_index(&idx);
+        let replica = replica_manager
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&idx);
+        assert_eq!(replica, live, "replica/live divergence at {idx:?}");
+    }
+
+    // Non-vacuous: one adjustment happened, not two.
+    let InstrumentKind::Option(contract) = &engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .instrument
+        .kind
+    else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+}
+
+/// A market `Item` from an exchange the engine was never built against is **reported**, and its
+/// `InstrumentIndex` is never dereferenced.
+///
+/// This is the ordering `EngineState::update_from_market` exists to enforce: the exchange is
+/// resolved, and the result propagated, *before* `instrument_index_mut`. An event from an untracked
+/// exchange carries an `InstrumentIndex` from a collection the engine does not share, so the
+/// positional lookup would either panic on an out-of-range index or credit the print to whichever
+/// instrument occupies that slot — a wrong price on a real position, reported nowhere. Move the `?`
+/// below the lookup and only this test fails.
+#[test]
+fn test_untracked_exchange_market_item_is_reported_without_resolving_its_instrument() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    // The engine tracks two `BinanceSpot` instruments, indices 0 and 1.
+    const UNTRACKED: ExchangeId = ExchangeId::Coinbase;
+    let out_of_range = InstrumentIndex(99);
+
+    let connectivity_before = engine.state.connectivity.clone();
+    let instruments_before = engine.state.instruments.clone();
+
+    let event = EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
+        time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+        time_received: time_plus_days(STARTING_TIMESTAMP, 1),
+        exchange: UNTRACKED,
+        instrument: out_of_range,
+        kind: DataKind::Trade(PublicTrade {
+            id: "untracked".into(),
+            price: dec!(10_000),
+            amount: Decimal::ONE,
+            side: Some(Side::Buy),
+        }),
+    }));
+
+    let audit = process_with_audit(&mut engine, event.clone());
+
+    assert_eq!(
+        audit.event,
+        EngineAudit::process_with_output(
+            event,
+            EngineOutput::UntrackedExchange(UntrackedExchange::new(
+                UNTRACKED,
+                ConnectivityDimension::MarketData
+            ))
+        ),
+        "the market-data dimension must be named"
+    );
+    assert_eq!(
+        engine.state.connectivity, connectivity_before,
+        "an untracked exchange must not mutate connectivity state"
+    );
+    assert_eq!(
+        engine.state.instruments, instruments_before,
+        "no instrument state may be read or written for an untrusted InstrumentIndex"
+    );
+}
+
+/// Live engine vs audit-replica parity across all three `UntrackedExchange` paths.
+///
+/// The replica arm **discards** each `Result` (`let _untracked = …`), on the reasoning that its
+/// `ConnectivityStates` is a clone of the live engine's, so the same lookup against the same map
+/// reaches the same verdict from the event alone — and on `Err` neither side mutates. That holds by
+/// inspection today, but it is the only conditional replica arm in `update_from_event` with no
+/// parity test behind it, and `AuditMode::Enabled` is a live-trading mode `backtest` never
+/// exercises (it hardcodes `Disabled`). Without this, someone threading new `on_disconnect`-adjacent
+/// state through the replica would ship the divergence and discover it in production rather than in
+/// CI.
+#[test]
+fn test_untracked_exchange_replica_parity_across_all_three_paths() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    const UNTRACKED: ExchangeId = ExchangeId::Coinbase;
+
+    // Seed the replica from the engine's own starting state, so the two maps genuinely share a key
+    // set — the premise the discard relies on.
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let drive = |engine: &mut TestEngine,
+                 replica: &mut StateReplicaManager<_, DummyAuditUpdates>,
+                 event: EngineEvent<DataKind>| {
+        let audit_tick = process_with_audit(engine, event.clone());
+        let outputs = match &audit_tick.event {
+            EngineAudit::Process(audit) => audit.outputs.clone(),
+            _ => panic!("expected EngineAudit::Process"),
+        };
+        replica.update_from_event(event, &outputs);
+    };
+
+    // Non-vacuity first: a TRACKED market event moves connectivity off its default on both sides.
+    // Without this the parity assertions below would compare two states neither side ever touched,
+    // and would pass even if `update_from_event` ignored connectivity entirely.
+    drive(
+        &mut engine,
+        &mut replica_manager,
+        market_event_trade(1, 0, dec!(100)),
+    );
+    assert_eq!(
+        engine
+            .state
+            .connectivity
+            .connectivity(&ExchangeId::BinanceSpot)
+            .market_data,
+        Health::Healthy,
+        "the tracked event must actually mutate, or the parity asserts below are vacuous"
+    );
+    assert_eq!(
+        replica_manager.replica_engine_state().connectivity,
+        engine.state.connectivity,
+    );
+
+    let connectivity_before = engine.state.connectivity.clone();
+
+    // All three paths, in the order they appear in `update_from_event`.
+    for event in [
+        EngineEvent::Account(AccountStreamEvent::Reconnecting(UNTRACKED)),
+        EngineEvent::Market(MarketStreamEvent::Reconnecting(UNTRACKED)),
+        // The market `Item` carries an `InstrumentIndex` from a collection neither side shares, so
+        // this also pins that the replica stops before its own positional lookup.
+        EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
+            time_received: time_plus_days(STARTING_TIMESTAMP, 2),
+            exchange: UNTRACKED,
+            instrument: InstrumentIndex(99),
+            kind: DataKind::Trade(PublicTrade {
+                id: "untracked".into(),
+                price: dec!(10_000),
+                amount: Decimal::ONE,
+                side: Some(Side::Buy),
+            }),
+        })),
+    ] {
+        drive(&mut engine, &mut replica_manager, event);
+    }
+
+    assert_eq!(
+        replica_manager.replica_engine_state().connectivity,
+        engine.state.connectivity,
+        "replica/live connectivity divergence across the untracked paths"
+    );
+    assert_eq!(
+        replica_manager.replica_engine_state().instruments,
+        engine.state.instruments,
+        "replica/live instrument divergence — the out-of-range index must not be dereferenced \
+         on either side"
+    );
+    assert_eq!(
+        engine.state.connectivity, connectivity_before,
+        "and none of the three may have mutated anything at all"
+    );
+}
+
+/// A `Reconnecting` event for an exchange the engine was never built against is **reported**, and
+/// nothing else happens: no `on_disconnect`, no connectivity mutation, no new tracked exchange.
+///
+/// `ConnectivityStates` is unit-tested at its own seam; this pins the two layers above it, which are
+/// where the decision actually lands. `Engine::update_from_{market,account}_stream` matches on the
+/// `Result` to choose between calling `Strategy::on_disconnect` and reporting, and `ProcessAudit`
+/// translates that choice into an `EngineOutput`. Swap those arms — fire `on_disconnect` for a venue
+/// the strategy has no link to, or drop the report instead of emitting it — and every other test in
+/// this suite still passes, because none of them names an exchange the engine does not track.
+#[test]
+fn test_untracked_exchange_reconnecting_is_reported_without_disconnect_or_mutation() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    // The engine is built from `BinanceSpot` instruments only. Nothing about this event is
+    // malformed — it is the shape a misconfigured subscription or execution client produces.
+    const UNTRACKED: ExchangeId = ExchangeId::Coinbase;
+    let tracked_before = engine.state.connectivity.clone();
+
+    let event = EngineEvent::Market(MarketStreamEvent::Reconnecting(UNTRACKED));
+    let audit = process_with_audit(&mut engine, event.clone());
+
+    assert_eq!(
+        audit.event,
+        EngineAudit::process_with_output(
+            event,
+            EngineOutput::UntrackedExchange(UntrackedExchange::new(
+                UNTRACKED,
+                ConnectivityDimension::MarketData
+            ))
+        ),
+        "the market-data dimension must be named, and no MarketDisconnect emitted"
+    );
+
+    let event = EngineEvent::Account(AccountStreamEvent::Reconnecting(UNTRACKED));
+    let audit = process_with_audit(&mut engine, event.clone());
+
+    assert_eq!(
+        audit.event,
+        EngineAudit::process_with_output(
+            event,
+            EngineOutput::UntrackedExchange(UntrackedExchange::new(
+                UNTRACKED,
+                ConnectivityDimension::Account
+            ))
+        ),
+        "the account dimension must be named, and no AccountDisconnect emitted"
+    );
+
+    // Reporting is the whole effect: an untracked exchange is not silently adopted into the
+    // collection, and the venues the engine does track are left exactly as they were.
+    assert_eq!(
+        engine.state.connectivity, tracked_before,
+        "an untracked exchange must not mutate connectivity state"
+    );
+    assert!(
+        !engine.state.connectivity.exchanges.contains_key(&UNTRACKED),
+        "an untracked exchange must not become tracked by reporting it"
     );
 }

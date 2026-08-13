@@ -206,7 +206,7 @@ pub enum EngineEvent<
     ///   and **panics on an unknown key** (consistent with the rest of the `EngineEvent` API), so
     ///   validate the key before constructing the event.
     /// - Supply the `policy` (matching the broker's rounding behaviour) and a resolved
-    ///   `effective_time` (see [`split_effective_instant`](rustrade_instrument::corporate_action::split_effective_instant)).
+    ///   `effective_time` (see [`split_effective_instant`]).
     /// - **Inject once**, after the broker has applied the action, before processing new fills on
     ///   the post-split scale.
     /// - A same-day **correction** is expressed as two distinct events with distinct `id`s — a

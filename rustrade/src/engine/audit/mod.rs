@@ -229,6 +229,9 @@ impl<Event, OnTradingDisabled, OnDisconnect>
                 Self::with_output(event, EngineOutput::AccountDisconnect(disconnect))
             }
             UpdateFromAccountOutput::PositionExit(position) => Self::with_output(event, position),
+            UpdateFromAccountOutput::UntrackedExchange(untracked) => {
+                Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
+            }
         }
     }
 
@@ -240,6 +243,9 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromMarketOutput::None => Self::with_event(event),
             UpdateFromMarketOutput::OnDisconnect(disconnect) => {
                 Self::with_output(event, EngineOutput::MarketDisconnect(disconnect))
+            }
+            UpdateFromMarketOutput::UntrackedExchange(untracked) => {
+                Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
             }
         }
     }

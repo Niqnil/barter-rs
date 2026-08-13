@@ -10,6 +10,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::{
         Instrument,
+        data_venue::DataVenue,
         kind::{
             InstrumentKind, cfd::CfdContract, future::FutureContract, option::OptionContract,
             perpetual::PerpetualContract,
@@ -53,6 +54,13 @@ pub struct InstrumentConfig {
 
     /// Optional additional specifications for the instrument.
     pub spec: Option<InstrumentSpec<AssetNameExchange>>,
+
+    /// Optional venue to source this instrument's market data from, when it differs from
+    /// `exchange` — see [`DataVenue`].
+    ///
+    /// Defaulted so every config written before this field existed still deserialises.
+    #[serde(default)]
+    pub data_venue: Option<DataVenue<ExchangeId>>,
 }
 
 /// Configuration for an execution link.
@@ -135,6 +143,7 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
                 },
                 notional: spec.notional,
             }),
+            data_venue: value.data_venue,
         }
     }
 }

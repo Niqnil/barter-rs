@@ -23,26 +23,26 @@ use std::sync::Arc;
 ///   merge with the market stream is a two-way merge that relies on both inputs already being
 ///   sorted; out-of-order aux events produce an out-of-order engine feed (and, in backtest, a
 ///   non-monotonic [`HistoricalClock`](crate::engine::clock::HistoricalClock)).
-/// - For an [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction), the wrapping
-///   [`Timed::time`] MUST equal the action's `effective_time`. These are two independent knobs: the
+/// - For an [`EngineEvent::CorporateAction`], the wrapping [`Timed::time`] MUST equal the action's
+///   `effective_time`. These are two independent knobs: the
 ///   merge **positions** the event in the stream by `Timed::time`, while the handler advances the
 ///   [`HistoricalClock`](crate::engine::clock::HistoricalClock) to `effective_time` and stamps the
 ///   adjustment there. A mismatch would *order* the action at one instant but make it *take effect*
 ///   at another. The backtest harness **enforces** this pre-merge via
-///   [`assert_aux_corporate_action_effective_times`] (a hard panic naming the offending event) — the
+///   `assert_aux_corporate_action_effective_times` (a hard panic naming the offending event) — the
 ///   handler itself cannot see the wrapping `Timed`, so keep the two equal to pass the check.
-/// - For an [`EngineEvent::ContractExpiry`](crate::EngineEvent::ContractExpiry), the wrapping
-///   [`Timed::time`] MUST equal the target instrument's own `expiry` (engine-side ground truth on
+/// - For an [`EngineEvent::ContractExpiry`], the wrapping [`Timed::time`] MUST equal the target
+///   instrument's own `expiry` (engine-side ground truth on
 ///   its `InstrumentKind`). Unlike `CorporateAction`, the instant is not on the payload — the merge
 ///   positions the event by `Timed::time`, while the handler advances the clock to the instrument's
 ///   `expiry` (see below). A mismatch would *order* the expiry at one instant but *settle* it at
-///   another. Enforced pre-merge via [`assert_aux_contract_expiry_times`] (a hard panic naming the
+///   another. Enforced pre-merge via `assert_aux_contract_expiry_times` (a hard panic naming the
 ///   offending event); non-expiring or unregistered targets are skipped.
 ///
 /// # `ContractExpiry` clock advance
-/// [`EngineEvent::ContractExpiry`](crate::EngineEvent::ContractExpiry) carries no timestamp on its
-/// payload (unlike [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction), which
-/// carries `effective_time`). Its effective instant is instead engine-side ground truth: the
+/// [`EngineEvent::ContractExpiry`] carries no timestamp on its payload (unlike
+/// [`EngineEvent::CorporateAction`], which carries `effective_time`). Its effective instant is
+/// instead engine-side ground truth: the
 /// handler resolves the expiring instrument's `expiry` from its `InstrumentKind` and advances the
 /// [`HistoricalClock`](crate::engine::clock::HistoricalClock) to it via
 /// [`EngineClock::advance_to`](crate::engine::clock::EngineClock::advance_to), so the synthetic
@@ -51,7 +51,7 @@ use std::sync::Arc;
 /// handler always settles at the instrument's own `expiry`, so keep the wrapping `Timed::time` equal
 /// to that `expiry` (a mismatch would *order* the expiry at one instant but *settle* it at another).
 /// The harness enforces this equality pre-merge — see the caller obligation above and
-/// [`assert_aux_contract_expiry_times`].
+/// `assert_aux_contract_expiry_times`.
 pub trait AuxEventSource<
     MarketKind = DataKind,
     ExchangeKey = ExchangeIndex,

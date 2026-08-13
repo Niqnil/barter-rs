@@ -20,7 +20,9 @@ use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use futures::{StreamExt, stream::BoxStream};
 use rustrade_instrument::{
-    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -109,6 +111,15 @@ where
     FnTime: Fn() -> DateTime<Utc> + Clone + Send + Sync,
 {
     const EXCHANGE: ExchangeId = ExchangeId::Mock;
+
+    // `MockExchange` models no expiry, funding schedule or contract chain, so `Perpetual`, `Future`
+    // and `Option` have no faithful projection onto it. `Spot` and `Cfd` need none: both are
+    // positions in an instrument that the mock can open, close and mark without simulating a
+    // lifecycle. Kept in step with the projection in `generate_mock_exchange_instruments`.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
+        InstrumentKindDiscriminant::Spot,
+        InstrumentKindDiscriminant::Cfd,
+    ];
     type Config = MockExecutionClientConfig<FnTime>;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 

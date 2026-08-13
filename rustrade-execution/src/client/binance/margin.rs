@@ -90,8 +90,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
@@ -521,6 +523,11 @@ impl BinanceMargin {
 
 impl ExecutionClient for BinanceMargin {
     const EXCHANGE: ExchangeId = ExchangeId::BinanceMargin;
+
+    // Margin is leverage applied to spot pairs, not a distinct instrument kind: a cross or
+    // isolated margin order is still an order on a `Spot` symbol.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] =
+        &[InstrumentKindDiscriminant::Spot];
     type Config = BinanceMarginConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 

@@ -762,6 +762,7 @@ mod tests {
                 quote: InstrumentQuoteAsset::UnderlyingQuote,
                 kind: InstrumentKind::Spot,
                 spec: None,
+                data_venue: None,
             },
         );
 
@@ -879,6 +880,7 @@ mod tests {
                     settlement_asset: AssetNameExchange::new("gbp"),
                 }),
                 spec: None,
+                data_venue: None,
             },
         );
 

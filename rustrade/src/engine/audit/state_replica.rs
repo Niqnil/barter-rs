@@ -143,7 +143,8 @@ where
     /// - **`CorporateAction`**: a *hybrid*. `Position::apply_split` is deterministic, so the
     ///   adjustment (quantity / basis / unrealised PnL) is **event-replayed** for every position
     ///   from the payload — after re-running the same guards (idempotency / non-`Spot` /
-    ///   unsupported-kind, all of which skip without mutating). The Floor-to-zero **close** is
+    ///   unsupported-kind, plus the ambiguous-target and pre-validation guards inside the shared
+    ///   prepare pass, all of which skip without mutating). The Floor-to-zero **close** is
     ///   **output-mirrored** (like `ContractExpiry`): the live handler stamps the closing
     ///   `PositionExit.time_exit` with `self.time()`, which is wall-clock-derived on
     ///   `HistoricalClock` and therefore cannot be reproduced from the payload, so the replica
@@ -169,9 +170,16 @@ where
                     .trading
                     .update(trading_state);
             }
+            // The three `UntrackedExchange` results below are event-replayed, not output-mirrored:
+            // the replica's `ConnectivityStates` is a clone of the live engine's, so the same
+            // lookup against the same map reaches the same verdict from the event alone. On `Err`
+            // the live engine mutated nothing, and so does the replica — discarding the result
+            // *is* the mirror. (The live engine already emitted the observable and logged it; the
+            // replica mirrors state, not outputs.)
             EngineEvent::Account(event) => match event {
                 AccountStreamEvent::Reconnecting(exchange) => {
-                    self.replica_engine_state_mut()
+                    let _untracked = self
+                        .replica_engine_state_mut()
                         .connectivity
                         .update_from_account_reconnecting(&exchange);
                 }
@@ -181,12 +189,13 @@ where
             },
             EngineEvent::Market(event) => match event {
                 MarketStreamEvent::Reconnecting(exchange) => {
-                    self.replica_engine_state_mut()
+                    let _untracked = self
+                        .replica_engine_state_mut()
                         .connectivity
                         .update_from_market_reconnecting(&exchange);
                 }
                 MarketStreamEvent::Item(event) => {
-                    self.replica_engine_state_mut().update_from_market(&event);
+                    let _untracked = self.replica_engine_state_mut().update_from_market(&event);
                 }
             },
             EngineEvent::ContractExpiry(key) => {
@@ -303,17 +312,19 @@ where
                 let adjust_options_in_place = classify_option_split(&kind).unwrap_or(false);
 
                 // Pre-compute the whole action BEFORE mutating anything, mirroring the live
-                // handler's Step 2c: if the live engine rejected it (Decimal overflow — equity,
-                // option strike, or option position — or a corrupted option contract count) it
-                // recorded no `id` and mutated nothing, so the replica must do the same or state
-                // parity drifts. Single-sourced via the same `prepare_corporate_action_split` the
-                // live handler calls, so both reach the identical accept/reject decision AND the
-                // identical committed values. No output emitted — the replica mirrors state, and the
-                // live engine already logged the rejection.
+                // handler's Step 2c: if the live engine rejected it (an ambiguous split target, a
+                // Decimal overflow — equity, option strike, or option position — or a corrupted
+                // option contract count) it recorded no `id` and mutated nothing, so the replica
+                // must do the same or state parity drifts. Single-sourced via the same
+                // `prepare_corporate_action_split` the live handler calls, so both reach the
+                // identical accept/reject decision AND the identical committed values — including
+                // which options are excluded as already-adjusted by this `id`. No output emitted —
+                // the replica mirrors state, and the live engine already logged the rejection.
                 let split_plan = match self
                     .replica_engine_state()
                     .instruments
                     .prepare_corporate_action_split(
+                        &id,
                         &instrument,
                         ratio,
                         policy,
@@ -421,6 +432,14 @@ where
                             );
                         };
                         contract.strike = opt_plan.strike_post_split;
+
+                        // Record `id` on the OPTION's own set (mirrors the live handler): the
+                        // replica's `InstrumentState` is asserted field-for-field against the live
+                        // engine's, and this set now gates whether a later delivery of the same
+                        // action re-adjusts the option — so omitting it would both fail parity and
+                        // let the replica double-divide a strike the live engine skipped. Written
+                        // before the unheld early-out, exactly as the live handler does.
+                        option_state.corporate_actions_processed.insert(id.clone());
 
                         // Unheld option: strike correction is the whole job (silent registry fix),
                         // mirroring the live handler.

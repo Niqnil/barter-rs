@@ -4,16 +4,17 @@
 //! Massive/Polygon and Alpaca: query a provider by symbol + effective-date range and receive a
 //! stream of corporate-action facts. The yielded fact is the
 //! [`CorporateAction`](rustrade_instrument::corporate_action::CorporateAction) descriptor
-//! (re-exported here), keyed by an unresolved provider symbol ([`SmolStr`]); a wrapper resolves the
-//! symbol to its engine instrument key and supplies the rounding policy + stamping instant before
-//! injecting an engine event.
+//! (re-exported here), keyed by an unresolved provider symbol ([`SmolStr`](smol_str::SmolStr)); a
+//! wrapper resolves the symbol to its engine instrument key and supplies the rounding policy +
+//! stamping instant before injecting an engine event.
 //!
 //! # The kind lives in the trait name, not a filter
 //!
 //! There is deliberately **no unified `CorporateActionSource` with a `kinds` filter**. Reference
 //! providers expose a *separate endpoint per action type* (splits vs dividends), so the action kind
-//! is encoded in the trait itself: [`StockSplitSource`] fetches splits. A `DividendSource` sibling
-//! trait is the natural future addition when dividends are needed — each fully typed, with no
+//! is encoded in the trait itself: [`StockSplitSource`](crate::corporate_action::StockSplitSource)
+//! fetches splits. A `DividendSource` sibling trait is the natural future addition when dividends
+//! are needed — each fully typed, with no
 //! discriminant enum to keep in lockstep with
 //! [`CorporateActionKind`](rustrade_instrument::corporate_action::CorporateActionKind).
 //!
@@ -21,7 +22,9 @@
 //!
 //! Account-scoped or push-based sources (e.g. Interactive Brokers' WSH / Flex Query feeds) do not
 //! fit the global-by-symbol PULL model and are **intentionally not** expressed through this trait.
-//! Such a source maps its data onto the same [`CorporateAction`] descriptor via its own adapter.
+//! Such a source maps its data onto the same
+//! [`CorporateAction`](rustrade_instrument::corporate_action::CorporateAction) descriptor via its
+//! own adapter.
 
 use chrono::NaiveDate;
 use derive_more::Constructor;

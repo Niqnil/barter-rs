@@ -364,6 +364,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token" at fetch time. A runnable example
   (`ibkr_flex_corporate_actions`, `--features ibkr`) sketches the wrapper-side reconcile.
 
+- **BREAKING**: **A distinct market-data venue on `Instrument`** (`rustrade-instrument`,
+  `rustrade-data`, `rustrade`). `Instrument` gains `data_venue: Option<DataVenue<ExchangeKey>>`, so
+  one instrument can be priced on one venue and executed on another — the single `exchange` field
+  could not express that at all, which made live trading on a third-party price feed structurally
+  impossible. Modelling it as two separate instruments is not equivalent: position and
+  `pnl_unrealised` are strictly `InstrumentIndex`-scoped, so the traded instrument would never
+  receive the price updates landing on the other index, and its PnL would sit permanently stale.
+  `DataVenue` carries the exchange **and** an optional `name_exchange`, because two venues routinely
+  spell one instrument differently — a venue-only field would subscribe under the execution venue's
+  symbol and silently receive nothing, or another instrument's prices. Read it through the new
+  `Instrument::data_exchange()` / `data_name_exchange()` accessors, which apply the
+  fall-back-to-the-execution-venue rule in one place, and set it with `with_data_venue()`.
+  `IndexedInstrumentsBuilder` now registers both venues into `exchanges` — but deliberately **not**
+  into `assets`, since a data-only venue holds no balances and registering it would seed balance
+  state for a venue that can never report one — and market-data subscription batching groups by
+  `data_exchange()`. Migration: `Instrument::new` / `Instrument::spot` are unchanged and set the
+  field to `None`, so only struct literals and destructuring patterns need touching. The same field
+  is added to `system::config::InstrumentConfig`, which has no constructor to shield literals from
+  it — it is `#[serde(default)]`, so configs written before it existed still deserialise. The field
+  is declared **last** deliberately: `Instrument` derives `Ord` and `IndexedInstrumentsBuilder` sorts
+  before assigning `InstrumentIndex`, so appending renumbers no existing configuration.
+  *Known limitation:* `index_market_data_subscription_batches` resolves both the assets and the
+  instrument against the **execution** venue, so it cannot honour a `DataVenue`. Naming the data
+  venue fails loudly (`IndexError`), since that venue holds no registered assets. Naming the
+  execution venue **succeeds** — the returned `InstrumentIndex` is correct, but the subscription it
+  is attached to names the wrong feed, and the function has no way to tell that the instrument is
+  priced elsewhere. Its rustdoc states both cases, and a test pins each.
+
+- **`VenueRole { DataOnly, ExecutionOnly, Both }`** (`rustrade`), naming which connection dimensions
+  a venue provides, alongside a `ConnectivityState::new(role)` constructor. See the **BREAKING**
+  Changed entry on `ConnectivityState` gaining the field for why it exists and how to migrate.
+
+- **`EngineStateBuilder::execution_venues`** (`rustrade`) declares which venues have a registered
+  execution client, so only those are given an account connection to wait on. `SystemBuilder` calls
+  it automatically, and `backtest` reconciles the roles itself (see the entry below); provide it by
+  hand when building an `EngineState` for an engine you drive directly.
+  See the Fixed entry on the account connection dimension for what it corrects.
+
+- **`connectivity::reconcile_venue_roles`** (`rustrade`) re-derives every tracked venue's
+  `VenueRole` from the venues that have a registered execution client, leaving connection `Health`
+  and the positional `ExchangeIndex` order untouched. For callers that must build an `EngineState`
+  before their execution clients exist — `backtest` builds one set of clients per run from a state
+  supplied once — this corrects the roles after the fact instead of obliging the caller to declare
+  venues it cannot yet know. Its one caller obligation — that `instruments` is the collection
+  `states` was built from — is `assert!`ed by comparing the venue keys in `ExchangeIndex`
+  order. **This panics in release builds too**, deliberately: the failure it guards is silent, in
+  the same way `assert_aux_events_sorted`'s is. Every venue would otherwise be handed a plausible
+  but wrong role, `global` is re-derived from those roles, and a strategy gated on global health
+  then trades against a link that never came up. A pair holding the *same* venues with different
+  instruments is not
+  detectable this way, but also misaligns every `InstrumentIndex` in the engine, so venue roles are
+  not the symptom that surfaces first.
+
+- **`ExecutionClient::SUPPORTED_KINDS`** (`rustrade-execution`, `rustrade`), a required associated
+  const listing the `InstrumentKindDiscriminant`s a client can trade, alongside the existing
+  `const EXCHANGE`. `rustrade-execution` had no kind guard whatsoever, so an instrument of a kind a
+  venue cannot encode reached that venue as a silent wrong-symbol order. `ExecutionBuilder::add_execution`
+  now rejects the build naming the offending client and kind. The new
+  `InstrumentKindDiscriminant { Spot, Perpetual, Future, Option, Cfd }` in `rustrade-instrument`
+  (plus `InstrumentKind::discriminant()`) exists because `InstrumentKind` carries data on four of its
+  five variants and so cannot itself be declared against; `MarketDataInstrumentKind` is deliberately
+  not reused, as it answers a different question. Declared support: Binance spot and margin `Spot`;
+  Hyperliquid perpetual `Perpetual` and spot `Spot`; Alpaca `Spot, Option`; IBKR `Spot, Future,
+  Option`; mock `Spot, Cfd`. IBKR omits `Cfd` deliberately — the client builds no security type for
+  them, so a CFD could only ever reach that venue as some other contract. Scope: the guard is
+  checked against `Instrument::kind`, so it catches a kind a client can never represent; it does
+  **not** validate a client's own symbol registry against the instrument model — IBKR's
+  `ContractConfig.security_type`, for one, stays caller-supplied and unchecked.
+  **BREAKING** for external `ExecutionClient` implementors: the const has no default.
+
+- **`ConnectivityDimension` and `UntrackedExchange`** (`rustrade`), the reported detail when a market
+  or account event names an exchange the engine does not track — see the Fixed entry below.
+
+- **`UnsupportedCorporateActionReason::AmbiguousSplitTarget`** (`rustrade`), rejecting a stock split
+  whose target is not the unique deliverable instrument on its `(base, quote, exchange)` — see the
+  Fixed entry below. Appended last to the (`#[non_exhaustive]`) enum, which derives `Ord`.
+
 ### Changed
 
 - **Silent assumptions in the new LSE and streaming code are now observable.** None of these change
@@ -814,6 +891,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an abort: the next poll fell through to draining the aux stream, emitting events at instants the
   market data never reached.
 
+- **BREAKING**: **`ConnectivityState` gains a `role: VenueRole` field** (`rustrade`), and
+  `all_healthy()` now consults only the dimensions that role says the venue actually has. Without
+  this, any venue supplying market data without an account — which the new `data_venue` makes
+  ordinary — would hold its `account` at `Reconnecting` forever, so `ConnectivityStates::global`
+  could never reach `Healthy`, and everything gated on global health would be permanently degraded.
+  The role is derived per dimension rather than per provider, which matters: marking only the data
+  venue `DataOnly` fixes half the trap, leaving the *execution* venue waiting on a market-data
+  subscription that is never made. Migration: struct literals and exhaustive destructuring patterns
+  must supply the field — use the new `ConnectivityState::new(role)`, or `..Default::default()`,
+  which yields the pre-existing `VenueRole::Both` semantics. The field is `#[serde(default)]` to
+  `Both`, so state persisted before it existed deserialises unchanged.
+
+- **BREAKING**: **`ConnectivityStates::exchanges` is an `FnvIndexMap`** (`rustrade`), not a
+  SipHash-keyed `indexmap::IndexMap`. It is looked up by `ExchangeId` on **every** market event now
+  that resolution precedes the global-health short-circuit (see the Fixed entry on the
+  untracked-exchange panic), and a fieldless enum key is exactly the shape SipHash's fixed
+  per-call setup cost is worst for. This also matches every sibling per-event keyed structure —
+  `InstrumentStates`, `AssetStates`, `MultiExchangeTxMap`. Iteration order is unchanged: `IndexMap`
+  is insertion-ordered regardless of hasher. Migration: the field is public, so code naming its type
+  or building one directly needs `rustrade_integration::collection::FnvIndexMap`; `IndexMap`'s API is
+  otherwise identical.
+
+- **BREAKING**: **The `ExchangeId`-keyed connectivity updates are now fallible** (`rustrade`).
+  `ConnectivityStates::update_from_market_event`, `update_from_market_reconnecting` and
+  `update_from_account_reconnecting` return `Result<(), UntrackedExchange>`, and
+  `EngineState::update_from_market` propagates it — see the Fixed entry on the untracked-exchange
+  panic. The `ExchangeIndex`-keyed accessors stay panicking, deliberately: those keys are derived
+  from the same `IndexedInstruments` the collection was built from, so an out-of-range one is a
+  library bug rather than a misconfigured input, and is not something a caller could handle.
+  `UpdateFromMarketOutput` and `UpdateFromAccountOutput` each gain an `UntrackedExchange` variant and
+  are now `#[non_exhaustive]` (adding the variant was already breaking, so the future-proofing is
+  absorbed here rather than costing a second break later).
+
+- **BREAKING**: **`generate_empty_indexed_connectivity_states` takes the execution venues**
+  (`rustrade`), as `Option<&FnvHashSet<ExchangeId>>`. Pass `None` to keep the previous
+  instrument-derived behaviour. See the Fixed entry on the account connection dimension.
+
+- **BREAKING**: **`Instrument::map_exchange_key` takes a lookup closure**, not a pre-resolved key
+  (`rustrade-instrument`): `(self, exchange: NewExchangeKey)` becomes
+  `(self, find_exchange: impl Fn(&ExchangeKey) -> NewExchangeKey)`. One key cannot serve two venues:
+  the old shape could only stamp the execution venue's key onto the data venue, which is wrong by
+  construction once the two differ. Migration: pass a closure returning the key you used to pass —
+  `instrument.map_exchange_key(|_| key.clone())` reproduces the old behaviour exactly for an
+  instrument with no `data_venue`. `DataVenue::map_exchange_key` takes the same closure shape, but is
+  new API rather than a change.
+
+- **`UnindexedAccountSnapshot`s omit data-only venues instead of reporting them empty** (`rustrade`).
+  `From<&EngineState> for FnvHashMap<ExchangeId, UnindexedAccountSnapshot>` iterated every tracked
+  exchange, so a venue that only supplies market data produced an **empty** snapshot. The two claims
+  are not the same: an empty snapshot asserts a known, drained account, which a caller cannot
+  distinguish from a real one that has gone to zero — and seeding a `MockExecutionConfig::initial_state`
+  from it would stand up a mock account at a venue nothing trades on. A missing `ExchangeId` now means
+  "no account here", so callers must not assume every tracked exchange appears as a key.
+
+- **`EngineOutput::CorporateActionAlreadyProcessed` has two emitters** (`rustrade`), distinguished by
+  its `instrument` field: the pre-existing target-level replay suppression, and the new per-option
+  one described in the Fixed entry below. Its rustdoc previously claimed no other observable
+  accompanies it, which is no longer true — a suppressed chain adjustment emits one per skipped
+  option alongside an aggregate warning.
+
 ### Removed
 
 - **`EngineOutput::OptionPositionsUnadjustedForSplit`** (`rustrade`). The placeholder option-split
@@ -832,6 +969,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **Twenty-one rustdoc link defects across the workspace** (`rustrade`, `rustrade-execution`,
+  `rustrade-integration`), each of which rendered as dead or misdirected text on docs.rs. **Six**
+  resolved to nothing: `EngineOutput::Commanded` and `EngineOutput::AlgoOrders` pointed at
+  `super::command::Command` / `super::audit::ProcessAudit`, but those docs live in `crate::engine`,
+  where `super::` is the crate root — both items are already imported in that module, so the bare
+  labels resolve; and `rustrade-integration`'s `corporate_action` module doc referenced `SmolStr`,
+  `StockSplitSource` and `CorporateAction` by bare name, which does not resolve there because that
+  module's documentation is split between the `pub mod` statement in `lib.rs` and the file's own
+  `//!` block. **Five** pointed public documentation at private items a reader cannot navigate to
+  (`DEFAULT_HTTP_REQUEST_TIMEOUT`, `ContractConfig::to_contract`, and the two `assert_aux_*` harness
+  checks named in `AuxEventSource`'s caller obligations), and are now plain code spans that still
+  name the mechanism. **Ten** carried an explicit target the label already implied. Documentation
+  only — no behaviour change.
+
+- **CI now gates rustdoc links.** No job ran `cargo doc` with denied lints, which is why the above
+  accumulated unnoticed — and why only `rustrade` had ever been checked at all, leaving the defects
+  in `rustrade-execution` and `rustrade-integration` invisible. A `cargo doc` job now denies
+  `broken_intra_doc_links`, `private_intra_doc_links` and `redundant_explicit_links` across the whole
+  workspace. It runs `--all-features` deliberately: `rustrade-execution` has `default = []` with
+  every client feature-gated, so a bare `cargo doc` documents none of that code and would pass
+  vacuously.
+
+- **`reconcile_venue_roles` now re-derives `ConnectivityStates::global` from the roles it
+  corrected** (`rustrade`). `global` is a cached aggregate over `ConnectivityState::all_healthy`,
+  which is a *function of* `ConnectivityState::role` — so correcting a role silently changes what
+  the cached value should already have been, and the event paths that normally maintain it cannot
+  repair the difference, because each short-circuits once its own dimension is `Health::Healthy`. On
+  a state whose connections had already reported in, a role change therefore stranded `global` wrong
+  in whichever direction it moved, permanently and with no warning: **stale-`Healthy`** when a role
+  widened, where a consumer gating on `global` trades on for the rest of the run against a link that
+  never came up, or **stuck-`Reconnecting`** when one narrowed, where every health-gated strategy
+  stays gated for the whole run — the same footgun the function was added to remove. Reachable
+  through public API: `BacktestArgsConstant::engine_state` is caller-supplied, and `backtest` returns
+  its terminal `engine_state` precisely so it can be inspected and reused, so chaining one window's
+  terminal state into the next window's args (a walk-forward sweep) hits it whenever the execution
+  client set differs between windows. The freshly-built path is unaffected — every connection starts
+  `Reconnecting`, so the re-derive is a no-op there. An **empty** `ConnectivityStates` re-derives to
+  `Reconnecting` whatever it arrived with — a convention on a degenerate input rather than a safety
+  property, since neither `Health` variant is honest over zero venues and a venue-less state holds no
+  instrument to protect. `Reconnecting` is chosen to agree with
+  `generate_empty_indexed_connectivity_states`, which already returns it for a zero-exchange
+  collection, and to leave the postcondition total: on return `global` is `Healthy` iff the state is
+  non-empty and every venue in it is healthy under its corrected role.
+
+- **`generate_empty_indexed_connectivity_states` now warns on an empty venue set** (`rustrade`). A
+  venue-less engine leaves `global` at `Reconnecting` forever, which a consumer gating on it cannot
+  distinguish from a routine reconnect — so an empty configuration presents as an indefinite wait
+  with nothing naming the cause. It now reports the misconfiguration directly, matching the existing
+  warning for a venue that provides neither market data nor execution.
+
+- **`ConnectivityState::market_data`'s rustdoc no longer overstates it as a role-mismatch detector**
+  (`rustrade`). It claimed that a market event arriving for a venue declared `ExecutionOnly` would
+  set the field `Healthy` and so surface the wrong role. That holds only before
+  `ConnectivityStates::global` reaches `Healthy`: after convergence `update_from_market_event`
+  short-circuits on the cached aggregate and returns before writing, so a role error whose first
+  market event arrives later is not observable through this field. Documentation only — no behaviour
+  change.
+
+- **A disconnect on a dimension a venue does not provide no longer wedges global connectivity**
+  (`rustrade`). `ConnectivityStates::update_from_account_reconnecting` and
+  `update_from_market_reconnecting` checked only that the `ExchangeId` was *tracked*, then wrote
+  `ConnectivityStates::global = Health::Reconnecting` unconditionally, without consulting the
+  venue's `VenueRole`. In a split configuration both venues are single-dimension, so a
+  `MarketStreamEvent::Reconnecting` naming the **execution** venue — or an
+  `AccountStreamEvent::Reconnecting` naming the **data** venue — degraded global health over a
+  connection that venue never had, and nothing could then restore it: no event can arrive for a
+  dimension a venue does not provide, and `update_from_account_event` / `update_from_market_event`
+  each return early once their own dimension is already `Healthy`, so the convergence check never
+  re-ran. Every strategy gated on global health stayed gated for the remainder of the session, after
+  a single `warn!` line. Both paths now re-derive `global` through `ConnectivityState::all_healthy`,
+  which does not consult a dimension the role does not own, and `warn!` the role mismatch itself as
+  a misconfiguration in its own right. The market-side case is reachable without any wrong role at
+  all: a `SystemBuild`'s market stream is caller-supplied and forwarded verbatim, so one built per
+  `IndexedInstruments::exchanges()` rather than per *data* venue emits exactly this on its first
+  reconnect.
+  The aggregate is now derived in **one** place, shared by both disconnect paths, both event paths
+  and `reconcile_venue_roles`, so the cached value cannot disagree with the states it summarises.
+  One log change follows from that: a `global` transition is reported as
+  `"EngineState updating global connectivity"` with its previous and new value, in both directions,
+  replacing a message emitted only on the transition to `Healthy`.
+
+- **The three `UntrackedExchange` rejection paths now log** (`rustrade`). Each returned
+  `Err(UntrackedExchange)` silently, while the *routine* disconnect on the adjacent line logged a
+  `warn!` — so the anomaly was quieter than the ordinary event it replaced. The structured
+  observable (`EngineOutput::UntrackedExchange`) rides the audit stream, but only the
+  `*_with_audit` runners retain per-event ticks: a consumer on `sync_run`/`async_run` got **no**
+  signal at all, which is a differently-shaped version of the intermittent blind spot this release
+  set out to close. The level is chosen by how often each path can fire: `warn!` on
+  `update_from_account_reconnecting` and `update_from_market_reconnecting`, which are bounded by the
+  disconnect rate and now match the level of their tracked-venue counterparts, and `debug!` on
+  `update_from_market_event`, which fires once per market event and at `warn!` would emit at tick
+  rate for a stream wired to an unconfigured exchange. A consumer that must not miss this on a
+  non-audit runner should enable `debug!` for `rustrade::engine::state::connectivity` or run an
+  `*_with_audit` variant and count the output.
+
+- **`backtest` now derives venue roles from the execution clients it builds** (`rustrade`), instead
+  of requiring the caller to declare them on the state it is handed. A backtest that priced an
+  instrument on one venue and executed on another had that pricing venue approximated as
+  `VenueRole::Both` unless the caller passed `EngineStateBuilder::execution_venues`, so it waited
+  forever on an account connection nothing would establish, held `ConnectivityStates::global` at
+  `Health::Reconnecting`, and gated every strategy that consults global health for the entire run —
+  without erroring. `backtest` builds its own execution clients per run, so it now reconciles the
+  roles on its own clone of the state (see `reconcile_venue_roles`); the caller's `engine_state` is
+  still never modified, and declaring the venues upfront remains supported and reconciles to
+  itself. A venue that neither prices an instrument nor has an execution client still cannot
+  converge — it is now reported with a warning naming it, rather than left to be inferred from a
+  `global` that never leaves `Reconnecting`.
 
 - **LSE candle pages are now checked for ordering and resolution instead of assumed correct**
   (`rustrade-data`, `lse` feature). Two provider behaviours the module compensates for were pinned
@@ -1269,6 +1514,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prior `--save-baseline` numbers for those two groups are not comparable across this change (they
   never completed). Benchmark-only; no library behaviour changes.
 
+- **An event from an untracked exchange is reported instead of panicking the engine** (`rustrade`).
+  A market or account event naming an exchange with no `ConnectivityState` hit
+  `panic!("ConnectivityStates does not contain: {key}")`. Worse than a panic, it was an
+  *intermittent* one: the lookup sat behind a `global == Healthy` early-return, so a misconfigured
+  exchange was silently ignored for as long as everything else stayed healthy and only brought the
+  engine down once a reconnect dragged global health back down — hours into a run. The exchange is
+  now resolved on **every** market event, including the healthy fast path, so the report fires on the
+  first event from that exchange in every run; the early-return still skips the state mutation. An
+  untracked exchange mutates nothing — including `global`, which previously went to `Reconnecting`
+  immediately before the panic — and surfaces as a non-mutating `EngineOutput::UntrackedExchange`.
+  `EngineState::update_from_market` returns before the positional `instrument_index_mut` lookup,
+  which would otherwise panic or, worse, misattribute the print to whichever instrument occupied that
+  slot. Untracked reconnects also skip `Strategy::on_disconnect`, since the strategy has no link to
+  that venue to react to. The audit replica reaches the same verdict by replaying the event rather
+  than mirroring the output. Cost of the unconditional lookup, measured rather than assumed: below
+  the noise floor of a ~50,000-market-event backtest bench (127.28 ms → 126.66 ms, within the
+  criterion noise threshold).
+
+- **The account connection dimension is derived from execution clients, not the instrument model**
+  (`rustrade`). A venue that supplies prices without executing anything was assigned
+  `VenueRole::Both`, so it waited forever on an account connection nothing would ever establish and
+  held `ConnectivityStates::global` at `Reconnecting` for the life of the run. The two dimensions
+  have different sources of truth: market data is instrument-derived and exactly so, since
+  subscriptions are generated from the same `data_exchange` field, but account events reach the
+  engine only from a registered `ExecutionManager`, and `Instrument::exchange` names the venue an
+  instrument *would* trade on — not whether anything is wired up to trade there. `SystemBuilder`
+  now reads the registered venues from the `MultiExchangeTxMap` it has already built, so the live
+  path is correct without the caller doing anything. This matters for any configuration pricing one
+  instrument on a venue it never trades on, including a strategy that decides on one instrument and
+  trades another. A venue providing neither dimension — instruments priced elsewhere, no execution
+  client registered — is reachable for the first time as a result; it stays `Both`, withholding
+  health rather than granting it to a venue with no known connection, and is reported with a warning.
+
+- **A stock split no longer double-adjusts an option chain** (`rustrade`).
+  `prepare_corporate_action_split` derived `(base, quote, exchange)` from the split target and
+  adjusted every option matching it, with nothing verifying the target was the unique deliverable
+  instrument on that underlying. Two instruments sharing that identity each acted as a valid trigger
+  for adjusting the whole chain, and the second pass was silent *and* unrecorded: unheld options took
+  the strike correction with no position event, and `corporate_actions_processed` was consulted only
+  on the target, so the mutated options carried no record at all. A re-delivered action therefore
+  halved an already-halved strike, surfacing months later as mis-settlement at contract expiry. Both
+  doors are now closed, because they are different doors — the existing idempotency guard is keyed on
+  action `id` alone and read only from the target's set, so recording alone is defeated by a distinct
+  `id` per instrument, while uniqueness alone leaves a same-`id` replay unrecorded on the options it
+  mutated:
+  - the split is rejected with `UnsupportedCorporateActionReason::AmbiguousSplitTarget` if any other
+    registered instrument is split-eligible on the target's `(base, quote, exchange)`, checked before
+    any mutation and before the ratio arithmetic, so an ambiguous target is reported as such even
+    when the arithmetic would also fail;
+  - each adjusted option records the action `id` in its **own** `corporate_actions_processed`,
+    written before the unheld early-out so a silent registry fix leaves the same evidence a held
+    position does, and the prepare pass filters options already carrying the `id` out of the plan.
+  Suppressed options are reported, not silently skipped — one
+  `EngineOutput::CorporateActionAlreadyProcessed` each plus a single aggregate warning, since a full
+  chain can be large. Dropping them would have reproduced the defect's own signature. Both guards
+  live in the shared prepare pass rather than being hand-mirrored, so the live handler and the audit
+  replica agree by construction.
+
 ### Security
 
 - **The London Strategic Edge vault client no longer follows redirects, so `x-api-key` cannot be
@@ -1363,6 +1666,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fmt::Pointer` impl for `Atomic`/`Shared` when the underlying pointer is null). A transitive
   dependency (via `ibapi` and, in dev builds, `rayon`/`criterion`); the bump is a `Cargo.lock`-only
   patch within the existing `0.9` constraint.
+- Updated `lru` to 0.18.2 to clear RUSTSEC-2026-0253 (`LruCache::pop()` was not panic-safe: a
+  panicking key `Drop` skipped `detach()`, leaving a dangling pointer in the internal linked list
+  for a later eviction to write through — use-after-free and potential double-free). `lru` backs
+  the WebSocket event-deduplication cache behind the `alpaca` and `binance` features; reaching the
+  bug additionally requires `catch_unwind` around a panicking key `Drop`, and the cache is keyed on
+  plain owned data, so the workspace could not trigger it. The bump is a `Cargo.lock`-only patch
+  within the existing `0.18` constraint.
 
 ## [0.5.0] - 2026-06-19
 

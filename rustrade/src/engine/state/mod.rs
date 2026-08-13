@@ -3,7 +3,7 @@ use crate::engine::{
     state::{
         asset::{AssetStates, filter::AssetFilter},
         builder::EngineStateBuilder,
-        connectivity::ConnectivityStates,
+        connectivity::{ConnectivityStates, UntrackedExchange},
         instrument::{
             InstrumentStates, data::InstrumentDataState, filter::InstrumentFilter,
             generate_unindexed_instrument_account_snapshot,
@@ -200,16 +200,26 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///   [`InstrumentState::update_from_market`](instrument::InstrumentState::update_from_market),
     ///   which updates its [`InstrumentDataState`] and then, for each open position, re-computes
     ///   `pnl_unrealised` and advances `time_exchange_update` from the new market price.
+    ///
+    /// # Errors
+    /// Returns [`UntrackedExchange`] if the event is tagged with an exchange the engine was not
+    /// built against. Nothing is mutated and the event is dropped — see that type for why the
+    /// instrument update is skipped too, rather than merely the connectivity one.
     pub fn update_from_market(
         &mut self,
         event: &MarketEvent<InstrumentIndex, InstrumentData::MarketEventKind>,
-    ) where
+    ) -> Result<(), UntrackedExchange>
+    where
         GlobalData:
             for<'a> Processor<&'a MarketEvent<InstrumentIndex, InstrumentData::MarketEventKind>>,
         InstrumentData: InstrumentDataState,
     {
-        // Set exchange market data connectivity to Healthy if it was Reconnecting
-        self.connectivity.update_from_market_event(&event.exchange);
+        // Set exchange market data connectivity to Healthy if it was Reconnecting. Resolved first,
+        // and propagated rather than logged: the `InstrumentIndex` on an event from an untracked
+        // exchange is not ours to trust either, and `instrument_index_mut` below is a positional
+        // lookup that would panic on it -- or silently credit the print to another instrument.
+        self.connectivity
+            .update_from_market_event(&event.exchange)?;
 
         let instrument_state = self.instruments.instrument_index_mut(&event.instrument);
 
@@ -218,9 +228,24 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         // `pnl_unrealised` + advances `time_exchange_update` — previously only `data.process` ran,
         // leaving `pnl_unrealised` stale between fills despite its documented per-tick contract.
         instrument_state.update_from_market(event);
+
+        Ok(())
     }
 }
 
+/// Snapshots the account state the engine holds at each exchange that *has* an account.
+///
+/// # Data-only venues are absent, not empty
+/// A [`VenueRole::DataOnly`](connectivity::VenueRole::DataOnly) venue prices instruments but is
+/// executed on by none, so it holds no balances and no positions. It is omitted from the map
+/// entirely rather than mapped to an empty [`UnindexedAccountSnapshot`], because those two claims
+/// are not the same one: an empty snapshot asserts a known, funded-then-drained account, which a
+/// consumer cannot tell apart from a real one that has gone to zero. Seeding a
+/// [`MockExecutionConfig`](rustrade_execution::client::mock::MockExecutionConfig) from an empty
+/// snapshot would stand up a mock account at a venue nothing trades on.
+///
+/// Callers must therefore treat a missing `ExchangeId` as "no account at this venue", and not
+/// assume every exchange the engine tracks appears as a key.
 impl<GlobalData, InstrumentData> From<&EngineState<GlobalData, InstrumentData>>
     for FnvHashMap<ExchangeId, UnindexedAccountSnapshot>
 {
@@ -233,12 +258,21 @@ impl<GlobalData, InstrumentData> From<&EngineState<GlobalData, InstrumentData>>
             instruments,
         } = value;
 
-        // Allocate appropriately
+        // Upper bound: venues without an account are skipped below.
         let mut snapshots =
             FnvHashMap::with_capacity_and_hasher(connectivity.exchanges.len(), Default::default());
 
-        // Insert UnindexedAccountSnapshot for each exchange
-        for (index, exchange) in connectivity.exchange_ids().enumerate() {
+        // Insert UnindexedAccountSnapshot for each exchange that holds an account.
+        //
+        // `enumerate` deliberately runs *before* the role filter. `ExchangeIndex` is positional
+        // into `connectivity.exchanges`, so numbering only the surviving venues would shift every
+        // index past the first skipped one and silently attribute one exchange's instruments to
+        // another.
+        for (index, (exchange, state)) in connectivity.exchanges.iter().enumerate() {
+            if !state.role.has_account() {
+                continue;
+            }
+
             snapshots.insert(
                 *exchange,
                 UnindexedAccountSnapshot {
@@ -260,5 +294,47 @@ impl<GlobalData, InstrumentData> From<&EngineState<GlobalData, InstrumentData>>
         }
 
         snapshots
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::engine::state::EngineState;
+    use rustrade_instrument::{
+        instrument::data_venue::DataVenue, test_utils::instrument as test_instrument,
+    };
+
+    const DATA: ExchangeId = ExchangeId::BinanceSpot;
+    const EXECUTION: ExchangeId = ExchangeId::Coinbase;
+
+    #[test]
+    fn account_snapshots_omit_a_data_only_venue_and_keep_the_execution_venues_instruments() {
+        // Priced on DATA, executed on EXECUTION: DATA is tracked for connectivity but holds no
+        // account at all.
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")
+            .with_data_venue(DataVenue::new_same_name(DATA))]);
+        let state: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ()).build();
+
+        let snapshots = FnvHashMap::<ExchangeId, UnindexedAccountSnapshot>::from(&state);
+
+        assert!(
+            !snapshots.contains_key(&DATA),
+            "a data-only venue has no account, so it must be absent rather than empty"
+        );
+        assert_eq!(snapshots.len(), 1);
+
+        // The property below only bites while the skipped venue sorts FIRST, and `ExchangeId`
+        // orders by declaration position — so assert it rather than assume it. Were the two to
+        // invert, this test would keep passing while guarding nothing.
+        assert!(DATA < EXECUTION, "the skipped venue must sort first");
+
+        // Guards the enumerate-before-filter ordering: `DATA` sorts ahead of `EXECUTION`, so
+        // numbering the surviving venues instead would hand `EXECUTION` the skipped venue's
+        // `ExchangeIndex` and its instrument list would come back empty.
+        let execution = snapshots.get(&EXECUTION).unwrap();
+        assert_eq!(execution.exchange, EXECUTION);
+        assert_eq!(execution.instruments.len(), 1);
     }
 }

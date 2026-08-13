@@ -98,8 +98,10 @@ use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::{SmolStr, format_smolstr};
@@ -184,6 +186,11 @@ impl HyperliquidClient {
 
 impl ExecutionClient for HyperliquidClient {
     const EXCHANGE: ExchangeId = ExchangeId::HyperliquidPerp;
+
+    // Perpetuals only — spot is served by `HyperliquidSpotClient`, which uses different coin
+    // naming, asset indices and balance endpoints.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] =
+        &[InstrumentKindDiscriminant::Perpetual];
 
     type Config = HyperliquidConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
