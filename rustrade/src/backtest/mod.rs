@@ -53,9 +53,8 @@ use std::{
 };
 use tracing::error;
 
-/// Defines the [`AuxEventSource`](aux_events::AuxEventSource) interface for interleaving non-market
-/// `EngineEvent`s (e.g. corporate actions, contract expiries) into a backtest in simulated-time
-/// order.
+/// Defines the [`AuxEventSource`] interface for interleaving non-market `EngineEvent`s (e.g.
+/// corporate actions, contract expiries) into a backtest in simulated-time order.
 pub mod aux_events;
 
 /// Defines the interface and implementations for different types of market data sources

@@ -967,6 +967,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Twenty-one rustdoc link defects across the workspace** (`rustrade`, `rustrade-execution`,
+  `rustrade-integration`), each of which rendered as dead or misdirected text on docs.rs. **Six**
+  resolved to nothing: `EngineOutput::Commanded` and `EngineOutput::AlgoOrders` pointed at
+  `super::command::Command` / `super::audit::ProcessAudit`, but those docs live in `crate::engine`,
+  where `super::` is the crate root — both items are already imported in that module, so the bare
+  labels resolve; and `rustrade-integration`'s `corporate_action` module doc referenced `SmolStr`,
+  `StockSplitSource` and `CorporateAction` by bare name, which does not resolve there because that
+  module's documentation is split between the `pub mod` statement in `lib.rs` and the file's own
+  `//!` block. **Five** pointed public documentation at private items a reader cannot navigate to
+  (`DEFAULT_HTTP_REQUEST_TIMEOUT`, `ContractConfig::to_contract`, and the two `assert_aux_*` harness
+  checks named in `AuxEventSource`'s caller obligations), and are now plain code spans that still
+  name the mechanism. **Ten** carried an explicit target the label already implied. Documentation
+  only — no behaviour change.
+
+- **CI now gates rustdoc links.** No job ran `cargo doc` with denied lints, which is why the above
+  accumulated unnoticed — and why only `rustrade` had ever been checked at all, leaving the defects
+  in `rustrade-execution` and `rustrade-integration` invisible. A `cargo doc` job now denies
+  `broken_intra_doc_links`, `private_intra_doc_links` and `redundant_explicit_links` across the whole
+  workspace. It runs `--all-features` deliberately: `rustrade-execution` has `default = []` with
+  every client feature-gated, so a bare `cargo doc` documents none of that code and would pass
+  vacuously.
+
 - **`reconcile_venue_roles` now re-derives `ConnectivityStates::global` from the roles it
   corrected** (`rustrade`). `global` is a cached aggregate over `ConnectivityState::all_healthy`,
   which is a *function of* `ConnectivityState::role` — so correcting a role silently changes what

@@ -202,10 +202,9 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///   `pnl_unrealised` and advances `time_exchange_update` from the new market price.
     ///
     /// # Errors
-    /// Returns [`UntrackedExchange`](connectivity::UntrackedExchange) if the event is tagged with an
-    /// exchange the engine was not built against. Nothing is mutated and the event is dropped —
-    /// see that type for why the instrument update is skipped too, rather than merely the
-    /// connectivity one.
+    /// Returns [`UntrackedExchange`] if the event is tagged with an exchange the engine was not
+    /// built against. Nothing is mutated and the event is dropped — see that type for why the
+    /// instrument update is skipped too, rather than merely the connectivity one.
     pub fn update_from_market(
         &mut self,
         event: &MarketEvent<InstrumentIndex, InstrumentData::MarketEventKind>,

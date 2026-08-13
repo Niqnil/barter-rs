@@ -131,6 +131,40 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf
 
+  docs:
+    name: cargo doc
+    needs: [fmt, check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install mold linker  # Required for proc-macro linking on cache miss
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: "rustrade-ci-check"
+
+      # Nothing else compiles rustdoc's link graph, so a doc link that stops resolving ships green
+      # and renders as dead text on docs.rs -- which is how four of them accumulated before this job
+      # existed. All three lints are warn-by-default, so denying them here is what makes them a gate.
+      # `--all-features` is load-bearing: `rustrade-execution` has `default = []` with every client
+      # feature-gated, so a bare `cargo doc` would document none of that code and pass vacuously.
+      - name: Check rustdoc links
+        env:
+          RUSTDOCFLAGS: >-
+            -D rustdoc::broken_intra_doc_links
+            -D rustdoc::private_intra_doc_links
+            -D rustdoc::redundant_explicit_links
+        run: cargo doc --locked --workspace --all-features --no-deps
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest

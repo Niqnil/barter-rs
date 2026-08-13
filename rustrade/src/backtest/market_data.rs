@@ -205,10 +205,10 @@ impl<Kind> MarketDataInMemory<Kind> {
 ///
 /// A violation is nonetheless **observable rather than silent**: the harness's merge checks each
 /// event against the last as it passes, in release as well as debug, and a backwards step aborts
-/// the run with a [`BarterError::BacktestMarketData`](crate::error::BarterError::BacktestMarketData)
-/// instead of producing statistics over a non-monotonic clock. That is a backstop, not a licence to
-/// hand this an unsorted source: it reports the first violation and stops, so it tells the factory
-/// it is wrong rather than repairing anything.
+/// the run with a [`BarterError::BacktestMarketData`] instead of producing statistics over a
+/// non-monotonic clock. That is a backstop, not a licence to hand this an unsorted source: it
+/// reports the first violation and stops, so it tells the factory it is wrong rather than repairing
+/// anything.
 #[derive(Debug, Clone)]
 pub struct MarketDataStreamed<Factory, Kind> {
     time_first_event: DateTime<Utc>,

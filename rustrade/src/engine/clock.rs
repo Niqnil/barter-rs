@@ -28,8 +28,7 @@ pub trait EngineClock {
     /// backtest stamps the synthetic settlement fill at the expiry instant rather than the prior
     /// market tick. Events that already carry their instant on the payload (e.g.
     /// [`EngineEvent::CorporateAction`]'s `effective_time`) advance the clock via the normal
-    /// [`TimeExchange`] path in [`Processor::process`](crate::engine::Processor::process) and do
-    /// not use this method.
+    /// [`TimeExchange`] path in [`Processor::process`] and do not use this method.
     ///
     /// The default implementation is a no-op, correct for clocks that derive time externally
     /// (e.g. [`LiveClock`], which reads `Utc::now()`). [`HistoricalClock`] overrides it.

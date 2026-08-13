@@ -1450,15 +1450,15 @@ pub enum EngineOutput<
     ExchangeKey = ExchangeIndex,
     InstrumentKey = InstrumentIndex,
 > {
-    /// Output of an actioned [`Command`](super::command::Command).
+    /// Output of an actioned [`Command`].
     ///
     /// **Inline.** [`ActionOutput`]'s inner order payloads are boxed at the root (#195), so
     /// `ActionOutput` is only ~96 B — well under the ~232 B [`PositionExit`](Self::PositionExit)
     /// variant that floors this enum's size. Carrying it inline therefore costs `EngineOutput`
-    /// nothing in stack size (and thus in the per-tick [`ProcessAudit`](super::audit::ProcessAudit)
-    /// copy), while avoiding a heap allocation and pointer indirection on the command path that an
-    /// outer `Box` would add. The audit wire format is unchanged (a newtype variant serializes its
-    /// payload identically whether boxed or not).
+    /// nothing in stack size (and thus in the per-tick [`ProcessAudit`] copy), while avoiding a
+    /// heap allocation and pointer indirection on the command path that an outer `Box` would add.
+    /// The audit wire format is unchanged (a newtype variant serializes its payload identically
+    /// whether boxed or not).
     Commanded(ActionOutput<ExchangeKey, InstrumentKey>),
     OnTradingDisabled(OnTradingDisabled),
     AccountDisconnect(OnDisconnect),
@@ -1471,11 +1471,11 @@ pub enum EngineOutput<
     /// **Inline.** `GenerateAlgoOrdersOutput`'s inner order payloads are boxed at the root (#195),
     /// so it is only ~144 B — under the ~232 B [`PositionExit`](Self::PositionExit) variant that
     /// floors this enum's size. Carrying it inline therefore costs `EngineOutput` nothing in stack
-    /// size (and thus in the per-tick [`ProcessAudit`](super::audit::ProcessAudit) copy). The
-    /// only allocation is the root boxing of the orders themselves, paid solely when the strategy
-    /// actually emits some — the empty no-order case short-circuits before this variant is even
-    /// constructed. The audit wire format is unchanged (a newtype variant serializes its payload
-    /// identically whether boxed or not).
+    /// size (and thus in the per-tick [`ProcessAudit`] copy). The only allocation is the root
+    /// boxing of the orders themselves, paid solely when the strategy actually emits some — the
+    /// empty no-order case short-circuits before this variant is even constructed. The audit wire
+    /// format is unchanged (a newtype variant serializes its payload identically whether boxed or
+    /// not).
     AlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
 
     /// Cash-in-lieu observable: a corporate-action split disposed a fractional share quantity
@@ -1582,8 +1582,8 @@ pub enum EngineOutput<
     /// a backtest replays *known* history: pre-declare **both** identities at construction (each with
     /// its own data series — the new identity naturally has prints only post-split), then inject BOTH
     /// the [`CorporateAction`](crate::EngineEvent::CorporateAction) and a flatten
-    /// [`Command::ClosePositions`](crate::engine::command::Command::ClosePositions) for the old
-    /// identity at the split boundary. **Caveat** (identical to the
+    /// [`Command::ClosePositions`] for the old identity at the split boundary. **Caveat**
+    /// (identical to the
     /// [`EngineOutput::OpenOrdersAtSplit`] backtest caveat): in backtest the close trigger is
     /// *pre-planned* (the split date is known ahead), not *reactive* from this observable — the
     /// backtest harness disables the audit stream, so this output is invisible there; the reactive
