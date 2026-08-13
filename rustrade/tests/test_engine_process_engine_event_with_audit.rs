@@ -5526,6 +5526,113 @@ fn test_untracked_exchange_market_item_is_reported_without_resolving_its_instrum
     );
 }
 
+/// Live engine vs audit-replica parity across all three `UntrackedExchange` paths.
+///
+/// The replica arm **discards** each `Result` (`let _untracked = …`), on the reasoning that its
+/// `ConnectivityStates` is a clone of the live engine's, so the same lookup against the same map
+/// reaches the same verdict from the event alone — and on `Err` neither side mutates. That holds by
+/// inspection today, but it is the only conditional replica arm in `update_from_event` with no
+/// parity test behind it, and `AuditMode::Enabled` is a live-trading mode `backtest` never
+/// exercises (it hardcodes `Disabled`). Without this, someone threading new `on_disconnect`-adjacent
+/// state through the replica would ship the divergence and discover it in production rather than in
+/// CI.
+#[test]
+fn test_untracked_exchange_replica_parity_across_all_three_paths() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    const UNTRACKED: ExchangeId = ExchangeId::Coinbase;
+
+    // Seed the replica from the engine's own starting state, so the two maps genuinely share a key
+    // set — the premise the discard relies on.
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let drive = |engine: &mut TestEngine,
+                 replica: &mut StateReplicaManager<_, DummyAuditUpdates>,
+                 event: EngineEvent<DataKind>| {
+        let audit_tick = process_with_audit(engine, event.clone());
+        let outputs = match &audit_tick.event {
+            EngineAudit::Process(audit) => audit.outputs.clone(),
+            _ => panic!("expected EngineAudit::Process"),
+        };
+        replica.update_from_event(event, &outputs);
+    };
+
+    // Non-vacuity first: a TRACKED market event moves connectivity off its default on both sides.
+    // Without this the parity assertions below would compare two states neither side ever touched,
+    // and would pass even if `update_from_event` ignored connectivity entirely.
+    drive(
+        &mut engine,
+        &mut replica_manager,
+        market_event_trade(1, 0, dec!(100)),
+    );
+    assert_eq!(
+        engine
+            .state
+            .connectivity
+            .connectivity(&ExchangeId::BinanceSpot)
+            .market_data,
+        Health::Healthy,
+        "the tracked event must actually mutate, or the parity asserts below are vacuous"
+    );
+    assert_eq!(
+        replica_manager.replica_engine_state().connectivity,
+        engine.state.connectivity,
+    );
+
+    let connectivity_before = engine.state.connectivity.clone();
+
+    // All three paths, in the order they appear in `update_from_event`.
+    for event in [
+        EngineEvent::Account(AccountStreamEvent::Reconnecting(UNTRACKED)),
+        EngineEvent::Market(MarketStreamEvent::Reconnecting(UNTRACKED)),
+        // The market `Item` carries an `InstrumentIndex` from a collection neither side shares, so
+        // this also pins that the replica stops before its own positional lookup.
+        EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
+            time_received: time_plus_days(STARTING_TIMESTAMP, 2),
+            exchange: UNTRACKED,
+            instrument: InstrumentIndex(99),
+            kind: DataKind::Trade(PublicTrade {
+                id: "untracked".into(),
+                price: dec!(10_000),
+                amount: Decimal::ONE,
+                side: Some(Side::Buy),
+            }),
+        })),
+    ] {
+        drive(&mut engine, &mut replica_manager, event);
+    }
+
+    assert_eq!(
+        replica_manager.replica_engine_state().connectivity,
+        engine.state.connectivity,
+        "replica/live connectivity divergence across the untracked paths"
+    );
+    assert_eq!(
+        replica_manager.replica_engine_state().instruments,
+        engine.state.instruments,
+        "replica/live instrument divergence — the out-of-range index must not be dereferenced \
+         on either side"
+    );
+    assert_eq!(
+        engine.state.connectivity, connectivity_before,
+        "and none of the three may have mutated anything at all"
+    );
+}
+
 /// A `Reconnecting` event for an exchange the engine was never built against is **reported**, and
 /// nothing else happens: no `on_disconnect`, no connectivity mutation, no new tracked exchange.
 ///

@@ -967,6 +967,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`reconcile_venue_roles` now re-derives `ConnectivityStates::global` from the roles it
+  corrected** (`rustrade`). `global` is a cached aggregate over `ConnectivityState::all_healthy`,
+  which is a *function of* `ConnectivityState::role` — so correcting a role silently changes what
+  the cached value should already have been, and the event paths that normally maintain it cannot
+  repair the difference, because each short-circuits once its own dimension is `Health::Healthy`. On
+  a state whose connections had already reported in, a role change therefore stranded `global` wrong
+  in whichever direction it moved, permanently and with no warning: **stale-`Healthy`** when a role
+  widened, where a consumer gating on `global` trades on for the rest of the run against a link that
+  never came up, or **stuck-`Reconnecting`** when one narrowed, where every health-gated strategy
+  stays gated for the whole run — the same footgun the function was added to remove. Reachable
+  through public API: `BacktestArgsConstant::engine_state` is caller-supplied, and `backtest` returns
+  its terminal `engine_state` precisely so it can be inspected and reused, so chaining one window's
+  terminal state into the next window's args (a walk-forward sweep) hits it whenever the execution
+  client set differs between windows. The freshly-built path is unaffected — every connection starts
+  `Reconnecting`, so the re-derive is a no-op there. An **empty** `ConnectivityStates` re-derives to
+  `Reconnecting` whatever it arrived with — a convention on a degenerate input rather than a safety
+  property, since neither `Health` variant is honest over zero venues and a venue-less state holds no
+  instrument to protect. `Reconnecting` is chosen to agree with
+  `generate_empty_indexed_connectivity_states`, which already returns it for a zero-exchange
+  collection, and to leave the postcondition total: on return `global` is `Healthy` iff the state is
+  non-empty and every venue in it is healthy under its corrected role.
+
+- **`generate_empty_indexed_connectivity_states` now warns on an empty venue set** (`rustrade`). A
+  venue-less engine leaves `global` at `Reconnecting` forever, which a consumer gating on it cannot
+  distinguish from a routine reconnect — so an empty configuration presents as an indefinite wait
+  with nothing naming the cause. It now reports the misconfiguration directly, matching the existing
+  warning for a venue that provides neither market data nor execution.
+
+- **`ConnectivityState::market_data`'s rustdoc no longer overstates it as a role-mismatch detector**
+  (`rustrade`). It claimed that a market event arriving for a venue declared `ExecutionOnly` would
+  set the field `Healthy` and so surface the wrong role. That holds only before
+  `ConnectivityStates::global` reaches `Healthy`: after convergence `update_from_market_event`
+  short-circuits on the cached aggregate and returns before writing, so a role error whose first
+  market event arrives later is not observable through this field. Documentation only — no behaviour
+  change.
+
+- **The three `UntrackedExchange` rejection paths now log** (`rustrade`). Each returned
+  `Err(UntrackedExchange)` silently, while the *routine* disconnect on the adjacent line logged a
+  `warn!` — so the anomaly was quieter than the ordinary event it replaced. The structured
+  observable (`EngineOutput::UntrackedExchange`) rides the audit stream, but only the
+  `*_with_audit` runners retain per-event ticks: a consumer on `sync_run`/`async_run` got **no**
+  signal at all, which is a differently-shaped version of the intermittent blind spot this release
+  set out to close. The level is chosen by how often each path can fire: `warn!` on
+  `update_from_account_reconnecting` and `update_from_market_reconnecting`, which are bounded by the
+  disconnect rate and now match the level of their tracked-venue counterparts, and `debug!` on
+  `update_from_market_event`, which fires once per market event and at `warn!` would emit at tick
+  rate for a stream wired to an unconfigured exchange. A consumer that must not miss this on a
+  non-audit runner should enable `debug!` for `rustrade::engine::state::connectivity` or run an
+  `*_with_audit` variant and count the output.
+
 - **`backtest` now derives venue roles from the execution clients it builds** (`rustrade`), instead
   of requiring the caller to declare them on the state it is handed. A backtest that priced an
   instrument on one venue and executed on another had that pricing venue approximated as

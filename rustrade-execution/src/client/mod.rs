@@ -90,6 +90,13 @@ where
     /// There is deliberately no default. A new client must state its capabilities rather than
     /// inherit a permissive set that would silently admit every kind.
     ///
+    /// It is a `const` and not a `fn supported_kinds(&self)` because [`ExecutionBuilder`] validates
+    /// the instrument set *before* [`Self::new`] is ever called — there is no instance to ask at the
+    /// point the answer is needed, and deferring validation until after construction would mean
+    /// standing up a client for a venue the engine is about to reject. A capability set that varies
+    /// with `Self::Config` therefore cannot be expressed here; it would need a separate
+    /// pre-construction hook on the config.
+    ///
     /// [`ExecutionBuilder`]: https://docs.rs/rustrade/latest/rustrade/execution/builder/struct.ExecutionBuilder.html
     const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant];
 
