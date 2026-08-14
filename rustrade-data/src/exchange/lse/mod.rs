@@ -57,6 +57,9 @@
 /// Replay historical candles for N instruments as one time-ordered market stream.
 pub mod backtest;
 
+/// The WebSocket channel a subscription maps to.
+pub mod channel;
+
 /// Errors produced by the London Strategic Edge integration.
 pub mod error;
 
@@ -73,4 +76,96 @@ pub mod parquet;
 /// The shared streaming + export allowance, as the provider reports it.
 pub mod quota;
 
+pub mod tick;
+
 pub mod vault;
+
+use self::market::{LseServer, LseSymbolShape};
+use crate::exchange::ExchangeServer;
+use rustrade_instrument::exchange::ExchangeId;
+use std::marker::PhantomData;
+
+/// The WebSocket endpoint.
+///
+/// One host serves every dataset. The per-dataset connector split below is about provenance in
+/// `MarketEvent.exchange` and per-dataset support declarations, not about distinct endpoints — so
+/// subscribing across datasets opens several connections to this one host. The provider served at
+/// least eight concurrent authenticated connections on one key when measured; the binding
+/// constraint is the per-connection subscription cap, not the connection count.
+pub const WEBSOCKET_URL: &str = "wss://data-ws.londonstrategicedge.com";
+
+/// The London Strategic Edge live market data connector.
+///
+/// Use the per-dataset aliases — [`LseFx`], [`LseCrypto`], [`LseEquities`], [`LseFutures`],
+/// [`LseCfd`] — rather than naming the server type directly.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub struct Lse<Server>(PhantomData<Server>);
+
+/// Spot FX: `EUR/USD`, `GBP/USD`, …
+pub type LseFx = Lse<LseServerFx>;
+
+/// Aggregated spot crypto: `BTC/USD`, `ETH/USD`, …
+pub type LseCrypto = Lse<LseServerCrypto>;
+
+/// Equities and ETFs: `AAPL`, `SPY`, `BP.L`, …
+pub type LseEquities = Lse<LseServerEquities>;
+
+/// Continuous front-month futures proxies: `ES.F`, `FDAX`, …
+pub type LseFutures = Lse<LseServerFutures>;
+
+/// Indices, commodities, interest rates, currency indices and volatility, all as CFDs:
+/// `SPX500/USD`, `XAU/USD`, `USB10Y/USD`, `DXY/USD`, `VIX/USD`.
+pub type LseCfd = Lse<LseServerCfd>;
+
+/// Spot FX server.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub struct LseServerFx;
+
+/// Aggregated spot crypto server.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub struct LseServerCrypto;
+
+/// Equities and ETFs server.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub struct LseServerEquities;
+
+/// Continuous futures-proxy server.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub struct LseServerFutures;
+
+/// CFD server — indices, commodities, interest rates, currency indices and volatility.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub struct LseServerCfd;
+
+macro_rules! impl_lse_server {
+    ($server:ty, $id:expr, $shape:expr) => {
+        impl ExchangeServer for $server {
+            const ID: ExchangeId = $id;
+
+            fn websocket_url() -> &'static str {
+                WEBSOCKET_URL
+            }
+        }
+
+        impl LseServer for $server {
+            const SYMBOL_SHAPE: LseSymbolShape = $shape;
+        }
+    };
+}
+
+// The two traits are declared together per server because they answer one question each about the
+// same dataset -- which venue its events are stamped with, and how it spells a symbol -- and a
+// server that implements one without the other is not usable.
+impl_lse_server!(LseServerFx, ExchangeId::LseFx, LseSymbolShape::Pair);
+impl_lse_server!(LseServerCrypto, ExchangeId::LseCrypto, LseSymbolShape::Pair);
+impl_lse_server!(
+    LseServerEquities,
+    ExchangeId::LseEquities,
+    LseSymbolShape::Bare
+);
+impl_lse_server!(
+    LseServerFutures,
+    ExchangeId::LseFutures,
+    LseSymbolShape::Bare
+);
+impl_lse_server!(LseServerCfd, ExchangeId::LseCfd, LseSymbolShape::Pair);
