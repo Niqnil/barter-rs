@@ -1,4 +1,5 @@
-//! London Strategic Edge market data.
+//! London Strategic Edge market data (behind the `lse` feature) — ⚠️ the retrieved data is **not
+//! redistributable**.
 //!
 //! A free, no-account market-data provider covering FX, equities, ETFs, crypto, commodities,
 //! indices, futures and options, plus reference and macroeconomic series.
@@ -63,9 +64,9 @@
 //!   filter; a test pins that both are emitted.
 //! - **London (`.L`) listings are quoted in PENCE**, and the catalog reports no unit. They are
 //!   quoted in GBX, an asset distinct from GBP; see
-//!   [`market::quote_asset`](crate::exchange::lse::market::quote_asset).
+//!   [`market::quote_asset`].
 //! - **Dataset slugs are not instrument identities** and do not uniquely identify a series; see
-//!   [`market::slug`](crate::exchange::lse::market::slug).
+//!   [`market::slug`].
 
 // A module carries an outer `///` here only when its own file has no `//!` documentation.
 // Supplying both makes rustdoc resolve the file's inner links in THIS module's scope rather than
@@ -84,7 +85,6 @@ pub mod export;
 
 pub mod historical;
 
-/// The authenticating WebSocket subscriber and its pre-subscribe guards.
 pub mod live;
 
 /// London Strategic Edge symbology: datasets, underlying assets, quote currencies and slugs.
@@ -98,12 +98,17 @@ pub mod quota;
 
 pub mod quote;
 
-/// Subscription-lifecycle frames — confirmations, rejections and replay boundaries.
+pub mod resume;
+
+pub mod stream;
+
 pub mod subscription;
 
 pub mod tick;
 
 pub mod trade;
+
+pub mod transformer;
 
 pub mod vault;
 
@@ -111,8 +116,8 @@ use self::{
     channel::LseChannel,
     live::{LseSubscriber, subscribe_message},
     market::{LseMarket, LseServer, LseSymbolShape},
+    stream::LseStream,
     subscription::LseSubResponse,
-    tick::LseMessage,
 };
 use crate::{
     ExchangeWsStream, NoInitialSnapshots,
@@ -120,7 +125,6 @@ use crate::{
     instrument::InstrumentData,
     subscriber::validator::WebSocketSubValidator,
     subscription::{book::OrderBooksL1, trade::PublicTrades},
-    transformer::stateless::StatelessTransformer,
 };
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::protocol::websocket::{WebSocketSerdeParser, WsMessage};
@@ -137,7 +141,12 @@ use url::Url;
 /// constraint is the per-connection subscription cap, not the connection count.
 pub const WEBSOCKET_URL: &str = "wss://data-ws.londonstrategicedge.com";
 
-/// The WebSocket stream every London Strategic Edge subscription kind is served over.
+/// The stock WebSocket stream, parameterised by transformer.
+///
+/// Published for parity with the other exchange integrations, each of which exposes an alias of
+/// this shape. Subscriptions are **not** served over it: that is [`LseStream`], which is what
+/// carries a caller's resume state into the transformer. A stream assembled through this alias has
+/// no seam to carry it and would replay without skipping.
 pub type LseWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// The London Strategic Edge live market data connector.
@@ -239,7 +248,7 @@ where
     fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {
         exchange_subs
             .iter()
-            .map(|exchange_sub| subscribe_message(exchange_sub.market.as_ref()))
+            .map(|exchange_sub| subscribe_message(exchange_sub.market.as_ref(), None))
             .collect()
     }
 }
@@ -258,8 +267,7 @@ where
     Server: LseServer + Debug + Send + Sync,
 {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream =
-        LseWsStream<StatelessTransformer<Self, Instrument::Key, PublicTrades, LseMessage>>;
+    type Stream = LseStream<Self, Instrument::Key, PublicTrades>;
 }
 
 impl<Instrument, Server> StreamSelector<Instrument, OrderBooksL1> for Lse<Server>
@@ -268,8 +276,7 @@ where
     Server: LseServer + Debug + Send + Sync,
 {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream =
-        LseWsStream<StatelessTransformer<Self, Instrument::Key, OrderBooksL1, LseMessage>>;
+    type Stream = LseStream<Self, Instrument::Key, OrderBooksL1>;
 }
 
 impl<'de, Server> Deserialize<'de> for Lse<Server>

@@ -56,9 +56,10 @@ pub mod databento;
 #[cfg(feature = "massive")]
 pub mod massive;
 
-/// `London Strategic Edge` market data (behind `lse` feature).
-///
-/// ⚠️ The retrieved data is **not redistributable** — see the module documentation.
+// No `///` here, unlike its siblings: that file carries its own `//!` documentation, and supplying
+// both makes rustdoc resolve the file's inner links in THIS module's scope rather than the child's,
+// so every one of them renders as dead text. Its summary and the redistribution warning open that
+// file's first paragraph instead.
 #[cfg(feature = "lse")]
 pub mod lse;
 
