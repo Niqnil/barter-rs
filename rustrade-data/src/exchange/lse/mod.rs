@@ -76,6 +76,9 @@ pub mod parquet;
 /// The shared streaming + export allowance, as the provider reports it.
 pub mod quota;
 
+/// Subscription-lifecycle frames — confirmations, rejections and replay boundaries.
+pub mod subscription;
+
 pub mod tick;
 
 pub mod vault;
