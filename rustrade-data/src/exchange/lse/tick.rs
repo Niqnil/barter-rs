@@ -121,6 +121,21 @@ pub enum LseMessage {
     Other,
 }
 
+impl Identifier<Option<SubscriptionId>> for LseMessage {
+    /// A tick resolves to the subscription its symbol was registered under; anything else resolves
+    /// to nothing.
+    ///
+    /// The `None` is what keeps control frames out of the market stream: the transformer drops an
+    /// unidentifiable frame rather than attempting to convert it, so the two decoders never have to
+    /// invent an event for a frame that describes none.
+    fn id(&self) -> Option<SubscriptionId> {
+        match self {
+            Self::Tick(tick) => Some(tick.subscription_id.clone()),
+            Self::Other => None,
+        }
+    }
+}
+
 /// Deserialise the tick's `symbol` into the [`SubscriptionId`] it was registered under.
 fn de_tick_subscription_id<'de, D>(deserializer: D) -> Result<SubscriptionId, D::Error>
 where
@@ -374,6 +389,26 @@ mod tests {
     fn a_tick_frame_decodes_as_a_tick() {
         let message: LseMessage = serde_json::from_str(LIVE_T_SEPARATED).unwrap();
         assert!(matches!(message, LseMessage::Tick(_)));
+    }
+
+    #[test]
+    fn a_tick_identifies_itself_by_its_subscription() {
+        let message: LseMessage = serde_json::from_str(LIVE_T_SEPARATED).unwrap();
+        assert_eq!(
+            message.id(),
+            Some(SubscriptionId::from("tick|BTC/USD")),
+            "a tick must resolve to the subscription it was registered under"
+        );
+    }
+
+    /// The transformer drops a frame that identifies no subscription, which is what keeps control
+    /// frames from reaching the decoders at all.
+    #[test]
+    fn a_control_frame_identifies_no_subscription() {
+        let message: LseMessage =
+            serde_json::from_str(r#"{"type":"replay_complete","symbol":"BTC/USD","rows":41}"#)
+                .unwrap();
+        assert_eq!(message.id(), None);
     }
 
     /// Control frames share the data stream with ticks. Failing the parse on one would take the

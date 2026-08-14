@@ -44,6 +44,23 @@
 //!   There is no venue attribution anywhere in the feed.
 //! - **Crypto is an aggregated tape**: no funding rates, no liquidations, no venue. It is not a
 //!   substitute for a native exchange connector.
+//! - **The live tick is a QUOTE, not a print.** Its `price` equals its `bid` on every sample taken
+//!   — 3,966 of 3,966 ticks across every dataset family. Both [`PublicTrades`] and [`OrderBooksL1`]
+//!   are served from it, but a trade decoded this way is a bid-side quote wearing a trade's shape
+//!   and is not evidence that a transaction occurred. See [`trade`] for the mapping and its
+//!   reasoning.
+//! - **Live tick `volume` is real on two venues and FABRICATED on two others**, with no in-band
+//!   signal separating them. [`LseCrypto`] and [`LseEquities`] carry a genuine per-tick size, which
+//!   reconciles exactly against the provider's own one-minute candles (ratio `1.000`).
+//!   **[`LseFx`] and [`LseCfd`] carry a hard-coded `1.0`** on every tick of every symbol sampled —
+//!   a placeholder that will aggregate into a legitimate-looking total at any resolution, so
+//!   volume-weighted prices and size filters on those two venues are meaningless rather than merely
+//!   imprecise. Note this differs from the REST vault, which *omits* FX volume entirely; the
+//!   WebSocket invents a value instead.
+//! - **Identical consecutive live ticks are genuine and are never de-duplicated.** Barely a third
+//!   of a sampled run was unique on `(ts, price, bid, ask, volume)`, yet removing the repeats
+//!   destroyed 3–10% of volume that otherwise reconciles exactly. Do not add a de-duplication
+//!   filter; a test pins that both are emitted.
 //! - **London (`.L`) listings are quoted in PENCE**, and the catalog reports no unit. They are
 //!   quoted in GBX, an asset distinct from GBP; see
 //!   [`market::quote_asset`](crate::exchange::lse::market::quote_asset).
@@ -79,10 +96,14 @@ pub mod parquet;
 /// The shared streaming + export allowance, as the provider reports it.
 pub mod quota;
 
+pub mod quote;
+
 /// Subscription-lifecycle frames — confirmations, rejections and replay boundaries.
 pub mod subscription;
 
 pub mod tick;
+
+pub mod trade;
 
 pub mod vault;
 
@@ -91,15 +112,20 @@ use self::{
     live::{LseSubscriber, subscribe_message},
     market::{LseMarket, LseServer, LseSymbolShape},
     subscription::LseSubResponse,
+    tick::LseMessage,
 };
 use crate::{
-    exchange::{Connector, ExchangeServer, ExchangeSub},
+    ExchangeWsStream, NoInitialSnapshots,
+    exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
+    instrument::InstrumentData,
     subscriber::validator::WebSocketSubValidator,
+    subscription::{book::OrderBooksL1, trade::PublicTrades},
+    transformer::stateless::StatelessTransformer,
 };
 use rustrade_instrument::exchange::ExchangeId;
-use rustrade_integration::protocol::websocket::WsMessage;
+use rustrade_integration::protocol::websocket::{WebSocketSerdeParser, WsMessage};
 use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
+use std::{fmt::Debug, marker::PhantomData};
 use url::Url;
 
 /// The WebSocket endpoint.
@@ -110,6 +136,9 @@ use url::Url;
 /// least eight concurrent authenticated connections on one key when measured; the binding
 /// constraint is the per-connection subscription cap, not the connection count.
 pub const WEBSOCKET_URL: &str = "wss://data-ws.londonstrategicedge.com";
+
+/// The WebSocket stream every London Strategic Edge subscription kind is served over.
+pub type LseWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// The London Strategic Edge live market data connector.
 ///
@@ -213,6 +242,34 @@ where
             .map(|exchange_sub| subscribe_message(exchange_sub.market.as_ref()))
             .collect()
     }
+}
+
+// Both subscription kinds decode the SAME frame -- the provider publishes one data frame and it
+// carries a price, a bid, an ask and a size -- so the two selectors differ only in which decoder
+// the transformer is instantiated with. Neither needs an initial snapshot: the feed is a tick
+// stream with no book to synchronise against.
+//
+// One blanket impl per kind covers all five servers, rather than five impls each. The servers
+// differ in venue and symbol shape, never in framing.
+
+impl<Instrument, Server> StreamSelector<Instrument, PublicTrades> for Lse<Server>
+where
+    Instrument: InstrumentData,
+    Server: LseServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        LseWsStream<StatelessTransformer<Self, Instrument::Key, PublicTrades, LseMessage>>;
+}
+
+impl<Instrument, Server> StreamSelector<Instrument, OrderBooksL1> for Lse<Server>
+where
+    Instrument: InstrumentData,
+    Server: LseServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        LseWsStream<StatelessTransformer<Self, Instrument::Key, OrderBooksL1, LseMessage>>;
 }
 
 impl<'de, Server> Deserialize<'de> for Lse<Server>
