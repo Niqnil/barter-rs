@@ -55,6 +55,11 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 tempfile = { workspace = true }  # Scratch directories for LSE export download/resume tests; already in the tree
 sha2 = { workspace = true }  # Computes the digest in synthetic LSE export job fixtures
 hex = { workspace = true }  # Encodes that digest as the provider does
+# Speaks the server half of the LSE WebSocket handshake in-process, so the guards that must run
+# *before* the first subscribe leaves the client can be tested by counting what reached the socket.
+# `wiremock` cannot serve this: the flow is a stateful conversation on a long-lived connection, not
+# a request/response exchange. Already in the tree via `rustrade-integration`'s `protocol` feature.
+tokio-tungstenite = { workspace = true }
 
 [dependencies]
 # Rustrade Ecosystem
