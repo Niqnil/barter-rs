@@ -67,6 +67,9 @@ pub mod export;
 
 pub mod historical;
 
+/// The authenticating WebSocket subscriber and its pre-subscribe guards.
+pub mod live;
+
 /// London Strategic Edge symbology: datasets, underlying assets, quote currencies and slugs.
 pub mod market;
 
@@ -83,10 +86,21 @@ pub mod tick;
 
 pub mod vault;
 
-use self::market::{LseServer, LseSymbolShape};
-use crate::exchange::ExchangeServer;
+use self::{
+    channel::LseChannel,
+    live::{LseSubscriber, subscribe_message},
+    market::{LseMarket, LseServer, LseSymbolShape},
+    subscription::LseSubResponse,
+};
+use crate::{
+    exchange::{Connector, ExchangeServer, ExchangeSub},
+    subscriber::validator::WebSocketSubValidator,
+};
 use rustrade_instrument::exchange::ExchangeId;
+use rustrade_integration::protocol::websocket::WsMessage;
+use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
+use url::Url;
 
 /// The WebSocket endpoint.
 ///
@@ -172,3 +186,64 @@ impl_lse_server!(
     LseSymbolShape::Bare
 );
 impl_lse_server!(LseServerCfd, ExchangeId::LseCfd, LseSymbolShape::Pair);
+
+impl<Server> Connector for Lse<Server>
+where
+    Server: LseServer,
+{
+    const ID: ExchangeId = Server::ID;
+    type Channel = LseChannel;
+    type Market = LseMarket;
+    type Subscriber = LseSubscriber;
+    type SubValidator = WebSocketSubValidator;
+    type SubResponse = LseSubResponse;
+
+    fn url() -> Result<Url, url::ParseError> {
+        Url::parse(Server::websocket_url())
+    }
+
+    /// One payload per symbol — the provider accepts no batched subscribe.
+    ///
+    /// [`LseSubscriber`] builds its payloads with the same helper rather than calling this, because
+    /// a subscription may carry a replay window and this function cannot see one. The two therefore
+    /// agree by construction.
+    fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {
+        exchange_subs
+            .iter()
+            .map(|exchange_sub| subscribe_message(exchange_sub.market.as_ref()))
+            .collect()
+    }
+}
+
+impl<'de, Server> Deserialize<'de> for Lse<Server>
+where
+    Server: ExchangeServer,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        let input = <String as Deserialize>::deserialize(deserializer)?;
+
+        if input.as_str() == Server::ID.as_str() {
+            Ok(Self::default())
+        } else {
+            Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(input.as_str()),
+                &Server::ID.as_str(),
+            ))
+        }
+    }
+}
+
+impl<Server> Serialize for Lse<Server>
+where
+    Server: ExchangeServer,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.serialize_str(Server::ID.as_str())
+    }
+}

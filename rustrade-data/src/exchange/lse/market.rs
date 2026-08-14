@@ -140,6 +140,30 @@ impl LseDataset {
             | Self::Futures => MarketDataInstrumentKind::Cfd,
         }
     }
+
+    /// The category label the WebSocket handshake reports for this dataset's symbols, where it
+    /// reports one at all.
+    ///
+    /// # ⚠️ `None` is the common case, not the exception
+    /// The handshake publishes no category for roughly half the symbols it offers, and some
+    /// entries carry neither a category nor a name. `None` here therefore means *the provider does
+    /// not label this dataset*, not *unknown* — so a symbol arriving without a category can never
+    /// be treated as contradicting the dataset it was requested on.
+    ///
+    /// These labels are the provider's own spelling and are deliberately not derived from
+    /// [`as_catalog_str`](Self::as_catalog_str): the two vocabularies differ (`etf` against
+    /// `ETFs`, `index` against `Indices`) and neither is a transformation of the other.
+    pub fn ws_category(&self) -> Option<&'static str> {
+        match self {
+            Self::Stocks => Some("Stocks"),
+            Self::Etf => Some("ETFs"),
+            Self::Crypto => Some("Crypto"),
+            Self::Fx => Some("Forex"),
+            Self::Index => Some("Indices"),
+            Self::Commodity => Some("Commodities"),
+            Self::InterestRates | Self::CurrencyIndex | Self::Volatility | Self::Futures => None,
+        }
+    }
 }
 
 /// A London Strategic Edge dataset slug — the path key of the provider's dataset-info endpoint.
