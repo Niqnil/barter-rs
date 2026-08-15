@@ -25,6 +25,10 @@ lse = ["rustrade-data/lse"]
 name = "engine_backtest_with_lse_candles"
 required-features = ["lse"]
 
+[[example]]
+name = "engine_sync_with_lse_market_data_and_mock_execution"
+required-features = ["lse"]
+
 [[bench]]
 name = "backtest"
 path = "benches/backtest/mod.rs"

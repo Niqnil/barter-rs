@@ -171,6 +171,10 @@ name = "lse_export"
 required-features = ["lse-parquet"]
 
 [[example]]
+name = "lse_market_data"
+required-features = ["lse"]
+
+[[example]]
 name = "ibkr_historical"
 required-features = ["ibkr"]
 
