@@ -20,7 +20,7 @@ use std::sync::{Mutex, PoisonError};
 /// so they can be skipped by position. Resuming one tick *later* instead would be simpler and
 /// would silently lose every event at that instant not yet consumed.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct LseWatermark {
+pub(super) struct LseWatermark {
     /// The newest `time_exchange` delivered for this subscription.
     pub time_exchange: DateTime<Utc>,
 
@@ -37,6 +37,16 @@ pub struct LseWatermark {
 
 /// Resume state shared between a [`LseSubscriber`](super::live::LseSubscriber) and the transformer
 /// of every stream it opens.
+///
+/// # An opaque handle, deliberately
+/// Construct it, hand it to
+/// [`LseSubscriber::with_resume`](super::live::LseSubscriber::with_resume), and let delivery drive
+/// it; there is no supported way to read or advance a watermark from outside. Reading one means
+/// exposing the key it is filed under, and this provider's ticks are filed under a wire identifier
+/// rather than anything a caller holds — publishing that identifier would freeze its spelling into
+/// this contract and still hand back a map no caller could interpret, because deriving it is
+/// one-way. A read surface keyed on the symbol is the shape to add if a caller ever needs one, and
+/// adding it later against a stated need is a smaller commitment than taking one back.
 ///
 /// # Reconnect, not crash recovery
 /// The watermark advances on **delivered** events and lives in memory. It closes the gap a
@@ -83,7 +93,7 @@ impl LseResumeState {
     /// Advancing to a newer instant resets the count to one. An instant older than the watermark
     /// is ignored rather than rolling it back — the watermark is the high-water mark of what was
     /// delivered, and moving it backwards would re-request events already seen.
-    pub fn record(&self, subscription_id: &SubscriptionId, time_exchange: DateTime<Utc>) {
+    pub(super) fn record(&self, subscription_id: &SubscriptionId, time_exchange: DateTime<Utc>) {
         let mut marks = self.lock();
 
         match marks.get_mut(subscription_id) {
@@ -110,7 +120,7 @@ impl LseResumeState {
     }
 
     /// The watermark for `subscription_id`, if anything has been delivered for it.
-    pub fn watermark(&self, subscription_id: &SubscriptionId) -> Option<LseWatermark> {
+    pub(super) fn watermark(&self, subscription_id: &SubscriptionId) -> Option<LseWatermark> {
         self.lock().get(subscription_id).copied()
     }
 
@@ -118,7 +128,7 @@ impl LseResumeState {
     ///
     /// Taken as a snapshot so a transformer can carry its own drop counters without holding the
     /// lock, or consulting it, per tick.
-    pub fn snapshot(&self) -> FnvHashMap<SubscriptionId, LseWatermark> {
+    pub(super) fn snapshot(&self) -> FnvHashMap<SubscriptionId, LseWatermark> {
         self.lock().clone()
     }
 

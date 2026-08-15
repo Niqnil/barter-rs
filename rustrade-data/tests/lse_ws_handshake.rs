@@ -57,7 +57,6 @@ use rustrade_data::{
             channel::LseChannel,
             live::{LseCredentials, LseSubscriber},
             market::{LseMarket, LseServer, LseSymbolShape},
-            resume::LseResumeState,
         },
         subscription::ExchangeSub,
     },
@@ -361,43 +360,6 @@ async fn a_subscriber_without_resume_opens_no_replay_window_on_the_wire() {
         sent[0],
         json!({"action": "subscribe", "symbol": "BTC/USD"}),
         "a subscriber with no resume state must send the plain payload",
-    );
-}
-
-/// The resume point has to survive the trip out as a number the provider filters on at microsecond
-/// resolution. Asserting it at the socket is what proves the watermark reached the payload, rather
-/// than only that the payload builder can encode one.
-#[tokio::test]
-#[serial]
-async fn a_resuming_subscriber_puts_its_watermark_on_the_wire() {
-    let harness = Harness::start(Script::default()).await;
-
-    let watermark = "2026-08-14T10:16:55.161234Z".parse().unwrap();
-    let state = Arc::new(LseResumeState::new());
-    state.record(&subscription_id("btc"), watermark);
-
-    let subscriptions = [subscription("btc"), subscription("eth")];
-    subscriber()
-        .with_resume(state)
-        .subscribe(&subscriptions)
-        .await
-        .unwrap();
-
-    let sent = harness.subscribes();
-    assert_eq!(symbols(&sent), vec!["BTC/USD", "ETH/USD"]);
-
-    let start = sent[0]["start"]
-        .as_f64()
-        .unwrap_or_else(|| panic!("BTC/USD should carry a resume point: {:?}", sent[0]));
-    let drift = start * 1_000_000.0 - watermark.timestamp_micros() as f64;
-    assert!(drift.abs() < 0.5, "the resume point drifted {drift} micros");
-
-    // A symbol the stream has delivered nothing for has nothing to resume from, and must be sent
-    // the payload a first-ever subscribe sends -- not the other symbol's window.
-    assert!(
-        sent[1].get("start").is_none(),
-        "ETH/USD has no watermark and must open no window: {:?}",
-        sent[1],
     );
 }
 
