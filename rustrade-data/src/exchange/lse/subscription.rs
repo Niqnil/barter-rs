@@ -1,8 +1,10 @@
-//! Subscription-lifecycle frames: what the provider answers a `subscribe` with, and how a replay
-//! window announces its own boundaries.
+//! What the provider answers a `subscribe` with.
+//!
+//! The replay window's own boundary frames are decoded on the stream instead, by
+//! [`LseMessage`](super::tick::LseMessage) — see
+//! [`ReplayStarted`](super::tick::LseMessage::ReplayStarted) for why the handshake is the wrong
+//! place to read them.
 
-use super::tick::de_timestamp;
-use chrono::{DateTime, Utc};
 use rustrade_integration::{Validator, error::SocketError};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -25,21 +27,29 @@ use smol_str::SmolStr;
 /// # Why replay frames are deliberately not modelled here
 /// The subscription validator counts every frame that deserialises into this type and validates
 /// `Ok` as one more subscription confirmed. A `replay_started` frame modelled as a success would
-/// inflate that count and end validation before the last real confirmation arrived. Replay frames
-/// are [`LseReplayFrame`] instead, and reach the subscriber through the buffered-events path — the
-/// same route ticks that arrive mid-validation take. For the same reason this enum has no
-/// catch-all variant: one would swallow ticks into the success count.
+/// inflate that count and end validation before the last real confirmation arrived. It is decoded
+/// on the stream instead, and reaches the transformer through the buffered-events path — the same
+/// route ticks that arrive mid-validation take. For the same reason this enum has no catch-all
+/// variant: one would swallow ticks into the success count.
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LseSubResponse {
     /// A subscription was accepted, and the connection now holds `count` of its `max` slots.
+    ///
+    /// Only `symbol` is required to deserialise. `count` and `max` are reported by the provider and
+    /// modelled for the reader, but nothing acts on them — the cap is enforced before a subscribe
+    /// is sent, against the `authenticated` frame — so requiring them would let a rename or an
+    /// omission upstream turn an arriving confirmation into a ten-second validation timeout
+    /// blaming latency. The same reasoning the [`Error`](Self::Error) variant is built on.
     Subscribed {
         /// The symbol, case-normalised by the provider (`eur/usd` is confirmed as `EUR/USD`).
         symbol: SmolStr,
         /// Slots held on this connection after the subscription.
-        count: u32,
+        #[serde(default)]
+        count: Option<u32>,
         /// Slots this connection may hold in total.
-        max: u32,
+        #[serde(default)]
+        max: Option<u32>,
     },
 
     /// A subscription was rejected.
@@ -81,42 +91,6 @@ impl Validator for LseSubResponse {
     }
 }
 
-/// A replay window's boundary frames.
-///
-/// A subscription carrying a `start` is served the historical window before any live tick, framed
-/// by these two. They are not subscription confirmations — see [`LseSubResponse`] for why keeping
-/// them out of that type is load-bearing rather than tidy.
-#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LseReplayFrame {
-    /// The replay window the provider actually opened.
-    ///
-    /// # ⚠️ `from` is the only signal that a `start` was clamped
-    /// A `start` further back than the provider's retention is **silently moved forward**, with no
-    /// error: a window requested 48 hours back was answered with one beginning exactly 24 hours
-    /// back, and streamed from there. Comparing `from` against what was asked for is the only way
-    /// to detect it.
-    ReplayStarted {
-        /// The symbol whose replay is beginning.
-        symbol: SmolStr,
-        /// The instant the provider will actually replay from.
-        #[serde(deserialize_with = "de_timestamp")]
-        from: DateTime<Utc>,
-    },
-
-    /// The replay window is drained and the stream is now live for this symbol.
-    ReplayComplete {
-        /// The symbol whose replay has finished.
-        symbol: SmolStr,
-        /// Rows replayed. Trustworthy — it matched the delivered count exactly on every run
-        /// measured.
-        rows: u64,
-        /// Live ticks that arrived during the replay and were held back to preserve ordering.
-        #[serde(default)]
-        buffered_drained: u64,
-    },
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -131,8 +105,8 @@ mod tests {
             response,
             LseSubResponse::Subscribed {
                 symbol: "EUR/USD".into(),
-                count: 1,
-                max: 16,
+                count: Some(1),
+                max: Some(16),
             }
         );
         assert!(response.validate().is_ok());
@@ -184,63 +158,23 @@ mod tests {
         }
     }
 
+    /// A confirmation that failed to deserialise would fall through to the buffered-events path and
+    /// leave the validator waiting out its ten-second timeout for a frame that had already arrived
+    /// — a failure that reads as latency. Nothing consumes these two fields, so nothing is worth
+    /// that.
     #[test]
-    fn a_replay_start_deserialises_with_its_window() {
-        let input = r#"{"type":"replay_started","symbol":"BTC/USD","from":"2026-01-02T09:39:31.716622+00:00"}"#;
-        let frame: LseReplayFrame = serde_json::from_str(input).unwrap();
+    fn a_confirmation_missing_the_fields_nothing_reads_still_confirms() {
+        let response: LseSubResponse =
+            serde_json::from_str(r#"{"type":"subscribed","symbol":"EUR/USD"}"#).unwrap();
 
         assert_eq!(
-            frame,
-            LseReplayFrame::ReplayStarted {
-                symbol: "BTC/USD".into(),
-                from: "2026-01-02T09:39:31.716622Z".parse().unwrap(),
+            response,
+            LseSubResponse::Subscribed {
+                symbol: "EUR/USD".into(),
+                count: None,
+                max: None,
             }
         );
-    }
-
-    /// The provider spells timestamps three ways and does not guarantee which one a given frame
-    /// uses, so `from` goes through the same decoder a tick's `ts` does.
-    #[test]
-    fn a_replay_start_accepts_every_timestamp_spelling() {
-        for raw in [
-            r#""2026-01-02 09:39:31.716622+00:00""#,
-            r#""2026-01-02T09:39:31.716622+00:00""#,
-            "1767346771.716622",
-        ] {
-            let input = format!(r#"{{"type":"replay_started","symbol":"BTC/USD","from":{raw}}}"#);
-            let frame: LseReplayFrame = serde_json::from_str(&input).unwrap();
-
-            let LseReplayFrame::ReplayStarted { from, .. } = frame else {
-                panic!("expected a replay start");
-            };
-            assert_eq!(
-                from,
-                "2026-01-02T09:39:31.716622Z"
-                    .parse::<DateTime<Utc>>()
-                    .unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn a_replay_completion_deserialises_with_its_row_count() {
-        let input = r#"{"type":"replay_complete","symbol":"BTC/USD","rows":41,
-            "buffered_drained":9}"#;
-        let frame: LseReplayFrame = serde_json::from_str(input).unwrap();
-
-        assert_eq!(
-            frame,
-            LseReplayFrame::ReplayComplete {
-                symbol: "BTC/USD".into(),
-                rows: 41,
-                buffered_drained: 9,
-            }
-        );
-    }
-
-    #[test]
-    fn subscription_frames_do_not_deserialise_as_replay_frames() {
-        let input = r#"{"type":"subscribed","symbol":"EUR/USD","count":1,"max":16}"#;
-        assert!(serde_json::from_str::<LseReplayFrame>(input).is_err());
+        assert!(response.validate().is_ok());
     }
 }

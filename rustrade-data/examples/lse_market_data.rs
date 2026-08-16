@@ -29,7 +29,7 @@
 //!   an `OrderBookL1` depending only on which kind was subscribed.
 //! - **Per-dataset provenance.** Each dataset family is its own connector, so `MarketEvent.exchange`
 //!   says which one an event came from — worth having, because two of the five fabricate `volume`.
-//! - **Opt-in resumption across a reconnect**, and the one rule that comes with it.
+//! - **Opt-in resumption across a reconnect**, with one state shared across every stream.
 //!
 //! # Properties worth knowing before you build on this
 //!
@@ -76,25 +76,22 @@ async fn main() {
     let subscriber = LseSubscriber::from_env()
         .expect("set LSE_API_KEY - get a free key at https://londonstrategicedge.com/data");
 
-    // Resumption is opt-in, and the state is keyed by symbol rather than by symbol and kind. So the
-    // two trade connections below share one state — their symbol sets are disjoint, which is the
-    // ordinary case — while the top-of-book connection carries the *same* crypto symbols as the
-    // crypto trade connection and therefore needs its own. Sharing across those two would let
-    // whichever stream ran ahead set the resume point for both, and the one behind would resume
-    // past events it never delivered.
+    // Resumption is opt-in, and one state serves every stream below — including the top-of-book
+    // connection, which carries the *same* crypto symbols as the crypto trade connection.
+    // Watermarks are filed per subscription *and* kind, so those two advance independently and
+    // neither can set the other's resume point; nothing about sharing needs thinking about here.
     //
-    // On a first connection there is nothing to resume from, so neither state triggers a replay
-    // here. They matter after a drop: the reconnect re-subscribes from the last event each stream
-    // actually delivered instead of leaving a gap.
-    let trades_resume = Arc::new(LseResumeState::new());
-    let quotes_resume = Arc::new(LseResumeState::new());
+    // On a first connection there is nothing to resume from, so nothing replays here. The state
+    // matters after a drop: the reconnect re-subscribes from the last event each stream actually
+    // delivered instead of leaving a gap.
+    let resume = Arc::new(LseResumeState::new());
 
     let streams: Streams<MarketStreamResult<MarketDataInstrument, DataKind>> =
         Streams::builder_multi()
             .add(
                 Streams::<PublicTrades>::builder()
                     .subscribe(
-                        subscriber.clone().with_resume(Arc::clone(&trades_resume)),
+                        subscriber.clone().with_resume(Arc::clone(&resume)),
                         [
                             (
                                 LseCrypto::default(),
@@ -115,7 +112,7 @@ async fn main() {
                     // A second dataset family, on its own connection: same frame, same decoder,
                     // different `MarketEvent.exchange` — and a `volume` the provider invents.
                     .subscribe(
-                        subscriber.clone().with_resume(trades_resume),
+                        subscriber.clone().with_resume(Arc::clone(&resume)),
                         [(
                             LseFx::default(),
                             "eur",
@@ -126,7 +123,7 @@ async fn main() {
                     ),
             )
             .add(Streams::<OrderBooksL1>::builder().subscribe(
-                subscriber.with_resume(quotes_resume),
+                subscriber.with_resume(resume),
                 [
                     (
                         LseCrypto::default(),

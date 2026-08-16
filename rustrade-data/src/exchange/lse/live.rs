@@ -2,8 +2,7 @@
 
 use super::{
     market::LseDataset,
-    resume::{LseResumeState, epoch_seconds, subscription_id},
-    subscription::LseReplayFrame,
+    resume::{LseResumeKey, LseResumeState, epoch_seconds, subscription_id},
 };
 use crate::{
     Identifier,
@@ -147,17 +146,22 @@ impl LseSubscriber {
     /// replay. Choosing between those is the caller's business, so the default is off.
     ///
     /// # ⚠️ The provider retains only 24 hours, and clamps silently
-    /// A resume point older than that is **moved forward with no error**. This subscriber
-    /// compares what the provider says it will replay from against what was asked for and warns on
-    /// a mismatch, but that check is best-effort — see [`Self::subscribe`].
+    /// A resume point older than that is **moved forward with no error**. The stream compares what
+    /// the provider says it will replay from against what was asked for and warns on a mismatch;
+    /// see [`LseMessage::ReplayStarted`](super::tick::LseMessage::ReplayStarted).
     ///
-    /// # ⚠️ Streams carrying the same symbol must not share one state
-    /// Watermarks are keyed by symbol, not by symbol and subscription kind. Two streams carrying
-    /// one symbol — the same instrument subscribed as both trades and top-of-book, say — therefore
-    /// share a single entry and advance it independently: whichever stream is ahead sets the
-    /// resume point for both, and the one behind resumes past events it never delivered. Give each
-    /// such set of streams its own state. Streams over disjoint symbols may share one freely, and
-    /// that is the ordinary case — a batch spanning several symbols is exactly what this is for.
+    /// One state may be shared by any set of streams, including two carrying the same symbol as
+    /// different kinds — watermarks are keyed by subscription *and* kind.
+    ///
+    /// # ⚠️ The replayed prefix is skipped by position, not by the `replay` flag
+    /// The provider re-serves every tick sharing the resume instant, and the ones already delivered
+    /// are dropped by counting rather than by trusting each tick's `replay` stamp — a provider that
+    /// stopped stamping them would otherwise turn every reconnect into a duplicate flood. The cost
+    /// is a narrow one: if the replay under-delivers at that instant, a genuinely *live* tick
+    /// arriving there while the count is still open is dropped as though it were one of the missing
+    /// duplicates. It requires the whole reconnect to land inside one timestamp quantum of the
+    /// resume instant, so it is unlikely rather than impossible, and it is reported by a `warn!`
+    /// naming the subscription and the instant rather than passing silently.
     ///
     /// Covers reconnects, not process restarts; see [`LseResumeState`].
     #[must_use]
@@ -187,10 +191,10 @@ impl LseSubscriber {
     /// filters at microsecond resolution, so a millisecond-floored `start` would re-serve a whole
     /// millisecond of already-delivered, timestamp-distinct events on the datasets that carry
     /// microseconds.
-    fn resume_start(&self, market: &str) -> Option<DateTime<Utc>> {
+    fn resume_start(&self, market: &str, kind: &'static str) -> Option<DateTime<Utc>> {
         self.resume
             .as_ref()
-            .and_then(|state| state.watermark(&subscription_id(market)))
+            .and_then(|state| state.watermark(&LseResumeKey::new(subscription_id(market), kind)))
             .map(|watermark| watermark.time_exchange)
     }
 }
@@ -210,9 +214,11 @@ impl Subscriber for LseSubscriber {
     ///
     /// Two checks run over that list:
     /// - **Membership is enforced.** A symbol the provider does not offer fails the batch.
-    /// - **The category is only cross-checked when the provider supplies one.** Roughly half the
-    ///   published entries carry no `category` key at all — and some carry neither `category` nor
-    ///   `name` — so absence is normal and can never be treated as a mismatch.
+    /// - **The category is only cross-checked when the provider supplies a label this integration
+    ///   recognises.** Roughly half the published entries carry no `category` key at all — and some
+    ///   carry neither `category` nor `name` — so absence is normal and can never be treated as a
+    ///   mismatch. Neither can a label we do not know: only one we recognise as belonging to a
+    ///   *different* dataset is evidence of anything.
     ///
     /// The subscription cap is enforced in the same pass, because an over-cap batch is rejected
     /// *anonymously*: the provider's rejection does not name the symbol it refused, leaving no
@@ -260,15 +266,15 @@ impl Subscriber for LseSubscriber {
             ws_subscriptions: _,
         } = Self::SubMapper::map::<Exchange, Instrument, Kind>(subscriptions);
 
-        let mut requested_replays = Vec::<(SmolStr, DateTime<Utc>)>::new();
+        // Every subscription in a batch shares one `Kind`, and a watermark is filed under the kind
+        // it was delivered for -- see `LseResumeKey`. `markets` is empty when `subscriptions` is,
+        // so the loop below never runs without one.
+        let kind = subscriptions
+            .first()
+            .map(|subscription| subscription.kind.as_str());
 
         for market in &markets {
-            let start = self.resume_start(market);
-
-            if let Some(start) = start {
-                requested_replays.push((market.clone(), start));
-            }
-
+            let start = kind.and_then(|kind| self.resume_start(market, kind));
             let message = subscribe_message(market, start);
             debug!(%exchange, payload = ?message, "sending London Strategic Edge subscription");
             websocket
@@ -283,8 +289,6 @@ impl Subscriber for LseSubscriber {
             Kind,
         >(instrument_map, &mut websocket)
         .await?;
-
-        warn_on_clamped_replays(exchange, &requested_replays, &buffered_websocket_events);
 
         debug!(%exchange, "London Strategic Edge subscriptions confirmed");
         Ok(Subscribed {
@@ -313,78 +317,6 @@ pub(super) fn subscribe_message(symbol: &str, start: Option<DateTime<Utc>>) -> W
     };
 
     WsMessage::text(payload.to_string())
-}
-
-/// Warn when the provider opened a replay window later than the one asked for.
-///
-/// # ⚠️ Silent clamping is the failure this exists to surface
-/// The provider retains 24 hours. A `start` older than that is **moved forward and served with no
-/// error** — a window requested 48 hours back was answered with one beginning exactly 24 hours
-/// back. The `from` field of the `replay_started` frame is the only signal that it happened, so it
-/// is compared here against what was requested.
-///
-/// # ⚠️ Best-effort by construction
-/// Only frames that arrived *during* subscription validation can be inspected: those are what the
-/// validator hands back after failing to read them as subscription responses. A `replay_started`
-/// that arrives after the last confirmation is never seen here and its clamp goes unreported. The
-/// alternative — holding the connection open to wait for one frame per symbol — would delay every
-/// subscription for a warning, so the check is deliberately opportunistic rather than complete.
-fn warn_on_clamped_replays(
-    exchange: ExchangeId,
-    requested: &[(SmolStr, DateTime<Utc>)],
-    buffered: &[WsMessage],
-) {
-    for (symbol, requested_start, serving_from) in clamped_replays(requested, buffered) {
-        warn!(
-            %exchange,
-            %symbol,
-            requested = %requested_start,
-            serving_from = %serving_from,
-            "London Strategic Edge clamped the requested replay window; events between the two \
-             instants are beyond the provider's retention and are permanently lost",
-        );
-    }
-}
-
-/// The replay windows the provider opened later than asked for, as
-/// `(symbol, requested, serving from)`.
-///
-/// A window opened *at* the requested instant is not a clamp: `start` is inclusive, so that is
-/// precisely the window that was requested. Frames naming a symbol no replay was requested for are
-/// ignored rather than reported — a subscription that asked for no window cannot have had one
-/// clamped, and the buffer also carries frames belonging to other subscriptions entirely.
-fn clamped_replays(
-    requested: &[(SmolStr, DateTime<Utc>)],
-    buffered: &[WsMessage],
-) -> Vec<(SmolStr, DateTime<Utc>, DateTime<Utc>)> {
-    if requested.is_empty() {
-        return Vec::new();
-    }
-
-    let mut clamped = Vec::new();
-
-    for message in buffered {
-        let WsMessage::Text(payload) = message else {
-            continue;
-        };
-
-        let Ok(LseReplayFrame::ReplayStarted { symbol, from }) =
-            serde_json::from_str::<LseReplayFrame>(payload.as_str())
-        else {
-            continue;
-        };
-
-        let Some((_, requested_start)) = requested.iter().find(|(market, _)| *market == symbol)
-        else {
-            continue;
-        };
-
-        if from > *requested_start {
-            clamped.push((symbol, *requested_start, from));
-        }
-    }
-
-    clamped
 }
 
 /// The distinct symbols a batch will subscribe to, in the order they were requested.
@@ -485,6 +417,7 @@ fn check_symbols_are_offered(
                 if let Some(category) = *category
                     && !expected.is_empty()
                     && !expected.contains(&category)
+                    && is_published_category(category)
                 {
                     miscategorised.push(format!("{market} is {category}"));
                 }
@@ -523,6 +456,25 @@ fn expected_categories(exchange: ExchangeId) -> Vec<&'static str> {
         .filter(|dataset| dataset.exchange_id() == exchange)
         .filter_map(|dataset| dataset.ws_category())
         .collect()
+}
+
+/// Whether `category` is a label this integration knows some dataset by.
+///
+/// # Why an unrecognised label can never be a contradiction
+/// [`expected_categories`] is only as complete as what the provider publishes *today*, and it is
+/// complete for no better reason than that the provider has not labelled more. Five datasets stand
+/// behind [`ExchangeId::LseCfd`] and only two of them are labelled, so the day the provider begins
+/// publishing a category for one of the other three — its published list moved by hundreds of
+/// entries in a week when measured — a correctly-requested symbol would read as belonging to a
+/// different dataset and fail the whole batch, every other symbol in it included, with no change on
+/// our side.
+///
+/// A label we do not recognise says nothing about which dataset a symbol belongs to. Only one we
+/// recognise as belonging somewhere *else* is evidence, and that is the only case this admits.
+fn is_published_category(category: &str) -> bool {
+    LseDataset::ALL
+        .into_iter()
+        .any(|dataset| dataset.ws_category() == Some(category))
 }
 
 /// Authenticate, and return the frame the provider answers with.
@@ -675,7 +627,9 @@ pub struct LseSymbol {
 mod tests {
     use super::*;
     use crate::exchange::lse::{LseCrypto, LseEquities, LseFx};
-    use crate::subscription::trade::PublicTrades;
+    // `SubscriptionKind` is already in scope through `use super::*`, which is what `as_str` below
+    // resolves through.
+    use crate::subscription::{book::OrderBooksL1, trade::PublicTrades};
     use rustrade_instrument::instrument::market_data::MarketDataInstrument;
     use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 
@@ -706,12 +660,6 @@ mod tests {
     /// need no truncating cast of their own.
     fn micros_as_f64(time: DateTime<Utc>) -> f64 {
         time.timestamp_micros() as f64
-    }
-
-    fn replay_started(symbol: &str, from: &str) -> WsMessage {
-        WsMessage::text(
-            json!({"type": "replay_started", "symbol": symbol, "from": from}).to_string(),
-        )
     }
 
     #[test]
@@ -762,7 +710,10 @@ mod tests {
     fn a_subscriber_without_resume_asks_for_no_replay_window() {
         let subscriber = LseSubscriber::new(LseCredentials::new("key"));
 
-        assert_eq!(subscriber.resume_start("BTC/USD"), None);
+        assert_eq!(
+            subscriber.resume_start("BTC/USD", PublicTrades.as_str()),
+            None
+        );
     }
 
     /// A reconnect re-subscribes every symbol in the batch, including ones added since the last
@@ -771,61 +722,40 @@ mod tests {
     fn a_resuming_subscriber_asks_for_a_window_only_where_it_has_delivered() {
         let state = Arc::new(LseResumeState::new());
         state.record(
-            &subscription_id("BTC/USD"),
+            &LseResumeKey::new(subscription_id("BTC/USD"), PublicTrades.as_str()),
             at("2026-08-14T10:16:55.161234Z"),
         );
 
         let subscriber = LseSubscriber::new(LseCredentials::new("key")).with_resume(state);
 
         assert_eq!(
-            subscriber.resume_start("BTC/USD"),
+            subscriber.resume_start("BTC/USD", PublicTrades.as_str()),
             Some(at("2026-08-14T10:16:55.161234Z")),
         );
-        assert_eq!(subscriber.resume_start("ETH/USD"), None);
-    }
-
-    /// The provider retains 24 hours and moves an older `start` forward with no error, so the
-    /// `replay_started` frame is the only evidence the requested window was not the served one.
-    #[test]
-    fn a_replay_window_opened_later_than_requested_is_reported() {
-        let requested = vec![("BTC/USD".into(), at("2026-08-12T10:00:00Z"))];
-        let buffered = [replay_started("BTC/USD", "2026-08-13T10:00:00+00:00")];
-
         assert_eq!(
-            clamped_replays(&requested, &buffered),
-            vec![(
-                SmolStr::new("BTC/USD"),
-                at("2026-08-12T10:00:00Z"),
-                at("2026-08-13T10:00:00Z"),
-            )],
+            subscriber.resume_start("ETH/USD", PublicTrades.as_str()),
+            None
         );
     }
 
-    /// `start` is inclusive, so a window opened exactly where it was asked for is the window that
-    /// was asked for — warning on it would make the check noise on every ordinary resume.
+    /// The provider has one channel, so both kinds tick under one wire identifier. A window is
+    /// asked for on the strength of what *this* kind delivered, never what another one did — the
+    /// trailing stream would otherwise resume past events it never saw.
     #[test]
-    fn a_replay_window_opened_where_requested_is_not_a_clamp() {
-        let requested = vec![("BTC/USD".into(), at("2026-08-14T10:16:55.161234Z"))];
-        let buffered = [replay_started(
-            "BTC/USD",
-            "2026-08-14T10:16:55.161234+00:00",
-        )];
+    fn a_window_is_asked_for_per_kind_rather_than_per_symbol() {
+        let state = Arc::new(LseResumeState::new());
+        state.record(
+            &LseResumeKey::new(subscription_id("BTC/USD"), PublicTrades.as_str()),
+            at("2026-08-14T10:16:55.161234Z"),
+        );
 
-        assert!(clamped_replays(&requested, &buffered).is_empty());
-    }
+        let subscriber = LseSubscriber::new(LseCredentials::new("key")).with_resume(state);
 
-    /// The buffer holds whatever failed to read as a subscription response, which includes frames
-    /// for symbols this batch never asked to resume.
-    #[test]
-    fn a_replay_for_a_symbol_no_window_was_requested_for_is_ignored() {
-        let requested = vec![("BTC/USD".into(), at("2026-08-12T10:00:00Z"))];
-        let buffered = [
-            replay_started("ETH/USD", "2026-08-13T10:00:00+00:00"),
-            WsMessage::text(r#"{"type":"subscribed","symbol":"BTC/USD","count":1,"max":16}"#),
-            WsMessage::text("not json at all"),
-        ];
-
-        assert!(clamped_replays(&requested, &buffered).is_empty());
+        assert_eq!(
+            subscriber.resume_start("BTC/USD", OrderBooksL1.as_str()),
+            None,
+            "a kind that has delivered nothing must subscribe live, not from another kind's mark",
+        );
     }
 
     /// Two subscriptions naming one symbol are one slot and one confirmation. Sending two payloads
@@ -898,6 +828,22 @@ mod tests {
         assert!(error.contains("NOPE_XYZ"), "{error}");
     }
 
+    /// The same symbol the test above rejects, and the list it was checked against removed. There
+    /// is then nothing to check, so the guard degrades to a warning rather than failing a batch it
+    /// cannot judge — refusing would break every caller the moment the provider stopped publishing
+    /// its catalog in the handshake.
+    ///
+    /// This branch is why the live canary asserts a rejection instead of trusting the guard: pinned
+    /// only by this test, the degradation is silent, and a provider that quietly dropped the list
+    /// would leave the guard passing everything forever.
+    #[test]
+    fn an_absent_symbol_list_degrades_to_a_warning_rather_than_failing_the_batch() {
+        let frame = authenticated(&[], Some(16));
+        let requested = markets(&["NOPE_XYZ"]);
+
+        assert!(check_symbols_are_offered(ExchangeId::LseFx, &requested, &frame).is_ok());
+    }
+
     #[test]
     fn a_contradicting_category_fails_the_batch() {
         let frame = authenticated(&[("AAPL", Some("Stocks"))], Some(16));
@@ -907,6 +853,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("AAPL is Stocks"), "{error}");
+    }
+
+    /// The same rule where the labels are *complete*, which is the case a symbol-shaped reading of
+    /// "only cross-check what we recognise" would leave out.
+    ///
+    /// A label is evidence only if some dataset is known by it, whether or not this exchange's own
+    /// expectation has gaps. Restricting the leniency to the partially-labelled exchanges would
+    /// leave the same defect standing here in a slower form: the provider renaming `Forex` makes
+    /// this expectation complete but *stale*, and every correctly-requested `LseFx` batch then
+    /// fails on a label that is simply newer than the table.
+    #[test]
+    fn an_unrecognised_label_is_not_a_contradiction_even_where_the_labels_are_complete() {
+        let expected = expected_categories(ExchangeId::LseFx);
+        assert_eq!(
+            expected,
+            ["Forex"],
+            "this exchange's expectation is complete, which is the point: {expected:?}"
+        );
+
+        let frame = authenticated(&[("EUR/USD", Some("FX Majors"))], Some(16));
+        let requested = markets(&["EUR/USD"]);
+
+        assert!(check_symbols_are_offered(ExchangeId::LseFx, &requested, &frame).is_ok());
     }
 
     /// Roughly half the published entries carry no category, so absence must never be a mismatch.
@@ -928,6 +897,38 @@ mod tests {
         let requested = markets(&["ES.F"]);
 
         assert!(check_symbols_are_offered(ExchangeId::LseFutures, &requested, &frame).is_ok());
+    }
+
+    /// Five datasets stand behind `LseCfd` and the provider labels two of them, so its expectation
+    /// is partial. A label appearing on one of the other three must not read as "this symbol
+    /// belongs to a different dataset" and fail the batch — the published list moved by hundreds of
+    /// entries in a week when measured, and this is what a correct subscription would meet.
+    #[test]
+    fn a_label_no_dataset_is_known_by_is_not_a_contradiction() {
+        let expected = expected_categories(ExchangeId::LseCfd);
+        assert!(expected.contains(&"Indices"), "{expected:?}");
+        assert!(
+            !expected.contains(&"Volatility"),
+            "the expectation is partial by construction: {expected:?}"
+        );
+
+        let frame = authenticated(&[("VIX/USD", Some("Volatility"))], Some(16));
+        let requested = markets(&["VIX/USD"]);
+
+        assert!(check_symbols_are_offered(ExchangeId::LseCfd, &requested, &frame).is_ok());
+    }
+
+    /// The other half of the same rule: a label we recognise as belonging elsewhere still fails,
+    /// because that is evidence the symbol is on a different dataset.
+    #[test]
+    fn a_label_belonging_to_another_dataset_still_fails_the_batch() {
+        let frame = authenticated(&[("AAPL", Some("Stocks"))], Some(16));
+        let requested = markets(&["AAPL"]);
+
+        let error = check_symbols_are_offered(ExchangeId::LseCfd, &requested, &frame)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("AAPL is Stocks"), "{error}");
     }
 
     /// Equities and ETFs share one identifier, so both categories must satisfy it.

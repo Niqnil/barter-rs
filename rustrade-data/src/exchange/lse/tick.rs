@@ -58,9 +58,14 @@ pub struct LseTick {
     /// # The three spellings, all measured on one connection
     /// 1. **RFC 3339** — `2026-01-02T09:37:24.760146+00:00`.
     /// 2. **The same with a space** separating date and time —
-    ///    `2026-01-02 09:37:21.690159+00:00`. [`DateTime::parse_from_rfc3339`] rejects this
-    ///    outright, and it is what five of thirteen sampled dataset families send. A decoder
-    ///    handling only spelling 1 silently loses them.
+    ///    `2026-01-02 09:37:21.690159+00:00`, which is what five of thirteen sampled dataset
+    ///    families send. [`DateTime::parse_from_rfc3339`] **accepts** it: RFC 3339 §5.6 permits a
+    ///    space in place of the `T` by prior agreement, and `chrono` implements that lenience —
+    ///    verified against both 0.4.39, the oldest this workspace admits, and the pinned 0.4.45.
+    ///    It is a lenience rather than a guarantee, so
+    ///    `a_space_separated_timestamp_decodes_to_the_same_instant_as_the_t_form` pins it: a future
+    ///    `chrono` that tightened the grammar would fail the build rather than silently drop five
+    ///    dataset families.
     /// 3. **Epoch seconds as a JSON number** — `1786091921.387`. Replayed ticks use this while
     ///    live ticks on the *same connection* use a string, so the field changes JSON type
     ///    mid-stream. A decoder typed as a string fails the moment replay is enabled.
@@ -68,14 +73,21 @@ pub struct LseTick {
     /// Sub-second precision also varies per symbol within one spelling: microseconds,
     /// milliseconds, and — on at least one symbol — no fractional component at all.
     ///
-    /// # The epoch spelling is quantised to microseconds
+    /// # Every spelling is quantised to microseconds
     /// An `f64` cannot carry nanosecond resolution at epoch scale: near the present its spacing is
-    /// roughly a quarter of a microsecond, so nanoseconds recovered from it are noise. Rounding to
-    /// the nearest microsecond discards that noise and recovers the provider's own precision
-    /// exactly, which matters for more than tidiness — **it is what makes spellings 1 and 3 of one
-    /// instant decode to the same value.** The replay path re-sends ticks the live path already
-    /// delivered, in the other spelling, so anything comparing the two for equality (resume
-    /// arithmetic above all) depends on them agreeing.
+    /// roughly a quarter of a microsecond, so nanoseconds recovered from spelling 3 are noise.
+    /// Rounding to the nearest microsecond discards that noise and recovers the provider's own
+    /// precision exactly, which matters for more than tidiness — **it is what makes the three
+    /// spellings of one instant decode to the same value.** The replay path re-sends ticks the live
+    /// path already delivered, in a different spelling, so anything comparing the two for equality
+    /// (resume arithmetic above all) depends on them agreeing.
+    ///
+    /// The string spellings are quantised to that same resolution rather than passed through at
+    /// whatever they carry, so the agreement is *enforced* rather than observed. Every string
+    /// sampled carried at most six fractional digits, but a seventh would defeat the resume
+    /// comparison silently: the watermark would hold a sub-microsecond instant, `start` would go
+    /// out truncated to the microsecond below it, and every replayed tick at that instant would
+    /// then sort *before* the watermark and be re-emitted as a duplicate.
     ///
     /// A string that is neither spelling, including one carrying no UTC offset, is rejected rather
     /// than guessed at — a mis-parsed timestamp is a silently misdated market event.
@@ -107,14 +119,39 @@ pub struct LseTick {
 ///
 /// The stream carries control frames (subscription confirmations, replay boundaries, errors)
 /// interleaved with ticks, on the same connection and after the handshake has completed. Anything
-/// that is not a tick decodes to [`Other`](Self::Other) so a control frame cannot fail the parse
-/// and take the stream down with it; the frames that carry *meaning* to a subscriber are decoded
-/// by the subscription types instead, during the handshake where they can be acted on.
+/// this integration does not act on decodes to [`Other`](Self::Other) so a control frame cannot
+/// fail the parse and take the stream down with it; the confirmations that carry meaning to the
+/// *handshake* are decoded by the subscription types instead, where they can be acted on.
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LseMessage {
     /// A tick.
     Tick(LseTick),
+
+    /// The boundary frame announcing the replay window the provider actually opened.
+    ///
+    /// # ⚠️ `from` is the only signal that a `start` was clamped
+    /// The provider retains 24 hours. A `start` further back is **silently moved forward**, with no
+    /// error: a window requested 48 hours back was answered with one beginning exactly 24 hours
+    /// back, and streamed from there. Comparing `from` against what was asked for is the only way
+    /// to detect it.
+    ///
+    /// # Why it is modelled on the stream rather than caught during the handshake
+    /// The provider answers `subscribe` *before* it announces the window — measured on both a
+    /// crypto and an FX symbol, the order is `subscribed`, then `replay_started`, then the replayed
+    /// ticks. The subscription validator stops reading the socket the moment the last confirmation
+    /// arrives, so a single-symbol resumed subscription never has a `replay_started` to inspect at
+    /// handshake time, and a batch never has one for its last symbol. Reading it here instead makes
+    /// the check independent of frame ordering and of batch size.
+    ReplayStarted {
+        /// The subscription the window belongs to, built from `symbol` exactly as a tick's is.
+        #[serde(rename = "symbol", deserialize_with = "de_tick_subscription_id")]
+        subscription_id: SubscriptionId,
+
+        /// The instant the provider will actually replay from.
+        #[serde(deserialize_with = "de_timestamp")]
+        from: DateTime<Utc>,
+    },
 
     /// Any other frame — a control frame, or one this integration does not model.
     #[serde(other)]
@@ -131,7 +168,10 @@ impl Identifier<Option<SubscriptionId>> for LseMessage {
     fn id(&self) -> Option<SubscriptionId> {
         match self {
             Self::Tick(tick) => Some(tick.subscription_id.clone()),
-            Self::Other => None,
+            // A replay boundary names a subscription but describes the stream rather than a market
+            // event. The transformer consumes it before this point; resolving it to an instrument
+            // would only offer it to a decoder that has nothing to build from it.
+            Self::ReplayStarted { .. } | Self::Other => None,
         }
     }
 }
@@ -151,7 +191,7 @@ where
 /// window's `from` is decoded through it too. The spellings, and why the epoch form is quantised
 /// to microseconds, are documented on [`LseTick::time_exchange`], which is where a reader of the
 /// public API meets them.
-pub(super) fn de_timestamp<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+fn de_timestamp<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -207,24 +247,31 @@ impl Visitor<'_> for TimestampVisitor {
 }
 
 /// Parse spellings 1 and 2 — see [`de_timestamp`].
+///
+/// Both spellings take one code path because `chrono` accepts the space separator itself, as the
+/// RFC 3339 §5.6 lenience it is. There is deliberately no second, laxer grammar behind this: an
+/// offset RFC 3339 rejects is rejected here too, so the spellings cannot drift apart in what they
+/// admit.
 fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
-        return Some(parsed.with_timezone(&Utc));
-    }
-
-    // The space-separated spelling is the same instant in a form RFC 3339 does not admit. Swapping
-    // the separator and re-parsing reuses the strict parser rather than introducing a second,
-    // laxer grammar -- so an offset RFC 3339 would reject is still rejected here, and the two
-    // spellings cannot drift apart in what they accept.
-    let (date, time) = raw.split_once(' ')?;
-    let mut rfc3339 = String::with_capacity(raw.len());
-    rfc3339.push_str(date);
-    rfc3339.push('T');
-    rfc3339.push_str(time);
-
-    DateTime::parse_from_rfc3339(&rfc3339)
+    DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|parsed| parsed.with_timezone(&Utc))
+        .and_then(round_to_micros)
+}
+
+/// Round an instant to the nearest microsecond.
+///
+/// The provider is measured never to spell more than six fractional digits, so this is a no-op on
+/// every string sampled. It is applied anyway because the resume arithmetic compares instants
+/// decoded from different spellings for *equality* — see [`LseTick::time_exchange`], which is where
+/// that dependency is documented.
+fn round_to_micros(time: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    // `timestamp_subsec_nanos` measures from the second below, so this rounds half upward. The
+    // epoch spelling's `f64::round` rounds half away from zero, and the two agree on every instant
+    // at or after the epoch -- which is every instant this feed can carry.
+    let round_up = i64::from(time.timestamp_subsec_nanos() % 1_000 >= 500);
+
+    DateTime::from_timestamp_micros(time.timestamp_micros() + round_up)
 }
 
 /// Parse spelling 3 — see [`de_timestamp`] for why this rounds to microseconds.
@@ -284,8 +331,10 @@ mod tests {
         assert_eq!(tick.volume, dec!(0.00155));
     }
 
-    /// The spelling `DateTime::parse_from_rfc3339` rejects. Five of thirteen sampled dataset
-    /// families send it, so an RFC-3339-only decoder loses them silently.
+    /// Five of thirteen sampled dataset families send this spelling. `chrono` accepts the space as
+    /// an RFC 3339 §5.6 lenience rather than a guarantee, so this test is the canary: if a future
+    /// version tightened the grammar, those five families would otherwise start failing to decode
+    /// silently, in production, on a dependency bump.
     #[test]
     fn a_space_separated_timestamp_decodes_to_the_same_instant_as_the_t_form() {
         let tick: LseTick = serde_json::from_str(LIVE_SPACE_SEPARATED).unwrap();
@@ -335,6 +384,27 @@ mod tests {
         let as_float = time_from_epoch_seconds(1_767_346_644.760_146).unwrap();
 
         assert_eq!(as_string, as_float);
+    }
+
+    /// The enforcement half of the same property: a string carrying more precision than the epoch
+    /// spelling can express is quantised to microseconds rather than passed through, so the two
+    /// still decode equal. Without it the watermark would hold an instant `start` cannot name, and
+    /// the replay would re-deliver it as a duplicate.
+    #[test]
+    fn a_sub_microsecond_string_is_quantised_so_it_still_matches_the_float_spelling() {
+        let seven_digits = parse_timestamp("2026-01-02T09:37:24.7601461+00:00").unwrap();
+        let as_float = time_from_epoch_seconds(1_767_346_644.760_146).unwrap();
+
+        assert_eq!(seven_digits, as_float);
+        assert_eq!(seven_digits.timestamp_subsec_nanos() % 1_000, 0);
+
+        // Rounds to nearest rather than truncating, matching what the epoch spelling recovers.
+        assert_eq!(
+            parse_timestamp("2026-01-02T09:37:24.7601465+00:00").unwrap(),
+            "2026-01-02T09:37:24.760147Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+        );
     }
 
     /// A whole-second epoch has no fractional part to print, so JSON carries it as an integer.
@@ -417,7 +487,6 @@ mod tests {
     fn control_frames_decode_as_other_rather_than_failing_the_parse() {
         for input in [
             r#"{"type":"subscribed","symbol":"BTC/USD","count":1,"max":16}"#,
-            r#"{"type":"replay_started","symbol":"BTC/USD","from":"2026-01-02T09:37:24+00:00"}"#,
             r#"{"type":"replay_complete","symbol":"BTC/USD","rows":41,"buffered_drained":9}"#,
             r#"{"type":"error","code":"LIMIT_REACHED","message":"Max 16 symbols"}"#,
             r#"{"type":"welcome","message":"hello","symbols_available":1}"#,
@@ -425,5 +494,42 @@ mod tests {
             let message: LseMessage = serde_json::from_str(input).unwrap();
             assert_eq!(message, LseMessage::Other, "failed on {input}");
         }
+    }
+
+    /// The replay boundary is the one control frame that is modelled, because its `from` is the
+    /// only evidence a requested window was clamped to the provider's retention.
+    #[test]
+    fn a_replay_boundary_decodes_with_its_window_in_every_timestamp_spelling() {
+        for raw in [
+            r#""2026-01-02 09:39:31.716622+00:00""#,
+            r#""2026-01-02T09:39:31.716622+00:00""#,
+            "1767346771.716622",
+        ] {
+            let input = format!(r#"{{"type":"replay_started","symbol":"BTC/USD","from":{raw}}}"#);
+            let message: LseMessage = serde_json::from_str(&input).unwrap();
+
+            assert_eq!(
+                message,
+                LseMessage::ReplayStarted {
+                    subscription_id: SubscriptionId::from("tick|BTC/USD"),
+                    from: "2026-01-02T09:39:31.716622Z"
+                        .parse::<DateTime<Utc>>()
+                        .unwrap(),
+                },
+                "failed on {raw}"
+            );
+        }
+    }
+
+    /// It names a subscription but describes the stream, so it must not resolve to an instrument —
+    /// a decoder handed one has no market event to build from it.
+    #[test]
+    fn a_replay_boundary_identifies_no_subscription() {
+        let message: LseMessage = serde_json::from_str(
+            r#"{"type":"replay_started","symbol":"BTC/USD","from":"2026-01-02T09:37:24+00:00"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(message.id(), None);
     }
 }

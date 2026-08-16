@@ -564,13 +564,20 @@ where
     }
 }
 
-/// Takes the exchange-side name verbatim, so it needs no per-dataset spelling: the caller has
-/// already supplied the provider's own symbol.
+/// Takes the exchange-side name as given, so it needs no per-dataset shape: the caller has already
+/// supplied the provider's own symbol, and there is nothing to reconstruct.
+///
+/// Case is still normalised, for the same reason the reconstruction path normalises it: the symbol
+/// is the instrument-map key a tick resolves through, and the provider echoes `EUR/USD` on the tick
+/// however the subscribe spelled it. A lowercase `name_exchange` would be *confirmed*, then tick
+/// under a key the map does not hold and deliver nothing — the silent failure the reconstruction
+/// path already avoids, and there is no reason for this path to keep it. On a correctly spelled
+/// exchange name the call is a no-op.
 impl<Server, InstrumentKey, Kind> Identifier<LseMarket>
     for Subscription<Lse<Server>, MarketInstrumentData<InstrumentKey>, Kind>
 {
     fn id(&self) -> LseMarket {
-        LseMarket(self.instrument.name_exchange.name().clone())
+        LseMarket(self.instrument.name_exchange.name().to_uppercase_smolstr())
     }
 }
 
@@ -968,40 +975,77 @@ mod tests {
 
         /// Reconstruction must invert the split the rest of the integration derives assets with,
         /// or the WebSocket and the REST vault would disagree about what one instrument is called.
+        ///
+        /// The shape comes from the dataset's own [`LseServer::SYMBOL_SHAPE`] rather than being
+        /// inferred from the symbol. Inferring it is what [`underlying`] already does, so deriving
+        /// both halves the same way would make the round trip agree with itself no matter what the
+        /// connectors declare — and a connector declaring the wrong shape is precisely the failure
+        /// that produces an unsubscribable symbol, since [`market_symbol`] dispatches on the
+        /// declaration and not on the string.
         #[test]
         fn reconstruction_inverts_the_underlying_split() {
-            for symbol in ["EUR/USD", "BTC/USD", "VIX/USD", "AAPL", "BP.L", "ES.F"] {
+            fn round_trips<Server>(symbol: &str)
+            where
+                Server: LseServer,
+            {
                 let split = underlying(symbol);
-                let shape = if symbol.contains('/') {
-                    LseSymbolShape::Pair
-                } else {
-                    LseSymbolShape::Bare
-                };
 
                 let rebuilt = market_symbol(
-                    shape,
+                    Server::SYMBOL_SHAPE,
                     &AssetNameInternal::new(split.base.name().clone()),
                     &AssetNameInternal::new(split.quote.name().clone()),
                 );
 
-                assert_eq!(rebuilt.as_ref(), symbol);
+                assert_eq!(
+                    rebuilt.as_ref(),
+                    symbol,
+                    "{symbol} does not survive a round trip through {:?}, the shape its dataset \
+                     declares",
+                    Server::SYMBOL_SHAPE,
+                );
             }
+
+            round_trips::<LseServerFx>("EUR/USD");
+            round_trips::<LseServerCrypto>("BTC/USD");
+            round_trips::<LseServerCfd>("VIX/USD");
+            round_trips::<LseServerEquities>("AAPL");
+            round_trips::<LseServerEquities>("BP.L");
+            round_trips::<LseServerFutures>("ES.F");
         }
 
+        /// An exchange-side name is the provider's own symbol, so it is used as given rather than
+        /// rebuilt through the dataset's shape.
         #[test]
         fn an_exchange_named_instrument_is_taken_verbatim() {
+            assert_eq!(
+                market_of_exchange_named("XAU/USD").as_ref(),
+                "XAU/USD",
+                "a correctly spelled exchange name must pass through untouched",
+            );
+        }
+
+        /// The one normalisation that still applies, and why: the symbol is the instrument-map key
+        /// a tick resolves through, and the provider echoes the uppercase spelling on the tick
+        /// whatever the subscribe said. Left alone, a lowercase name would be confirmed and then
+        /// tick under a key the map does not hold.
+        #[test]
+        fn an_exchange_named_instrument_is_uppercased_like_a_reconstructed_one() {
+            assert_eq!(market_of_exchange_named("xau/usd").as_ref(), "XAU/USD");
+            assert_eq!(market_of_exchange_named("bp.l").as_ref(), "BP.L");
+        }
+
+        fn market_of_exchange_named(name_exchange: &str) -> LseMarket {
             let subscription = Subscription {
                 exchange: LseCfd::default(),
                 instrument: MarketInstrumentData {
                     key: 0_usize,
-                    name_exchange: InstrumentNameExchange::new("XAU/USD"),
+                    name_exchange: InstrumentNameExchange::new(name_exchange),
                     kind: MarketDataInstrumentKind::Cfd,
                 },
                 kind: PublicTrades,
             };
-            let market: LseMarket = subscription.id();
 
-            assert_eq!(market.as_ref(), "XAU/USD");
+            subscription.id()
         }
     }
 }

@@ -35,6 +35,47 @@ pub(super) struct LseWatermark {
     pub count_at_time: usize,
 }
 
+/// The key a watermark is filed under: the subscription the provider ticks it on, **and** the
+/// subscription kind the stream serves it as.
+///
+/// # Why the kind is part of the key
+/// The provider publishes one data frame, so a subscribe names a symbol and nothing else and both
+/// supported kinds resolve to the same wire identifier (`tick|BTC/USD`). Keying on that identifier
+/// alone would let two streams carrying one symbol — the same instrument subscribed as trades and
+/// as top-of-book — share a single watermark and advance it independently: whichever stream ran
+/// ahead would set the resume point for both, and the one behind would resume past events it never
+/// delivered. Since this integration is required to serve both kinds from every dataset, that is
+/// the natural way to use the feature rather than an exotic one, so it is closed structurally here
+/// instead of being documented as a caller obligation.
+///
+/// The kind never reaches the wire: it is a partition of this map, not part of the subscription.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(super) struct LseResumeKey {
+    subscription: SubscriptionId,
+    kind: &'static str,
+}
+
+impl LseResumeKey {
+    /// File a watermark under `subscription`, as served for `kind`.
+    ///
+    /// `kind` is [`SubscriptionKind::as_str`](crate::subscription::SubscriptionKind::as_str) —
+    /// taken as a string rather than a type parameter because the map holds every kind at once.
+    pub(super) fn new(subscription: SubscriptionId, kind: &'static str) -> Self {
+        Self { subscription, kind }
+    }
+
+    /// The kind this key partitions on.
+    pub(super) fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    /// Consume the key for the subscription half, which is what a transformer keys its own
+    /// per-connection bookkeeping on once it has filtered the snapshot to its own kind.
+    pub(super) fn into_subscription(self) -> SubscriptionId {
+        self.subscription
+    }
+}
+
 /// Resume state shared between a [`LseSubscriber`](super::live::LseSubscriber) and the transformer
 /// of every stream it opens.
 ///
@@ -54,9 +95,12 @@ pub(super) struct LseWatermark {
 /// consumer to acknowledge what it durably stored, which is consumer policy and deliberately not
 /// modelled here.
 ///
-/// # One state per set of streams
-/// Watermarks are keyed by symbol, so streams that carry the same symbol must not share a state;
-/// see [`LseSubscriber::with_resume`](super::live::LseSubscriber::with_resume).
+/// # One state may be shared freely
+/// Watermarks are keyed by subscription *and* subscription kind, so one state serves any set of
+/// streams, including two that carry the same symbol as different kinds: this provider serves both
+/// kinds from a single data frame, so keying on the wire identifier alone would let whichever
+/// stream ran ahead set the resume point for both, and the one behind would resume past events it
+/// never delivered. Nothing about sharing needs thinking about at the call site.
 ///
 /// # Opting in
 /// Resumption is **off** unless [`LseSubscriber::with_resume`](super::live::LseSubscriber::with_resume)
@@ -79,7 +123,7 @@ pub struct LseResumeState {
     // reconnect chain polls the outer stream (where the subscriber reads) only once the inner
     // stream (where the transformer writes) has fully drained, so the two never overlap. The lock
     // is never held across an `await`.
-    marks: Mutex<FnvHashMap<SubscriptionId, LseWatermark>>,
+    marks: Mutex<FnvHashMap<LseResumeKey, LseWatermark>>,
 }
 
 impl LseResumeState {
@@ -88,15 +132,15 @@ impl LseResumeState {
         Self::default()
     }
 
-    /// Record that an event bearing `time_exchange` was delivered for `subscription_id`.
+    /// Record that an event bearing `time_exchange` was delivered under `key`.
     ///
     /// Advancing to a newer instant resets the count to one. An instant older than the watermark
     /// is ignored rather than rolling it back — the watermark is the high-water mark of what was
     /// delivered, and moving it backwards would re-request events already seen.
-    pub(super) fn record(&self, subscription_id: &SubscriptionId, time_exchange: DateTime<Utc>) {
+    pub(super) fn record(&self, key: &LseResumeKey, time_exchange: DateTime<Utc>) {
         let mut marks = self.lock();
 
-        match marks.get_mut(subscription_id) {
+        match marks.get_mut(key) {
             Some(watermark) if time_exchange > watermark.time_exchange => {
                 *watermark = LseWatermark {
                     time_exchange,
@@ -109,7 +153,7 @@ impl LseResumeState {
             Some(_) => {}
             None => {
                 marks.insert(
-                    subscription_id.clone(),
+                    key.clone(),
                     LseWatermark {
                         time_exchange,
                         count_at_time: 1,
@@ -119,23 +163,23 @@ impl LseResumeState {
         }
     }
 
-    /// The watermark for `subscription_id`, if anything has been delivered for it.
-    pub(super) fn watermark(&self, subscription_id: &SubscriptionId) -> Option<LseWatermark> {
-        self.lock().get(subscription_id).copied()
+    /// The watermark filed under `key`, if anything has been delivered for it.
+    pub(super) fn watermark(&self, key: &LseResumeKey) -> Option<LseWatermark> {
+        self.lock().get(key).copied()
     }
 
-    /// Every watermark recorded so far.
+    /// Every watermark recorded so far, across every kind.
     ///
     /// Taken as a snapshot so a transformer can carry its own drop counters without holding the
-    /// lock, or consulting it, per tick.
-    pub(super) fn snapshot(&self) -> FnvHashMap<SubscriptionId, LseWatermark> {
+    /// lock, or consulting it, per tick. The caller filters to its own kind.
+    pub(super) fn snapshot(&self) -> FnvHashMap<LseResumeKey, LseWatermark> {
         self.lock().clone()
     }
 
     // A poisoned lock means some other thread panicked mid-update. The data behind it is a
     // high-water mark whose worst case is a slightly stale resume point, so recovering the inner
     // value is strictly better than propagating the panic and taking the market stream down.
-    fn lock(&self) -> std::sync::MutexGuard<'_, FnvHashMap<SubscriptionId, LseWatermark>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FnvHashMap<LseResumeKey, LseWatermark>> {
         self.marks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -173,6 +217,7 @@ pub(super) fn epoch_seconds(time: DateTime<Utc>) -> f64 {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::subscription::{SubscriptionKind, book::OrderBooksL1, trade::PublicTrades};
 
     fn at(spelling: &str) -> DateTime<Utc> {
         spelling.parse::<DateTime<Utc>>().unwrap()
@@ -182,13 +227,25 @@ mod tests {
         subscription_id("BTC/USD")
     }
 
+    /// The key one symbol's trades are filed under.
+    ///
+    /// The kind comes from [`SubscriptionKind::as_str`] rather than a spelled-out literal, so
+    /// these tests partition on the same string production files watermarks under.
+    fn key() -> LseResumeKey {
+        LseResumeKey::new(id(), PublicTrades.as_str())
+    }
+
+    fn key_for(symbol: &str) -> LseResumeKey {
+        LseResumeKey::new(subscription_id(symbol), PublicTrades.as_str())
+    }
+
     #[test]
     fn the_first_event_seeds_the_watermark_with_a_count_of_one() {
         let state = LseResumeState::new();
-        state.record(&id(), at("2026-01-02T09:37:24.760146Z"));
+        state.record(&key(), at("2026-01-02T09:37:24.760146Z"));
 
         assert_eq!(
-            state.watermark(&id()),
+            state.watermark(&key()),
             Some(LseWatermark {
                 time_exchange: at("2026-01-02T09:37:24.760146Z"),
                 count_at_time: 1,
@@ -202,21 +259,21 @@ mod tests {
     fn events_sharing_an_instant_accumulate_a_count() {
         let state = LseResumeState::new();
         for _ in 0..141 {
-            state.record(&id(), at("2026-01-02T09:37:24.760Z"));
+            state.record(&key(), at("2026-01-02T09:37:24.760Z"));
         }
 
-        assert_eq!(state.watermark(&id()).unwrap().count_at_time, 141);
+        assert_eq!(state.watermark(&key()).unwrap().count_at_time, 141);
     }
 
     #[test]
     fn a_newer_instant_advances_the_watermark_and_resets_the_count() {
         let state = LseResumeState::new();
-        state.record(&id(), at("2026-01-02T09:37:24.760146Z"));
-        state.record(&id(), at("2026-01-02T09:37:24.760146Z"));
-        state.record(&id(), at("2026-01-02T09:37:24.760147Z"));
+        state.record(&key(), at("2026-01-02T09:37:24.760146Z"));
+        state.record(&key(), at("2026-01-02T09:37:24.760146Z"));
+        state.record(&key(), at("2026-01-02T09:37:24.760147Z"));
 
         assert_eq!(
-            state.watermark(&id()),
+            state.watermark(&key()),
             Some(LseWatermark {
                 time_exchange: at("2026-01-02T09:37:24.760147Z"),
                 count_at_time: 1,
@@ -228,11 +285,11 @@ mod tests {
     #[test]
     fn an_older_instant_leaves_the_watermark_untouched() {
         let state = LseResumeState::new();
-        state.record(&id(), at("2026-01-02T09:37:24.760147Z"));
-        state.record(&id(), at("2026-01-02T09:37:24.760146Z"));
+        state.record(&key(), at("2026-01-02T09:37:24.760147Z"));
+        state.record(&key(), at("2026-01-02T09:37:24.760146Z"));
 
         assert_eq!(
-            state.watermark(&id()),
+            state.watermark(&key()),
             Some(LseWatermark {
                 time_exchange: at("2026-01-02T09:37:24.760147Z"),
                 count_at_time: 1,
@@ -243,28 +300,46 @@ mod tests {
     #[test]
     fn subscriptions_are_tracked_independently() {
         let state = LseResumeState::new();
-        state.record(&subscription_id("BTC/USD"), at("2026-01-02T09:00:00Z"));
-        state.record(&subscription_id("ETH/USD"), at("2026-01-02T10:00:00Z"));
+        state.record(&key_for("BTC/USD"), at("2026-01-02T09:00:00Z"));
+        state.record(&key_for("ETH/USD"), at("2026-01-02T10:00:00Z"));
 
         assert_eq!(
-            state
-                .watermark(&subscription_id("BTC/USD"))
-                .unwrap()
-                .time_exchange,
+            state.watermark(&key_for("BTC/USD")).unwrap().time_exchange,
             at("2026-01-02T09:00:00Z")
         );
         assert_eq!(
-            state
-                .watermark(&subscription_id("ETH/USD"))
-                .unwrap()
-                .time_exchange,
+            state.watermark(&key_for("ETH/USD")).unwrap().time_exchange,
             at("2026-01-02T10:00:00Z")
+        );
+    }
+
+    /// The provider has one channel, so both kinds tick under one wire identifier. Sharing a
+    /// watermark between them would let whichever stream ran ahead set the resume point for both,
+    /// and the one behind would resume past events it never delivered.
+    #[test]
+    fn one_symbol_served_as_two_kinds_keeps_two_watermarks() {
+        let state = LseResumeState::new();
+        let trades = LseResumeKey::new(id(), PublicTrades.as_str());
+        let books = LseResumeKey::new(id(), OrderBooksL1.as_str());
+
+        state.record(&trades, at("2026-01-02T09:00:00Z"));
+        state.record(&trades, at("2026-01-02T10:00:00Z"));
+        state.record(&books, at("2026-01-02T09:00:00Z"));
+
+        assert_eq!(
+            state.watermark(&trades).unwrap().time_exchange,
+            at("2026-01-02T10:00:00Z"),
+        );
+        assert_eq!(
+            state.watermark(&books).unwrap().time_exchange,
+            at("2026-01-02T09:00:00Z"),
+            "the trailing kind must resume from its own last delivery, not the other kind's",
         );
     }
 
     #[test]
     fn an_untracked_subscription_has_no_watermark() {
-        assert_eq!(LseResumeState::new().watermark(&id()), None);
+        assert_eq!(LseResumeState::new().watermark(&key()), None);
     }
 
     /// The resume value must round-trip the stored instant exactly, because the server filters on

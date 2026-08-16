@@ -206,14 +206,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LseSubscriber` (`LseCredentials`, or `from_env` on `LSE_API_KEY`, whose errors name the variable
   and never its value). Timestamps arrive in three encodings — RFC-3339 with `T`, the same with a
   space separator, and a bare float epoch on replayed ticks — and a decoder accepting only the first
-  would silently drop five of the thirteen dataset families.
+  would silently drop five of the thirteen dataset families. Every spelling is quantised to
+  **microseconds**, the provider's own resolution and the one its replay filter honours: an
+  RFC-3339 string carrying seven fractional digits otherwise decodes to 100 ns while the float
+  spelling of the same instant cannot, and the resume arithmetic compares instants for equality.
   **Pre-subscribe guards, because this surface fails quietly.** An unknown symbol is *confirmed*
   rather than rejected and then never ticks, and the connection-wide 16-subscription cap is reported
   without naming the symbol that breached it. So the whole batch is validated against the symbol
   list the authentication response already carries, before anything is sent: an unoffered symbol or
   an over-cap batch fails loudly and consumes **no** subscription slot. The response's per-symbol
-  category is cross-checked only when present, since it is absent for roughly half the catalog and
-  a missing field is not a contradiction.
+  category is cross-checked only when it is both present *and* a label some dataset is known by,
+  since it is absent for roughly half the catalog: neither a missing field nor a label this
+  integration does not recognise is a contradiction — only one belonging to a *different* dataset
+  is evidence of anything.
   **Opt-in resumption across a reconnect** via `LseSubscriber::with_resume(Arc<LseResumeState>)`.
   A reconnect re-runs the subscribe, so a fixed replay window would re-deliver it in full on every
   attempt; instead the watermark records, per symbol, the newest delivered instant **and how many
@@ -223,11 +228,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a coarser resolution would re-serve a whole millisecond of already-delivered events on the
   families that carry microseconds. It is **off by default** — a resumed subscription is served its
   entire historical window before a single live tick, and one hour of a busy crypto symbol replayed
-  107,395 ticks. Watermarks are keyed by symbol rather than by symbol and kind, so streams carrying
-  the same symbol need their own state; disjoint sets may share one. The provider retains 24 hours
-  and clamps a longer request **silently**, which is compared against what it says it will replay
-  from and reported rather than swallowed. This covers reconnects, not process restarts: recovering
-  across a restart needs consumer-side acknowledgement of what was durably stored.
+  107,395 ticks. Watermarks are keyed by symbol **and** subscription kind, so one state may be
+  shared by any set of streams: this provider serves both kinds from one data frame, so two streams
+  carrying the same symbol as trades and as top-of-book would otherwise share a watermark and
+  advance it independently, and whichever ran ahead would set the resume point for the one behind.
+  The provider retains 24 hours and clamps a longer request **silently**; the honoured window is
+  announced in a `replay_started` frame that was measured to arrive *after* the subscription
+  confirmation, so the comparison against what was asked for is made on the stream rather than
+  during the handshake, and a clamp is warned about rather than swallowed. This covers reconnects,
+  not process restarts: recovering across a restart needs consumer-side acknowledgement of what was
+  durably stored.
   **⚠️ Known properties of the feed, not of this decoder, that will silently mislead:** the tick is
   a **QUOTE, not a print** — its `price` equalled its `bid` on 3,966 of 3,966 sampled ticks across
   every dataset family — so a `PublicTrade` decoded from it is a bid-side quote wearing a trade's

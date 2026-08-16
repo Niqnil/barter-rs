@@ -5,7 +5,7 @@
 //! [`resume`](super::resume): skipping the events a reconnect's replay re-delivers.
 
 use super::{
-    resume::{LseResumeState, LseWatermark},
+    resume::{LseResumeKey, LseResumeState, LseWatermark},
     tick::LseMessage,
 };
 use crate::{
@@ -43,6 +43,14 @@ pub struct LseTransformer<Exchange, InstrumentKey, Kind> {
 #[derive(Debug)]
 struct ResumeTracker {
     state: Arc<LseResumeState>,
+
+    /// The kind this stream serves, which partitions the shared state — see
+    /// [`LseResumeKey`]. Held as a string because the transformer's `Kind` type parameter has no
+    /// value to call [`SubscriptionKind::as_str`] on.
+    kind: &'static str,
+
+    /// Keyed by subscription alone: the snapshot is filtered to this stream's kind on construction,
+    /// so the kind is constant across every entry here.
     pending: FnvHashMap<SubscriptionId, PendingDrop>,
 }
 
@@ -51,6 +59,12 @@ struct ResumeTracker {
 struct PendingDrop {
     time_exchange: DateTime<Utc>,
     remaining: usize,
+
+    /// Whether the out-of-contract-ordering warning has already fired for this subscription.
+    ///
+    /// A provider replaying from *before* the requested instant would otherwise warn once per
+    /// replayed tick, which on a busy symbol is tens of thousands of identical lines.
+    warned_older: bool,
 }
 
 impl<Exchange, InstrumentKey, Kind> LseTransformer<Exchange, InstrumentKey, Kind>
@@ -63,22 +77,28 @@ where
 {
     /// Construct a transformer, optionally resuming from previously delivered events.
     ///
+    /// `resume` carries the kind this stream serves alongside the shared state, because the state
+    /// is partitioned by kind — see [`LseResumeKey`] — and this type's `Kind` parameter has no
+    /// value to derive it from.
+    ///
     /// The drop counters are snapshotted here rather than consulted per tick, so the shared lock
     /// is taken once per connection on this path.
     pub(super) async fn new(
         instrument_map: Map<InstrumentKey>,
         ws_sink_tx: mpsc::UnboundedSender<WsMessage>,
-        resume: Option<Arc<LseResumeState>>,
+        resume: Option<(Arc<LseResumeState>, &'static str)>,
     ) -> Result<Self, DataError> {
         let inner = StatelessTransformer::init(instrument_map, &[], ws_sink_tx).await?;
 
-        let resume = resume.map(|state| ResumeTracker {
+        let resume = resume.map(|(state, kind)| ResumeTracker {
             pending: state
                 .snapshot()
                 .into_iter()
-                .map(|(subscription_id, watermark)| (subscription_id, PendingDrop::from(watermark)))
+                .filter(|(key, _)| key.kind() == kind)
+                .map(|(key, watermark)| (key.into_subscription(), PendingDrop::from(watermark)))
                 .collect(),
             state,
+            kind,
         });
 
         Ok(Self { inner, resume })
@@ -90,6 +110,7 @@ impl From<LseWatermark> for PendingDrop {
         Self {
             time_exchange: watermark.time_exchange,
             remaining: watermark.count_at_time,
+            warned_older: false,
         }
     }
 }
@@ -131,19 +152,39 @@ where
     type OutputIter = Vec<Result<Self::Output, Self::Error>>;
 
     fn transform(&mut self, input: Self::Input) -> Self::OutputIter {
+        // The replay boundary is consumed here rather than forwarded. It is the only evidence that
+        // a requested window was clamped to the provider's retention, and it cannot be caught
+        // during the handshake -- see `LseMessage::ReplayStarted`. No decoder has a market event to
+        // build from it either way.
+        if let LseMessage::ReplayStarted {
+            subscription_id,
+            from,
+        } = &input
+        {
+            if let Some(resume) = self.resume.as_ref() {
+                resume.warn_if_clamped(Exchange::ID, subscription_id, *from);
+            }
+
+            return vec![];
+        }
+
         // Nothing to track when the caller did not opt in, and a control frame carries no instant
         // to track. Both go straight through.
-        let Some((subscription_id, time_exchange)) =
+        let Some((subscription_id, time_exchange, replay)) =
             self.resume.as_ref().and_then(|_| match &input {
-                LseMessage::Tick(tick) => Some((tick.subscription_id.clone(), tick.time_exchange)),
-                LseMessage::Other => None,
+                LseMessage::Tick(tick) => Some((
+                    tick.subscription_id.clone(),
+                    tick.time_exchange,
+                    tick.replay,
+                )),
+                _ => None,
             })
         else {
             return self.inner.transform(input);
         };
 
         if let Some(resume) = self.resume.as_mut()
-            && resume.should_drop(&subscription_id, time_exchange)
+            && resume.should_drop(Exchange::ID, &subscription_id, time_exchange, replay)
         {
             return vec![];
         }
@@ -156,7 +197,7 @@ where
         if let Some(resume) = self.resume.as_ref()
             && output.iter().any(Result::is_ok)
         {
-            resume.state.record(&subscription_id, time_exchange);
+            resume.record(subscription_id, time_exchange);
         }
 
         output
@@ -167,10 +208,12 @@ impl ResumeTracker {
     /// Whether this event was already delivered by the connection this one replaced.
     fn should_drop(
         &mut self,
+        exchange: ExchangeId,
         subscription_id: &SubscriptionId,
         time_exchange: DateTime<Utc>,
+        replay: bool,
     ) -> bool {
-        let Some(pending) = self.pending.get(subscription_id).copied() else {
+        let Some(pending) = self.pending.get_mut(subscription_id) else {
             return false;
         };
 
@@ -179,14 +222,32 @@ impl ResumeTracker {
             // delivered this many events there. `start` is inclusive, so the provider replays them
             // all and they are skipped by position.
             Ordering::Equal if pending.remaining > 0 => {
-                if let Some(pending) = self.pending.get_mut(subscription_id) {
-                    pending.remaining -= 1;
+                pending.remaining -= 1;
+
+                // The skip stays positional and does NOT require `replay`, deliberately: the flag
+                // is absent on live ticks, so a provider that stopped stamping replayed ones would
+                // turn every reconnect into a duplicate flood if the drop depended on it. But a
+                // tick arriving unstamped inside the window is a live event being discarded as a
+                // duplicate, which only happens if the replay under-delivered at this instant, so
+                // it is reported. Bounded by the count the watermark carries.
+                if !replay {
+                    warn!(
+                        %exchange,
+                        subscription = %subscription_id,
+                        instant = %time_exchange,
+                        "London Strategic Edge delivered an unreplayed tick inside the resume \
+                         window and it was skipped as an already-delivered duplicate; a genuinely \
+                         new tick may have been lost",
+                    );
                 }
+
                 true
             }
             // The instant is exhausted; anything further carrying it is genuinely new.
             Ordering::Equal => false,
             Ordering::Greater => {
+                let undelivered = pending.remaining;
+                let instant = pending.time_exchange;
                 self.pending.remove(subscription_id);
 
                 // The replay held fewer events at the watermark's instant than were delivered from
@@ -195,11 +256,12 @@ impl ResumeTracker {
                 // 141 events -- so a shortfall means the provider's history changed underneath the
                 // subscription. No event is lost by it, but the assumption is load-bearing enough
                 // that its failure must be visible rather than inferred from a gap much later.
-                if pending.remaining > 0 {
+                if undelivered > 0 {
                     warn!(
+                        %exchange,
                         subscription = %subscription_id,
-                        instant = %pending.time_exchange,
-                        undelivered = pending.remaining,
+                        instant = %instant,
+                        undelivered,
                         "London Strategic Edge replay held fewer ticks at the resume instant than \
                          were delivered from it; the provider's history changed under the resume",
                     );
@@ -210,8 +272,87 @@ impl ResumeTracker {
             // Older than the watermark. `start` is inclusive, so the provider should never send
             // this; emitting is the safe answer, since dropping would discard a real event on the
             // strength of an assumption that has already been contradicted.
-            Ordering::Less => false,
+            Ordering::Less => {
+                // The mirror image of the shortfall above, and the same load-bearing assumption
+                // contradicted in the other direction -- most plausibly a `start` filter flooring
+                // to a coarser resolution than the microseconds it was given. Its consequence is
+                // worse, because everything between the served instant and the watermark is a
+                // duplicate delivered into consumer state, so it must not be the quiet one. Fired
+                // once per subscription: the condition holds for every replayed tick below the
+                // watermark, and on a busy symbol that is tens of thousands of them.
+                if !pending.warned_older {
+                    pending.warned_older = true;
+
+                    warn!(
+                        %exchange,
+                        subscription = %subscription_id,
+                        instant = %time_exchange,
+                        watermark = %pending.time_exchange,
+                        "London Strategic Edge replayed a tick older than the resume instant, \
+                         which an inclusive `start` should make impossible; it is emitted rather \
+                         than dropped, so expect duplicates back to the instant shown",
+                    );
+                }
+
+                false
+            }
         }
+    }
+
+    /// Warn when the provider opened a replay window later than the one asked for.
+    ///
+    /// # ⚠️ Silent clamping is the failure this exists to surface
+    /// The provider retains 24 hours. A `start` older than that is **moved forward and served with
+    /// no error** — a window requested 48 hours back was answered with one beginning exactly 24
+    /// hours back. The `from` of the [`ReplayStarted`](LseMessage::ReplayStarted) frame is the only
+    /// signal that it happened.
+    ///
+    /// The watermark is what went out as `start`, so it *is* the requested instant and no separate
+    /// record of the request is needed. A window opened exactly at it is not a clamp: `start` is
+    /// inclusive, so that is precisely the window asked for.
+    fn warn_if_clamped(
+        &self,
+        exchange: ExchangeId,
+        subscription_id: &SubscriptionId,
+        from: DateTime<Utc>,
+    ) {
+        if let Some(requested) = self.clamped_from(subscription_id, from) {
+            warn!(
+                %exchange,
+                subscription = %subscription_id,
+                requested = %requested,
+                serving_from = %from,
+                "London Strategic Edge clamped the requested replay window; events between the two \
+                 instants are beyond the provider's retention and are permanently lost",
+            );
+        }
+    }
+
+    /// The instant a window was requested from, if the provider opened it later than that.
+    ///
+    /// `None` for a subscription this stream holds no watermark for — one that asked for no window,
+    /// or whose replay has already passed its watermark. The provider announces the boundary before
+    /// serving the window, measured on both a crypto and an FX symbol, so the second case means the
+    /// frames arrived out of order and the requested instant is no longer known here.
+    fn clamped_from(
+        &self,
+        subscription_id: &SubscriptionId,
+        from: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let requested = self.pending.get(subscription_id)?.time_exchange;
+
+        // A window opened *at* the requested instant is not a clamp: `start` is inclusive, so that
+        // is precisely the window that was asked for, and warning on it would make this fire on
+        // every ordinary resume.
+        (from > requested).then_some(requested)
+    }
+
+    /// Advance the shared watermark for an event this stream delivered.
+    fn record(&self, subscription_id: SubscriptionId, time_exchange: DateTime<Utc>) {
+        self.state.record(
+            &LseResumeKey::new(subscription_id, self.kind),
+            time_exchange,
+        );
     }
 }
 
@@ -231,13 +372,30 @@ mod tests {
 
     type Subject = LseTransformer<LseCrypto, u8, PublicTrades>;
 
+    /// The kind these tests serve, and the partition their watermarks are filed under.
+    const KIND: &str = "public_trades";
+
     fn id() -> SubscriptionId {
         super::super::resume::subscription_id("BTC/USD")
     }
 
+    fn key() -> LseResumeKey {
+        LseResumeKey::new(id(), KIND)
+    }
+
+    /// A live tick, which carries no `replay` key at all.
     fn tick(ts: &str, price: &str) -> LseMessage {
         serde_json::from_str(&format!(
             r#"{{"type":"tick","symbol":"BTC/USD","ts":"{ts}","price":{price},
+                "bid":{price},"ask":42001.0,"volume":0.00155}}"#
+        ))
+        .unwrap()
+    }
+
+    /// A tick served from the provider's replay buffer, which the provider stamps.
+    fn replayed_tick(ts: &str, price: &str) -> LseMessage {
+        serde_json::from_str(&format!(
+            r#"{{"type":"tick","symbol":"BTC/USD","ts":"{ts}","replay":true,"price":{price},
                 "bid":{price},"ask":42001.0,"volume":0.00155}}"#
         ))
         .unwrap()
@@ -249,7 +407,9 @@ mod tests {
             .collect::<FnvHashMap<SubscriptionId, u8>>());
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        Subject::new(map, tx, resume).await.unwrap()
+        Subject::new(map, tx, resume.map(|state| (state, KIND)))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -274,7 +434,7 @@ mod tests {
         subject.transform(tick("2026-01-02T09:00:00.000001Z", "1.0"));
         subject.transform(tick("2026-01-02T09:00:00.000001Z", "2.0"));
 
-        let watermark = state.watermark(&id()).unwrap();
+        let watermark = state.watermark(&key()).unwrap();
         assert_eq!(
             watermark.time_exchange,
             "2026-01-02T09:00:00.000001Z"
@@ -295,14 +455,14 @@ mod tests {
         for price in ["1.0", "2.0", "3.0"] {
             first.transform(tick("2026-01-02T09:00:00.000001Z", price));
         }
-        assert_eq!(state.watermark(&id()).unwrap().count_at_time, 3);
+        assert_eq!(state.watermark(&key()).unwrap().count_at_time, 3);
 
         // Reconnect: the provider replays all three, then a fourth that is genuinely new.
         let mut second = subject(Some(Arc::clone(&state))).await;
         for price in ["1.0", "2.0", "3.0"] {
             assert!(
                 second
-                    .transform(tick("2026-01-02T09:00:00.000001Z", price))
+                    .transform(replayed_tick("2026-01-02T09:00:00.000001Z", price))
                     .is_empty(),
                 "an already-delivered tick must not be emitted twice"
             );
@@ -315,7 +475,7 @@ mod tests {
             1,
             "a fourth tick at the same instant is new and must be emitted"
         );
-        assert_eq!(state.watermark(&id()).unwrap().count_at_time, 4);
+        assert_eq!(state.watermark(&key()).unwrap().count_at_time, 4);
     }
 
     /// The gap half of the contract: everything after the resume instant is new, always.
@@ -329,7 +489,7 @@ mod tests {
         let mut second = subject(Some(Arc::clone(&state))).await;
         assert!(
             second
-                .transform(tick("2026-01-02T09:00:00.000001Z", "1.0"))
+                .transform(replayed_tick("2026-01-02T09:00:00.000001Z", "1.0"))
                 .is_empty()
         );
         assert_eq!(
@@ -355,7 +515,7 @@ mod tests {
         // Replay is short by one, then moves past the instant -- the window closes here.
         assert!(
             second
-                .transform(tick("2026-01-02T09:00:00.000001Z", "1.0"))
+                .transform(replayed_tick("2026-01-02T09:00:00.000001Z", "1.0"))
                 .is_empty()
         );
         assert_eq!(
@@ -395,7 +555,7 @@ mod tests {
                 .unwrap();
 
         assert!(subject.transform(frame).is_empty());
-        assert_eq!(state.watermark(&id()), None);
+        assert_eq!(state.watermark(&key()), None);
     }
 
     /// The no-dedupe lock, restated at the transformer: identical repeats are genuine distinct
@@ -410,5 +570,134 @@ mod tests {
 
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1, "an identical repeat is a distinct print");
+    }
+
+    /// An inclusive `start` says this cannot happen, so it means the assumption behind positional
+    /// skipping has been contradicted — most plausibly a `start` filter flooring to a coarser
+    /// resolution. Emitting is the safe answer: dropping would discard a real event on the strength
+    /// of an assumption already known to be wrong. A `warn!` carries the signal.
+    #[tokio::test]
+    async fn a_replayed_tick_older_than_the_resume_instant_is_emitted_rather_than_dropped() {
+        let state = Arc::new(LseResumeState::new());
+
+        let mut first = subject(Some(Arc::clone(&state))).await;
+        first.transform(tick("2026-01-02T09:00:00.000002Z", "1.0"));
+
+        let mut second = subject(Some(Arc::clone(&state))).await;
+        assert_eq!(
+            second
+                .transform(replayed_tick("2026-01-02T09:00:00.000001Z", "0.5"))
+                .len(),
+            1,
+            "a tick below the watermark must be emitted, not silently swallowed"
+        );
+
+        // The window itself is untouched by it: the tick at the watermark is still skipped.
+        assert!(
+            second
+                .transform(replayed_tick("2026-01-02T09:00:00.000002Z", "1.0"))
+                .is_empty()
+        );
+    }
+
+    /// The skip stays positional rather than conditioning on `replay`, because the flag is absent
+    /// on live ticks: a provider that stopped stamping replayed ones would otherwise turn every
+    /// reconnect into a duplicate flood. The cost is this case, which is reported by a `warn!`
+    /// rather than changed.
+    #[tokio::test]
+    async fn an_unstamped_tick_inside_the_resume_window_is_still_skipped() {
+        let state = Arc::new(LseResumeState::new());
+
+        let mut first = subject(Some(Arc::clone(&state))).await;
+        first.transform(tick("2026-01-02T09:00:00.000001Z", "1.0"));
+
+        let mut second = subject(Some(Arc::clone(&state))).await;
+        assert!(
+            second
+                .transform(tick("2026-01-02T09:00:00.000001Z", "1.0"))
+                .is_empty()
+        );
+    }
+
+    /// A resumed subject whose `pending` holds a watermark at `instant`, as a reconnect's would.
+    async fn resumed_at(state: &Arc<LseResumeState>, instant: &str) -> Subject {
+        let mut first = subject(Some(Arc::clone(state))).await;
+        first.transform(tick(instant, "1.0"));
+
+        subject(Some(Arc::clone(state))).await
+    }
+
+    fn at(spelling: &str) -> DateTime<Utc> {
+        spelling.parse::<DateTime<Utc>>().unwrap()
+    }
+
+    /// The provider retains 24 hours and moves an older `start` forward with no error, so the
+    /// boundary frame's `from` is the only evidence the requested window was not the served one.
+    #[tokio::test]
+    async fn a_replay_window_opened_later_than_requested_is_reported() {
+        let state = Arc::new(LseResumeState::new());
+        let subject = resumed_at(&state, "2026-08-12T10:00:00Z").await;
+
+        assert_eq!(
+            subject
+                .resume
+                .as_ref()
+                .unwrap()
+                .clamped_from(&id(), at("2026-08-13T10:00:00Z")),
+            Some(at("2026-08-12T10:00:00Z")),
+        );
+    }
+
+    /// `start` is inclusive, so a window opened exactly where it was asked for is the window that
+    /// was asked for — reporting it would make the check noise on every ordinary resume.
+    #[tokio::test]
+    async fn a_replay_window_opened_where_requested_is_not_a_clamp() {
+        let state = Arc::new(LseResumeState::new());
+        let subject = resumed_at(&state, "2026-08-14T10:16:55.161234Z").await;
+
+        assert_eq!(
+            subject
+                .resume
+                .as_ref()
+                .unwrap()
+                .clamped_from(&id(), at("2026-08-14T10:16:55.161234Z")),
+            None,
+        );
+    }
+
+    /// A subscription that asked for no window cannot have had one clamped.
+    #[tokio::test]
+    async fn a_replay_boundary_for_a_subscription_with_no_watermark_is_ignored() {
+        let state = Arc::new(LseResumeState::new());
+        let subject = subject(Some(state)).await;
+
+        assert_eq!(
+            subject
+                .resume
+                .as_ref()
+                .unwrap()
+                .clamped_from(&id(), at("2026-08-13T10:00:00Z")),
+            None,
+        );
+    }
+
+    /// The frame is the only evidence a requested window was clamped, and it reaches the stream
+    /// rather than the handshake. It must yield no market event of its own.
+    #[tokio::test]
+    async fn a_replay_boundary_is_consumed_without_emitting_an_event() {
+        let state = Arc::new(LseResumeState::new());
+        let mut subject = subject(Some(Arc::clone(&state))).await;
+
+        let boundary: LseMessage = serde_json::from_str(
+            r#"{"type":"replay_started","symbol":"BTC/USD","from":"2026-01-02T09:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert!(subject.transform(boundary).is_empty());
+        assert_eq!(
+            state.watermark(&key()),
+            None,
+            "a boundary frame must not advance the watermark"
+        );
     }
 }

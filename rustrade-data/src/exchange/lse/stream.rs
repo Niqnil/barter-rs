@@ -122,8 +122,17 @@ where
             ));
         }
 
-        let mut transformer =
-            LseTransformer::new(instrument_map, ws_sink_tx, subscriber.resume_state()).await?;
+        // The resume state is partitioned by subscription kind -- see
+        // [`LseResumeKey`](super::resume::LseResumeKey) -- and every subscription in one batch
+        // shares a `Kind`, so the first names it for all of them. An empty batch has nothing to
+        // resume, which is what the `zip` yields.
+        let resume = subscriber.resume_state().zip(
+            subscriptions
+                .first()
+                .map(|subscription| subscription.kind.as_str()),
+        );
+
+        let mut transformer = LseTransformer::new(instrument_map, ws_sink_tx, resume).await?;
 
         let mut processed = process_buffered_events::<WebSocketSerdeParser, _>(
             &mut transformer,

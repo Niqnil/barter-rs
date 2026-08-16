@@ -47,9 +47,12 @@
 #![cfg(feature = "lse")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use rustrade_data::{
-    Identifier,
+    Identifier, MarketStream, NoInitialSnapshots,
+    error::DataError,
+    event::MarketEvent,
     exchange::{
         ExchangeServer,
         lse::{
@@ -57,11 +60,16 @@ use rustrade_data::{
             channel::LseChannel,
             live::{LseCredentials, LseSubscriber},
             market::{LseMarket, LseServer, LseSymbolShape},
+            resume::LseResumeState,
+            stream::LseStream,
         },
         subscription::ExchangeSub,
     },
     subscriber::Subscriber,
-    subscription::{Subscription, trade::PublicTrades},
+    subscription::{
+        Subscription,
+        trade::{PublicTrade, PublicTrades},
+    },
 };
 use rustrade_instrument::{
     exchange::ExchangeId,
@@ -123,6 +131,12 @@ struct Script {
     /// buffered events — the path a replayed tick takes when it arrives while other symbols are
     /// still being confirmed.
     frames_before_confirmation: Vec<Value>,
+
+    /// Frames to send after each subscription confirmation.
+    ///
+    /// These reach the stream itself rather than the handshake, which is what lets a test drive a
+    /// market event out of the far end instead of stopping at `subscribe`.
+    frames_after_confirmation: Vec<Value>,
 }
 
 impl Default for Script {
@@ -131,6 +145,7 @@ impl Default for Script {
             auth_reply: authenticated(&[("BTC/USD", Some("Crypto")), ("ETH/USD", None)], 16),
             close_without_answering: false,
             frames_before_confirmation: Vec::new(),
+            frames_after_confirmation: Vec::new(),
         }
     }
 }
@@ -281,6 +296,16 @@ async fn serve(stream: TcpStream, script: Script, subscribes: Arc<Mutex<Vec<Valu
                     .is_err()
                 {
                     return;
+                }
+
+                for frame in &script.frames_after_confirmation {
+                    if websocket
+                        .send(Message::text(frame.to_string()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
             // The client sends nothing else during a handshake; anything here would be a change in
@@ -514,4 +539,112 @@ async fn frames_arriving_during_validation_are_buffered_rather_than_dropped() {
     );
     assert_eq!(buffered[0]["type"], "replay_started");
     assert_eq!(buffered[1]["type"], "tick");
+}
+
+/// A tick frame as the provider spells it, live or replayed.
+fn tick_frame(symbol: &str, ts: &str, price: f64, replay: bool) -> Value {
+    let mut frame = json!({
+        "type": "tick", "symbol": symbol, "ts": ts,
+        "price": price, "bid": price, "ask": price + 0.5, "volume": 0.00155,
+    });
+
+    // Live ticks carry no `replay` key at all; only replayed ones are stamped.
+    if replay {
+        frame["replay"] = json!(true);
+    }
+
+    frame
+}
+
+/// Assemble the market stream the connector actually serves, resume state and all.
+async fn stream(
+    subscriber: &LseSubscriber,
+    subscriptions: &[Subscription<HarnessLse, MarketDataInstrument, PublicTrades>],
+) -> LseStream<HarnessLse, MarketDataInstrument, PublicTrades> {
+    <LseStream<_, _, _> as MarketStream<HarnessLse, MarketDataInstrument, PublicTrades>>::init::<
+        NoInitialSnapshots,
+    >(subscriber, subscriptions)
+    .await
+    .unwrap()
+}
+
+/// The next market event, or a failure naming which of the three ways it did not arrive.
+async fn next_event<S>(stream: &mut S) -> MarketEvent<MarketDataInstrument, PublicTrade>
+where
+    S: futures_util::Stream<
+            Item = Result<MarketEvent<MarketDataInstrument, PublicTrade>, DataError>,
+        > + Unpin,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream produced no event before the timeout")
+        .expect("the stream ended instead of producing an event")
+        .expect("the stream yielded an error instead of an event")
+}
+
+/// The invariant [`LseStream`] exists for, end to end.
+///
+/// A replayed tick can already be sitting in the handshake's buffered events: it fails to
+/// deserialise as a subscription response while other symbols are still confirming, and lands
+/// there. The resume state must therefore reach the transformer **before** those buffered events
+/// are processed, which is the only reason this connector does not use the blanket WebSocket
+/// stream.
+///
+/// The pieces are covered in isolation elsewhere — the transformer's skip logic in its own unit
+/// tests, the buffering in `frames_arriving_during_validation_are_buffered_rather_than_dropped`.
+/// This is what joins them: reorder the two statements in `LseStream::init` and every other test in
+/// this repository still passes, while every reconnect of a resumed subscription starts delivering
+/// duplicates.
+#[tokio::test]
+#[serial]
+async fn a_replayed_tick_buffered_during_validation_is_skipped_on_a_resumed_reconnect() {
+    const INSTANT: &str = "2026-08-14T10:16:55.161234+00:00";
+    const LATER: &str = "2026-08-14T10:16:55.161235+00:00";
+
+    let state = Arc::new(LseResumeState::new());
+    let subscriber = subscriber().with_resume(Arc::clone(&state));
+    let subscriptions = [subscription("btc")];
+
+    // The first connection delivers one tick, which becomes the watermark.
+    let first = Harness::start(Script {
+        frames_after_confirmation: vec![tick_frame("BTC/USD", INSTANT, 42000.5, false)],
+        ..Script::default()
+    })
+    .await;
+
+    let mut opened = stream(&subscriber, &subscriptions).await;
+    assert_eq!(
+        next_event(&mut opened).await.time_exchange,
+        INSTANT.parse::<DateTime<Utc>>().unwrap(),
+    );
+    assert_eq!(
+        first.subscribes()[0].get("start"),
+        None,
+        "the first subscribe has nothing to resume from and must open no window",
+    );
+    drop(opened);
+
+    // The reconnect: the provider replays that same tick, and it arrives *before* the confirmation
+    // -- so the stream meets it in the buffered events, not on the socket.
+    let second = Harness::start(Script {
+        frames_before_confirmation: vec![tick_frame("BTC/USD", INSTANT, 42000.5, true)],
+        frames_after_confirmation: vec![tick_frame("BTC/USD", LATER, 42001.0, false)],
+        ..Script::default()
+    })
+    .await;
+
+    let mut resumed = stream(&subscriber, &subscriptions).await;
+
+    assert!(
+        second.subscribes()[0]["start"].is_number(),
+        "the reconnect must carry the resume window: {:?}",
+        second.subscribes()[0],
+    );
+
+    assert_eq!(
+        next_event(&mut resumed).await.time_exchange,
+        LATER.parse::<DateTime<Utc>>().unwrap(),
+        "the first event out of a resumed stream was the replayed duplicate, so the resume state \
+         did not reach the transformer before the buffered events were processed",
+    );
 }

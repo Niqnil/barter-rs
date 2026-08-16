@@ -17,7 +17,7 @@
 //! ever caught. Support is asserted structurally instead: the guards either work against the real
 //! list or they do not.
 //!
-//! # The three signals it does assert
+//! # The four signals it does assert
 //!
 //! 1. **Every subscribed symbol actually ticks.** This surface's quietest failure is a subscription
 //!    that is *confirmed and then silent* — the provider answers `subscribed` for a symbol it does
@@ -35,6 +35,14 @@
 //!    the `authenticated` frame still carries a usable symbol list: were the list to disappear or be
 //!    renamed, the guard degrades to a warning by design, the provider confirms the bogus symbol,
 //!    and the batch would succeed. That silent degradation is exactly what this catches.
+//! 4. **A resumed reconnect leaves no gap and rolls nothing back.** Resumption is the one part of
+//!    this integration whose correctness rests on the *provider's* half of a bargain — that `start`
+//!    is inclusive, is honoured at the resolution it was sent at, and replays from exactly where it
+//!    is pointed. Every other test asserts that against fixtures this repository wrote, and a
+//!    fixture cannot notice the provider changing its mind. So one test disconnects deliberately,
+//!    stays away long enough that a resubscribe ignoring the watermark would be unmistakable, and
+//!    reconnects: the resumed stream must begin at the watermark rather than at the reconnect, and
+//!    never before it.
 //!
 //! # Skip vs. fail contract
 //!
@@ -72,8 +80,12 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{Stream, StreamExt};
 use rustrade_data::{
+    MarketStream, NoInitialSnapshots,
+    error::DataError,
     event::MarketEvent,
-    exchange::lse::{LseCfd, LseCrypto, live::LseSubscriber},
+    exchange::lse::{
+        LseCfd, LseCrypto, live::LseSubscriber, resume::LseResumeState, stream::LseStream,
+    },
     streams::{
         Streams,
         reconnect::{Event, stream::ReconnectingStream},
@@ -85,7 +97,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 
 const KEY_ENV: &str = "LSE_API_KEY";
@@ -116,6 +128,28 @@ const MAX_CLOSED_VENUE_TICK_AGE: ChronoDuration = ChronoDuration::days(7);
 ///
 /// Non-zero only for clock skew — the provider stamps in the past by construction.
 const MAX_TICK_LEAD: ChronoDuration = ChronoDuration::minutes(2);
+
+/// How long the resume canary's two connections stay apart.
+///
+/// This is the whole measurement: a reconnect that ignores the watermark begins at *now*, this far
+/// past it, while a resumed one begins *at* it. The two are only distinguishable if the pause is
+/// comfortably wider than the tick spacing, and it is — a busy crypto symbol prints roughly thirty
+/// ticks a second, so this is hundreds of ticks of separation. It is also short enough that the
+/// replay it triggers drains in a second or two rather than the minutes a whole-window resume takes.
+const RESUME_PAUSE: Duration = Duration::from_secs(20);
+
+/// How far past the watermark the resumed stream's earliest event may be stamped.
+///
+/// A correct resume begins *at* the watermark, so this is slack for a quiet stretch at that instant
+/// — not for the reconnect. It has to stay well under [`RESUME_PAUSE`] or it stops distinguishing a
+/// replay from a fresh live subscription, which is the only thing this bound is for.
+const RESUME_GAP_TOLERANCE: ChronoDuration = ChronoDuration::seconds(5);
+
+/// How many events the resume canary's first connection takes before disconnecting.
+///
+/// Only has to be enough to seed a watermark. The arithmetic being exercised is per instant, not
+/// per batch, so a larger sample would buy nothing but wall-clock.
+const TICKS_BEFORE_DISCONNECT: usize = 25;
 
 /// Build a subscriber, or `None` when the key is **absent** (skip rather than fail).
 ///
@@ -357,4 +391,192 @@ async fn a_symbol_the_provider_does_not_offer_is_rejected_before_subscribing() {
 
     assert!(error.contains("NOPE-XYZ/USD"), "{error}");
     println!("CANARY_OK: an unoffered symbol was rejected before any subscribe was sent");
+}
+
+/// One connection to the provider, resume state and all, with nothing wrapped around it.
+///
+/// The reconnecting stream the other tests build is deliberately avoided here: it decides for itself
+/// when to reconnect, and this test's entire signal is *what a reconnect does*, which means owning
+/// both connections explicitly. What is driven is still production code — this is the same
+/// [`LseStream`] that [`StreamSelector`](rustrade_data::exchange::StreamSelector) resolves to.
+async fn connection(
+    subscriber: &LseSubscriber,
+    subscriptions: &[Subscription<LseCrypto, MarketDataInstrument, PublicTrades>],
+) -> LseStream<LseCrypto, MarketDataInstrument, PublicTrades> {
+    <LseStream<_, _, _> as MarketStream<LseCrypto, MarketDataInstrument, PublicTrades>>::init::<
+        NoInitialSnapshots,
+    >(subscriber, subscriptions)
+    .await
+    .expect("subscribing to a continuously-traded crypto symbol should succeed")
+}
+
+/// Drive `stream` until `is_last` accepts an event or the deadline passes, returning what arrived.
+///
+/// A decode failure fails the test rather than being skipped: on this file's surface it is itself a
+/// shape-change signal, and silently dropping it would let a resumed stream that delivers nothing
+/// *readable* look the same as one that delivers nothing at all.
+async fn collect_until<S, F>(
+    stream: &mut S,
+    deadline: Instant,
+    mut is_last: F,
+) -> Vec<MarketEvent<MarketDataInstrument, PublicTrade>>
+where
+    S: Stream<Item = Result<MarketEvent<MarketDataInstrument, PublicTrade>, DataError>> + Unpin,
+    F: FnMut(&MarketEvent<MarketDataInstrument, PublicTrade>) -> bool,
+{
+    let mut collected = Vec::new();
+
+    let _ = tokio::time::timeout_at(deadline, async {
+        while let Some(item) = stream.next().await {
+            let event = item.expect("the market stream yielded an error instead of an event");
+            let last = is_last(&event);
+            collected.push(event);
+
+            if last {
+                break;
+            }
+        }
+    })
+    .await;
+
+    collected
+}
+
+/// Resumption, end to end against the real provider: disconnect, wait, reconnect, and check the
+/// seam.
+///
+/// # Why this cannot be a synthetic test
+///
+/// Every other resume test in this repository asserts the *client* half of the contract — that the
+/// watermark advances on delivery, that `start` carries the stored instant to the microsecond, that
+/// the replayed prefix is skipped by position. All of them are checked against frames this
+/// repository wrote, so all of them would keep passing if the provider changed the *server* half:
+/// if `start` stopped being inclusive, stopped being honoured at microsecond resolution, or began
+/// replaying from somewhere other than where it was pointed. That half has only ever been verified
+/// by hand. This makes it repeatable.
+///
+/// # What the two bounds actually separate
+///
+/// After the pause, a stream that consulted the watermark and one that ignored it look identical in
+/// every respect but one: where their first event is *stamped*. A live-only resubscribe begins at
+/// the reconnect — a whole [`RESUME_PAUSE`] past the watermark. A resumed one begins at the
+/// watermark itself. So the earliest resumed instant is required to sit **at or after** the
+/// watermark (nothing already delivered is served a second time, which is what a mis-scaled or
+/// timezone-shifted `start` would cause) and **no later than** a small tolerance past it (the
+/// window was really replayed). Reaching a live instant afterwards is required too, so the check
+/// covers the whole pause rather than only its first tick.
+///
+/// # ⚠️ What it deliberately does NOT decide
+///
+/// **The tie-group prefix.** `start` is inclusive, so the provider re-serves every tick sharing the
+/// watermark instant and the transformer drops the ones already delivered by position. Deciding
+/// whether it dropped *exactly* the right number needs the provider's own total at that instant,
+/// which is not observable — and inferring it from the tick signatures is not available either,
+/// because identical consecutive ticks are genuine on this feed and are never de-duplicated, so a
+/// legitimate repeat and a re-delivered duplicate are the same bytes. The counts on both sides of
+/// the seam are therefore printed rather than asserted; the positional arithmetic itself is covered
+/// exactly, against known totals, by the transformer's unit tests. Crypto also quantises to the
+/// millisecond, which is why a rounding error in `start` cannot be caught here — that is what
+/// `the_epoch_form_round_trips_an_instant_to_the_microsecond` is for.
+#[tokio::test]
+#[ignore = "opens two live connections and pauses between them; run on demand"]
+async fn a_resumed_reconnect_replays_from_the_watermark_rather_than_from_now() {
+    let Some(subscriber) = subscriber() else {
+        return;
+    };
+
+    // Crypto for the same reason the delivery test uses it: it never closes, so a pause of a known
+    // length is a window of known content rather than possibly a shut market.
+    let state = Arc::new(LseResumeState::new());
+    let subscriber = subscriber.with_resume(Arc::clone(&state));
+    let subscriptions = [
+        Subscription::<LseCrypto, MarketDataInstrument, PublicTrades>::new(
+            LseCrypto::default(),
+            spot("btc"),
+            PublicTrades,
+        ),
+    ];
+
+    // First connection: take enough ticks to seed a watermark, then hang up.
+    let mut opened = connection(&subscriber, &subscriptions).await;
+    let mut taken = 0;
+    let delivered = collect_until(&mut opened, Instant::now() + DELIVERY_TIMEOUT, |_| {
+        taken += 1;
+        taken >= TICKS_BEFORE_DISCONNECT
+    })
+    .await;
+    drop(opened);
+
+    let watermark = delivered
+        .last()
+        .map(|event| event.time_exchange)
+        .expect("a continuously-traded symbol delivered no tick to resume from");
+    for event in &delivered {
+        assert_stamped_plausibly(&event.instrument, event.time_exchange, MAX_TICK_AGE);
+    }
+    println!(
+        "CANARY: {} tick(s) taken, watermark {watermark}",
+        delivered.len()
+    );
+
+    tokio::time::sleep(RESUME_PAUSE).await;
+
+    // Second connection: the same subscriber, so the same resume state, which is exactly what the
+    // reconnecting stream does when it re-runs the subscribe.
+    let mut resumed_stream = connection(&subscriber, &subscriptions).await;
+    let reopened_at = Utc::now();
+    let resumed = collect_until(
+        &mut resumed_stream,
+        Instant::now() + DELIVERY_TIMEOUT,
+        |event| event.time_exchange >= reopened_at,
+    )
+    .await;
+
+    for event in &resumed {
+        assert_stamped_plausibly(&event.instrument, event.time_exchange, MAX_TICK_AGE);
+    }
+
+    let earliest = resumed
+        .iter()
+        .map(|event| event.time_exchange)
+        .min()
+        .expect("the resumed subscription delivered no tick at all");
+
+    assert!(
+        earliest >= watermark,
+        "the resumed stream served {earliest}, which is before the watermark {watermark} - the \
+         provider replayed further back than it was asked to, or `start` no longer means what this \
+         integration sends it as, and events already delivered are being served again",
+    );
+    assert!(
+        earliest - watermark <= RESUME_GAP_TOLERANCE,
+        "the resumed stream began at {earliest}, {} past the watermark {watermark} after a \
+         {RESUME_PAUSE:?} pause - the historical window was not replayed, so the reconnect left \
+         the gap resumption exists to close",
+        earliest - watermark,
+    );
+    assert!(
+        resumed
+            .last()
+            .is_some_and(|event| event.time_exchange >= reopened_at),
+        "the resumed stream never reached a live instant within {DELIVERY_TIMEOUT:?} - it began at \
+         the watermark but did not deliver the whole pause, so the window is covered at its start \
+         and not at its end",
+    );
+
+    // Reported, not asserted -- see the note on the tie-group prefix above.
+    println!(
+        "CANARY_OK: resumed at {earliest} from watermark {watermark} after a {RESUME_PAUSE:?} \
+         pause, {} tick(s) replayed to catch up ({} delivered at the watermark instant before the \
+         disconnect, {} served at it after)",
+        resumed.len(),
+        delivered
+            .iter()
+            .filter(|event| event.time_exchange == watermark)
+            .count(),
+        resumed
+            .iter()
+            .filter(|event| event.time_exchange == watermark)
+            .count(),
+    );
 }

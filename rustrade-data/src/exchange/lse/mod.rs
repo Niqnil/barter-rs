@@ -120,14 +120,14 @@ use self::{
     subscription::LseSubResponse,
 };
 use crate::{
-    ExchangeWsStream, NoInitialSnapshots,
+    NoInitialSnapshots,
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
     subscriber::validator::WebSocketSubValidator,
     subscription::{book::OrderBooksL1, trade::PublicTrades},
 };
 use rustrade_instrument::exchange::ExchangeId;
-use rustrade_integration::protocol::websocket::{WebSocketSerdeParser, WsMessage};
+use rustrade_integration::protocol::websocket::WsMessage;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, marker::PhantomData};
 use url::Url;
@@ -140,14 +140,6 @@ use url::Url;
 /// least eight concurrent authenticated connections on one key when measured; the binding
 /// constraint is the per-connection subscription cap, not the connection count.
 pub const WEBSOCKET_URL: &str = "wss://data-ws.londonstrategicedge.com";
-
-/// The stock WebSocket stream, parameterised by transformer.
-///
-/// Published for parity with the other exchange integrations, each of which exposes an alias of
-/// this shape. Subscriptions are **not** served over it: that is [`LseStream`], which is what
-/// carries a caller's resume state into the transformer. A stream assembled through this alias has
-/// no seam to carry it and would replay without skipping.
-pub type LseWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// The London Strategic Edge live market data connector.
 ///
@@ -309,5 +301,34 @@ where
         S: serde::ser::Serializer,
     {
         serializer.serialize_str(Server::ID.as_str())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+
+    /// The connector is hand-serialised rather than derived, so nothing else pins that the two
+    /// halves agree — a `Subscription` carrying one would otherwise fail to round-trip through a
+    /// config file with no compile-time signal.
+    #[test]
+    fn a_connector_round_trips_through_its_exchange_id() {
+        let json = serde_json::to_string(&LseCrypto::default()).unwrap();
+        assert_eq!(json, r#""lse_crypto""#);
+
+        assert_eq!(
+            serde_json::from_str::<LseCrypto>(&json).unwrap(),
+            LseCrypto::default()
+        );
+    }
+
+    /// Every dataset connector is a distinct type over one endpoint, so deserialising a config that
+    /// names a *different* dataset must fail rather than silently produce this one and subscribe
+    /// the wrong venue's symbology.
+    #[test]
+    fn a_connector_rejects_another_datasets_identifier() {
+        let error = serde_json::from_str::<LseCrypto>(r#""lse_fx""#).unwrap_err();
+        assert!(error.to_string().contains("lse_crypto"), "{error}");
     }
 }
