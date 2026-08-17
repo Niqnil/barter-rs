@@ -1,13 +1,17 @@
+use super::Lse;
 use crate::exchange::lse::error::LseError;
 use crate::subscription::candle::CandleInterval;
+use crate::{Identifier, instrument::MarketInstrumentData, subscription::Subscription};
 use rustrade_instrument::asset::name::AssetNameInternal;
 use rustrade_instrument::instrument::name::InstrumentNameExchange;
 use rustrade_instrument::instrument::quote::InstrumentQuoteAsset;
 use rustrade_instrument::{
-    Underlying, asset::name::AssetNameExchange, exchange::ExchangeId, index::IndexedInstruments,
-    instrument::InstrumentIndex, instrument::market_data::kind::MarketDataInstrumentKind,
+    Keyed, Underlying, asset::name::AssetNameExchange, exchange::ExchangeId,
+    index::IndexedInstruments, instrument::InstrumentIndex,
+    instrument::market_data::MarketDataInstrument,
+    instrument::market_data::kind::MarketDataInstrumentKind,
 };
-use smol_str::{SmolStr, StrExt};
+use smol_str::{SmolStr, StrExt, format_smolstr};
 
 /// A London Strategic Edge price dataset.
 ///
@@ -134,6 +138,30 @@ impl LseDataset {
             | Self::CurrencyIndex
             | Self::Volatility
             | Self::Futures => MarketDataInstrumentKind::Cfd,
+        }
+    }
+
+    /// The category label the WebSocket handshake reports for this dataset's symbols, where it
+    /// reports one at all.
+    ///
+    /// # ⚠️ `None` is the common case, not the exception
+    /// The handshake publishes no category for roughly half the symbols it offers, and some
+    /// entries carry neither a category nor a name. `None` here therefore means *the provider does
+    /// not label this dataset*, not *unknown* — so a symbol arriving without a category can never
+    /// be treated as contradicting the dataset it was requested on.
+    ///
+    /// These labels are the provider's own spelling and are deliberately not derived from
+    /// [`as_catalog_str`](Self::as_catalog_str): the two vocabularies differ (`etf` against
+    /// `ETFs`, `index` against `Indices`) and neither is a transformation of the other.
+    pub fn ws_category(&self) -> Option<&'static str> {
+        match self {
+            Self::Stocks => Some("Stocks"),
+            Self::Etf => Some("ETFs"),
+            Self::Crypto => Some("Crypto"),
+            Self::Fx => Some("Forex"),
+            Self::Index => Some("Indices"),
+            Self::Commodity => Some("Commodities"),
+            Self::InterestRates | Self::CurrencyIndex | Self::Volatility | Self::Futures => None,
         }
     }
 }
@@ -442,6 +470,115 @@ pub fn candle_interval_str(interval: CandleInterval) -> Option<&'static str> {
 #[must_use]
 pub fn supports_candle_interval(interval: CandleInterval) -> bool {
     candle_interval_str(interval).is_some()
+}
+
+/// How a dataset spells the display symbol the WebSocket subscribes on.
+///
+/// The provider uses two spellings and each dataset uses exactly one, which is what the per-dataset
+/// [`ExchangeId`] split buys at this boundary: the shape is known statically from the connector
+/// type, so no runtime discriminator is needed to reconstruct a symbol.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum LseSymbolShape {
+    /// `BASE/QUOTE` — FX, crypto and CFDs: `EUR/USD`, `BTC/USD`, `SPX500/USD`, `VIX/USD`.
+    Pair,
+    /// A bare ticker, venue suffix included — equities and futures: `AAPL`, `BP.L`, `ES.F`.
+    Bare,
+}
+
+/// A London Strategic Edge WebSocket server, and the symbol spelling its dataset uses.
+///
+/// Implemented by each `LseServer*` marker type. It exists so the symbol reconstruction below can
+/// be written once per instrument representation rather than once per representation *per server*,
+/// and so each dataset's spelling is declared in exactly one place and cannot drift from it.
+pub trait LseServer: crate::exchange::ExchangeServer {
+    /// The spelling this dataset's display symbols take.
+    const SYMBOL_SHAPE: LseSymbolShape;
+}
+
+/// A London Strategic Edge display symbol, as the WebSocket expects it.
+///
+/// This is the provider's own display symbol — the same key its REST vault serves candles on, not
+/// a slug. See [`slug`] for why the two are not interchangeable.
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct LseMarket(pub SmolStr);
+
+impl AsRef<str> for LseMarket {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for LseMarket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Reconstruct a display symbol from a registered instrument's assets.
+///
+/// The provider normalises case server-side (`eur/usd` is confirmed as `EUR/USD`), but the symbol
+/// is also the key of the instrument map a tick is resolved through, so it is uppercased here to
+/// match what the server will echo back on the tick.
+///
+/// The base asset's venue suffix is deliberately *not* stripped — see [`underlying`], which retains
+/// it for the same reason: `BP.L` and `BP` are different instruments in different currencies.
+fn market_symbol(
+    shape: LseSymbolShape,
+    base: &AssetNameInternal,
+    quote: &AssetNameInternal,
+) -> LseMarket {
+    match shape {
+        LseSymbolShape::Pair => LseMarket(format_smolstr!(
+            "{}/{}",
+            base.name().to_uppercase_smolstr(),
+            quote.name().to_uppercase_smolstr()
+        )),
+        LseSymbolShape::Bare => LseMarket(base.name().to_uppercase_smolstr()),
+    }
+}
+
+impl<Server, Kind> Identifier<LseMarket> for Subscription<Lse<Server>, MarketDataInstrument, Kind>
+where
+    Server: LseServer,
+{
+    fn id(&self) -> LseMarket {
+        market_symbol(
+            Server::SYMBOL_SHAPE,
+            &self.instrument.base,
+            &self.instrument.quote,
+        )
+    }
+}
+
+impl<Server, InstrumentKey, Kind> Identifier<LseMarket>
+    for Subscription<Lse<Server>, Keyed<InstrumentKey, MarketDataInstrument>, Kind>
+where
+    Server: LseServer,
+{
+    fn id(&self) -> LseMarket {
+        market_symbol(
+            Server::SYMBOL_SHAPE,
+            &self.instrument.value.base,
+            &self.instrument.value.quote,
+        )
+    }
+}
+
+/// Takes the exchange-side name as given, so it needs no per-dataset shape: the caller has already
+/// supplied the provider's own symbol, and there is nothing to reconstruct.
+///
+/// Case is still normalised, for the same reason the reconstruction path normalises it: the symbol
+/// is the instrument-map key a tick resolves through, and the provider echoes `EUR/USD` on the tick
+/// however the subscribe spelled it. A lowercase `name_exchange` would be *confirmed*, then tick
+/// under a key the map does not hold and deliver nothing — the silent failure the reconstruction
+/// path already avoids, and there is no reason for this path to keep it. On a correctly spelled
+/// exchange name the call is a no-op.
+impl<Server, InstrumentKey, Kind> Identifier<LseMarket>
+    for Subscription<Lse<Server>, MarketInstrumentData<InstrumentKey>, Kind>
+{
+    fn id(&self) -> LseMarket {
+        LseMarket(self.instrument.name_exchange.name().to_uppercase_smolstr())
+    }
 }
 
 #[cfg(test)]
@@ -761,6 +898,154 @@ mod tests {
                 ),
                 "{dataset:?} maps to an unsupported (exchange, kind) pair"
             );
+        }
+    }
+
+    mod market_symbol_reconstruction {
+        use super::*;
+        use crate::exchange::lse::{
+            LseCfd, LseServerCfd, LseServerCrypto, LseServerEquities, LseServerFutures, LseServerFx,
+        };
+        use crate::subscription::trade::PublicTrades;
+
+        /// Build a subscription for `Server` and resolve it to the symbol it would subscribe on.
+        ///
+        /// The return type is what selects `Identifier<LseMarket>` over the `Identifier<LseChannel>`
+        /// impl the same subscription also carries.
+        fn market_of<Server>(base: &str, quote: &str, kind: MarketDataInstrumentKind) -> LseMarket
+        where
+            Server: LseServer,
+        {
+            let subscription: Subscription<Lse<Server>, MarketDataInstrument, PublicTrades> =
+                Subscription::from((Lse::<Server>::default(), base, quote, kind, PublicTrades));
+
+            subscription.id()
+        }
+
+        #[test]
+        fn pair_shaped_datasets_reconstruct_base_slash_quote() {
+            assert_eq!(
+                market_of::<LseServerFx>("eur", "usd", MarketDataInstrumentKind::Spot).as_ref(),
+                "EUR/USD"
+            );
+            assert_eq!(
+                market_of::<LseServerCrypto>("btc", "usd", MarketDataInstrumentKind::Spot).as_ref(),
+                "BTC/USD"
+            );
+            assert_eq!(
+                market_of::<LseServerCfd>("spx500", "usd", MarketDataInstrumentKind::Cfd).as_ref(),
+                "SPX500/USD"
+            );
+        }
+
+        #[test]
+        fn bare_shaped_datasets_reconstruct_the_ticker_alone() {
+            assert_eq!(
+                market_of::<LseServerEquities>("aapl", "usd", MarketDataInstrumentKind::Spot)
+                    .as_ref(),
+                "AAPL"
+            );
+        }
+
+        /// The suffix is part of the base asset, and dropping it would subscribe to the US listing
+        /// while the engine marks the London one — a different instrument in a different currency.
+        #[test]
+        fn a_venue_suffix_survives_symbol_reconstruction() {
+            assert_eq!(
+                market_of::<LseServerEquities>("bp.l", "gbx", MarketDataInstrumentKind::Spot)
+                    .as_ref(),
+                "BP.L"
+            );
+            assert_eq!(
+                market_of::<LseServerFutures>("es.f", "usd", MarketDataInstrumentKind::Cfd)
+                    .as_ref(),
+                "ES.F"
+            );
+        }
+
+        /// The reconstructed symbol is the instrument-map key a tick is resolved through, so it
+        /// must match the casing the provider echoes back rather than the caller's spelling.
+        #[test]
+        fn reconstruction_uppercases_however_the_instrument_was_registered() {
+            assert_eq!(
+                market_of::<LseServerFx>("EuR", "uSd", MarketDataInstrumentKind::Spot).as_ref(),
+                "EUR/USD"
+            );
+        }
+
+        /// Reconstruction must invert the split the rest of the integration derives assets with,
+        /// or the WebSocket and the REST vault would disagree about what one instrument is called.
+        ///
+        /// The shape comes from the dataset's own [`LseServer::SYMBOL_SHAPE`] rather than being
+        /// inferred from the symbol. Inferring it is what [`underlying`] already does, so deriving
+        /// both halves the same way would make the round trip agree with itself no matter what the
+        /// connectors declare — and a connector declaring the wrong shape is precisely the failure
+        /// that produces an unsubscribable symbol, since [`market_symbol`] dispatches on the
+        /// declaration and not on the string.
+        #[test]
+        fn reconstruction_inverts_the_underlying_split() {
+            fn round_trips<Server>(symbol: &str)
+            where
+                Server: LseServer,
+            {
+                let split = underlying(symbol);
+
+                let rebuilt = market_symbol(
+                    Server::SYMBOL_SHAPE,
+                    &AssetNameInternal::new(split.base.name().clone()),
+                    &AssetNameInternal::new(split.quote.name().clone()),
+                );
+
+                assert_eq!(
+                    rebuilt.as_ref(),
+                    symbol,
+                    "{symbol} does not survive a round trip through {:?}, the shape its dataset \
+                     declares",
+                    Server::SYMBOL_SHAPE,
+                );
+            }
+
+            round_trips::<LseServerFx>("EUR/USD");
+            round_trips::<LseServerCrypto>("BTC/USD");
+            round_trips::<LseServerCfd>("VIX/USD");
+            round_trips::<LseServerEquities>("AAPL");
+            round_trips::<LseServerEquities>("BP.L");
+            round_trips::<LseServerFutures>("ES.F");
+        }
+
+        /// An exchange-side name is the provider's own symbol, so it is used as given rather than
+        /// rebuilt through the dataset's shape.
+        #[test]
+        fn an_exchange_named_instrument_is_taken_verbatim() {
+            assert_eq!(
+                market_of_exchange_named("XAU/USD").as_ref(),
+                "XAU/USD",
+                "a correctly spelled exchange name must pass through untouched",
+            );
+        }
+
+        /// The one normalisation that still applies, and why: the symbol is the instrument-map key
+        /// a tick resolves through, and the provider echoes the uppercase spelling on the tick
+        /// whatever the subscribe said. Left alone, a lowercase name would be confirmed and then
+        /// tick under a key the map does not hold.
+        #[test]
+        fn an_exchange_named_instrument_is_uppercased_like_a_reconstructed_one() {
+            assert_eq!(market_of_exchange_named("xau/usd").as_ref(), "XAU/USD");
+            assert_eq!(market_of_exchange_named("bp.l").as_ref(), "BP.L");
+        }
+
+        fn market_of_exchange_named(name_exchange: &str) -> LseMarket {
+            let subscription = Subscription {
+                exchange: LseCfd::default(),
+                instrument: MarketInstrumentData {
+                    key: 0_usize,
+                    name_exchange: InstrumentNameExchange::new(name_exchange),
+                    kind: MarketDataInstrumentKind::Cfd,
+                },
+                kind: PublicTrades,
+            };
+
+            subscription.id()
         }
     }
 }

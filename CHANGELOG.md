@@ -195,6 +195,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **⚠️ Licensing:** as above — the retrieved data is **not redistributable**, whatever this crate's
   own licence says. See <https://londonstrategicedge.com/terms>.
 
+- **London Strategic Edge live market data** (`rustrade-data`, `lse` feature): a WebSocket connector
+  per dataset family — `LseFx`, `LseCrypto`, `LseEquities`, `LseFutures`, `LseCfd` — each serving
+  both `PublicTrades` and `OrderBooksL1`. The provider publishes exactly **one** data frame, a
+  price with a bid, an ask and a size, so the two kinds are two decodings of the same tick rather
+  than two channels; the subscription kind decides what an event becomes, not what is asked for on
+  the wire. There is **no candle channel at all** — this provider's candles are a REST-only product,
+  so no `Candles` support is declared. Authentication is a *message* rather than a header and
+  subscriptions are accepted only after the server answers it, so the integration ships its own
+  `LseSubscriber` (`LseCredentials`, or `from_env` on `LSE_API_KEY`, whose errors name the variable
+  and never its value). Timestamps arrive in three encodings — RFC-3339 with `T`, the same with a
+  space separator, and a bare float epoch on replayed ticks — and a decoder accepting only the first
+  would silently drop five of the thirteen dataset families. Every spelling is quantised to
+  **microseconds**, the provider's own resolution and the one its replay filter honours: an
+  RFC-3339 string carrying seven fractional digits otherwise decodes to 100 ns while the float
+  spelling of the same instant cannot, and the resume arithmetic compares instants for equality.
+  Symbols are decoded as owned strings rather than borrowed slices: every symbol on this feed
+  contains a `/`, RFC 8259 permits spelling that `\/`, and a borrowed decode cannot unescape one.
+  **Pre-subscribe guards, because this surface fails quietly.** An unknown symbol is *confirmed*
+  rather than rejected and then never ticks, and the connection-wide 16-subscription cap is reported
+  without naming the symbol that breached it. So the whole batch is validated against the symbol
+  list the authentication response already carries, before anything is sent: an unoffered symbol or
+  an over-cap batch fails loudly and consumes **no** subscription slot. The response's per-symbol
+  category is cross-checked only when it is both present *and* a label some dataset is known by,
+  since it is absent for roughly half the catalog: neither a missing field nor a label this
+  integration does not recognise is a contradiction — only one belonging to a *different* dataset
+  is evidence of anything. A rejection raised *after* the handshake completes — a later
+  `LIMIT_REACHED`, an `INVALID_START` on a resumed symbol, a credential that expired mid-connection
+  — is decoded on the stream and logged rather than discarded: the subscription validator has
+  stopped reading by then, and because the provider names no symbol in a rejection, the only other
+  sign it ever gave would be a subscription that quietly stopped ticking.
+  **Opt-in resumption across a reconnect** via `LseSubscriber::with_resume(Arc<LseResumeState>)`.
+  A reconnect re-runs the subscribe, so a fixed replay window would re-deliver it in full on every
+  attempt; instead the watermark records, per symbol, the newest delivered instant **and how many
+  events already delivered carry it**, and the resumed subscribe skips exactly that prefix. Both
+  halves are load-bearing: `start` is inclusive and filters at microsecond resolution, so resuming
+  one tick later would silently drop every event at that instant not yet consumed, while flooring it
+  to a coarser resolution would re-serve a whole millisecond of already-delivered events on the
+  families that carry microseconds. It is **off by default** — a resumed subscription is served its
+  entire historical window before a single live tick, and one hour of a busy crypto symbol replayed
+  107,395 ticks. Watermarks are keyed by **dataset, symbol and subscription kind**, because two
+  axes collapse onto the provider's wire identifier: both kinds are decodings of one data frame, and
+  the five dataset connectors share one endpoint and one identifier construction — so `AAPL` as
+  trades and as top-of-book, or `AAPL` on `LseEquities` and on `LseFutures`, all resolve to
+  `tick|AAPL`. Sharing a watermark across either axis lets whichever stream ran ahead set the resume
+  point for the one behind, which then resumes past events it never delivered. Both are therefore
+  closed structurally, and one state serves any set of streams differing in any of the three. What
+  no key can separate is two streams duplicating all three, so **each duplicated
+  `(dataset, symbol, kind)` triple needs its own state** — the one obligation the caller carries,
+  and it is documented on `LseResumeState`.
+  The provider retains 24 hours and clamps a longer request **silently**; the honoured window is
+  announced in a `replay_started` frame that was measured to arrive *after* the subscription
+  confirmation, so the comparison against what was asked for is made on the stream rather than
+  during the handshake, and a clamp is warned about rather than swallowed. This covers reconnects,
+  not process restarts: recovering across a restart needs consumer-side acknowledgement of what was
+  durably stored.
+  **⚠️ Known properties of the feed, not of this decoder, that will silently mislead:** the tick is
+  a **QUOTE, not a print** — its `price` equalled its `bid` on 3,966 of 3,966 sampled ticks across
+  every dataset family — so a `PublicTrade` decoded from it is a bid-side quote wearing a trade's
+  shape and is not evidence a transaction occurred; it carries no trade identifier and no aggressor
+  side, and neither is inferable. `volume` is **genuine on `LseCrypto` and `LseEquities`** (summing
+  it reproduces the provider's own one-minute candle volume to ratio `1.000`) and a **hard-coded
+  `1.0` on `LseFx` and `LseCfd`**, with no in-band signal separating them — a plausible-looking
+  placeholder that aggregates into a legitimate-looking total, making volume-weighted prices and
+  size filters on those two families meaningless rather than imprecise. Identical consecutive ticks
+  are **genuine and are never de-duplicated**: barely a third of a sampled run was unique on
+  `(ts, price, bid, ask, volume)`, yet removing the repeats destroyed volume that otherwise
+  reconciles exactly, so a test pins that both are emitted. Both `OrderBookL1` levels carry a
+  **zero size** — the feed publishes prices only — which prices correctly, since the volume-weighted
+  mid falls back to the plain mid, but must not be read as available quantity. A zero **price** is
+  the opposite case and decodes to `None` rather than to a level: the provider publishes `0.0` for a
+  side it holds no quote for, and it is exactly the fallback that makes the zero *sizes* harmless
+  which makes a zero price dangerous — `mid_price` requires only that both sides be `Some` and then
+  averages whatever prices they carry, so a real ask of `42001` against a published zero bid would
+  price the instrument at `21000.5`, indistinguishably from a genuine quote.
+  Runnable end to end: `lse_market_data` (`rustrade-data`) streams the raw feed, and
+  `engine_sync_with_lse_market_data_and_mock_execution` (`rustrade`) prices engine instruments from
+  it while routing orders to a different, mocked venue — this provider offers no execution, so a
+  `DataVenue` is how a live system uses it.
+  **⚠️ Licensing:** as above — the retrieved data is **not redistributable**, whatever this crate's
+  own licence says. See <https://londonstrategicedge.com/terms>.
+
 - **`CandleInterval` gains the sub-minute resolutions `Sec5`, `Sec15` and `Sec30`**
   (`rustrade-data`, `subscription::candle`). `CandleInterval` is the venue-agnostic *union* of
   every resolution any connector serves, and providers exist that publish `5s`/`15s`/`30s` bars
