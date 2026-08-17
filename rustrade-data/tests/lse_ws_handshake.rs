@@ -201,29 +201,41 @@ impl Harness {
         Self { subscribes, served }
     }
 
-    /// The subscribe payloads that reached the socket, in the order they arrived.
+    /// A sample of the subscribe payloads recorded so far, in the order they arrived.
     ///
-    /// Sound only once every payload the client intends to send has been answered — on the success
-    /// path, where `subscribe` returns after the last confirmation, which the server sends *after*
-    /// recording. On a rejection path use [`Self::drained`] instead: a payload written to the
-    /// socket and not yet read by the server is indistinguishable here from one never sent, so
-    /// sampling would report a guard as running before the first send when it ran after it.
+    /// # ⚠️ Sound for content assertions only, never for counts
+    /// The server task is still running and still writing to this vector. What is safe to conclude
+    /// from a sample is that a payload *present* in it was really sent, and what it contained —
+    /// so this is the right tool for asserting the shape of a payload already known to exist,
+    /// which is what the confirmation the client just returned on establishes.
+    ///
+    /// It cannot say how many were sent, or that none was. A payload written to the socket and not
+    /// yet read by the server is indistinguishable here from one never sent, so an assertion on
+    /// `len()` would report a guard as running before the first send when it ran after it, and a
+    /// duplicate subscribe as absent when it was merely late. Those need [`Self::drained`], which
+    /// waits for the server to finish reading rather than sampling it mid-write.
     fn subscribes(&self) -> Vec<Value> {
         self.subscribes.lock().unwrap().clone()
     }
 
     /// Everything that reached the socket, read after the connection has closed.
     ///
-    /// A rejected batch drops the client's connection as it returns, which ends the server's read
-    /// loop — so awaiting that loop is what makes "nothing was sent" an observation rather than a
-    /// guess about timing. Never call this while the connection is still held open: on the success
-    /// path the client keeps it, and there would be nothing to await.
+    /// The server's read loop ends when the client's end of the connection goes away, so awaiting
+    /// that loop is what turns "nothing more was sent" from a guess about timing into an
+    /// observation. This is the only sound basis for a count.
+    ///
+    /// The connection must already be closing when this is called:
+    /// - on a **rejection** path, `subscribe` drops it as it returns, so nothing more is needed;
+    /// - on a **success** path the client keeps it, so drop the [`Subscribed`] first — and read
+    ///   anything wanted from it beforehand, since dropping it takes the buffered events with it.
+    ///
+    /// [`Subscribed`]: rustrade_data::subscriber::Subscribed
     async fn drained(self) -> Vec<Value> {
         let Self { subscribes, served } = self;
 
         tokio::time::timeout(std::time::Duration::from_secs(5), served)
             .await
-            .expect("the connection should have closed once the client rejected the batch")
+            .expect("the connection should have closed once the client released it")
             .expect("the harness server panicked");
 
         subscribes.lock().unwrap().clone()
@@ -361,10 +373,23 @@ async fn a_full_handshake_subscribes_each_distinct_symbol_exactly_once() {
     ];
     let subscribed = subscriber().subscribe(&subscriptions).await.unwrap();
 
-    assert_eq!(symbols(&harness.subscribes()), vec!["BTC/USD", "ETH/USD"]);
-    assert_eq!(subscribed.map.0.len(), 2);
-    assert!(subscribed.map.0.contains_key(&subscription_id("btc")));
-    assert!(subscribed.buffered_websocket_events.is_empty());
+    // Read the client's side before releasing the connection: dropping `Subscribed` takes the
+    // buffered events with it.
+    let instruments = subscribed.map.0.len();
+    let maps_btc = subscribed.map.0.contains_key(&subscription_id("btc"));
+    let buffered = subscribed.buffered_websocket_events.len();
+
+    // "Exactly once" is a count, so it needs the server to have finished reading rather than a
+    // sample of it mid-write -- a duplicate subscribe still in flight would otherwise read as
+    // absent, which is the very thing this test is here to rule out. Dropping the connection ends
+    // the server's read loop, and `drained` waits for it.
+    drop(subscribed);
+    let sent = harness.drained().await;
+
+    assert_eq!(symbols(&sent), vec!["BTC/USD", "ETH/USD"]);
+    assert_eq!(instruments, 2);
+    assert!(maps_btc);
+    assert_eq!(buffered, 0);
 }
 
 /// A live subscribe carries the symbol and nothing else — no replay window is opened for a
@@ -374,12 +399,16 @@ async fn a_full_handshake_subscribes_each_distinct_symbol_exactly_once() {
 async fn a_subscriber_without_resume_opens_no_replay_window_on_the_wire() {
     let harness = Harness::start(Script::default()).await;
 
-    subscriber()
+    let subscribed = subscriber()
         .subscribe(&[subscription("btc")])
         .await
         .unwrap();
 
-    let sent = harness.subscribes();
+    // The claim is that *no* payload carried a window, which is a statement about every payload
+    // sent and so needs the drained view rather than a sample of it.
+    drop(subscribed);
+    let sent = harness.drained().await;
+
     assert_eq!(sent.len(), 1);
     assert_eq!(
         sent[0],
@@ -519,8 +548,8 @@ async fn frames_arriving_during_validation_are_buffered_rather_than_dropped() {
         .await
         .unwrap();
 
-    assert_eq!(symbols(&harness.subscribes()), vec!["BTC/USD"]);
-
+    // Collected before the connection is released, because dropping `Subscribed` takes the
+    // buffered events with it.
     let buffered = subscribed
         .buffered_websocket_events
         .iter()
@@ -531,6 +560,9 @@ async fn frames_arriving_during_validation_are_buffered_rather_than_dropped() {
             other => panic!("unexpected buffered frame: {other:?}"),
         })
         .collect::<Vec<_>>();
+
+    drop(subscribed);
+    assert_eq!(symbols(&harness.drained().await), vec!["BTC/USD"]);
 
     assert_eq!(
         buffered.len(),

@@ -141,6 +141,13 @@ use http as _;
 // only when that feature is off.)
 #[cfg(test)]
 use {hex as _, sha2 as _, tempfile as _};
+// tokio_tungstenite is a dev-dependency for the `lse` WebSocket handshake test
+// (tests/lse_ws_handshake.rs), which speaks the server half of the protocol in-process and compiles
+// as a separate unit. It is *also* a non-dev dependency under the `massive` feature, where the lib
+// itself uses it -- so this stub matters only when that feature is off, and the `cfg(test)` gate is
+// load-bearing: an unconditional `use` would fail to resolve in a non-test build without `massive`.
+#[cfg(test)]
+use tokio_tungstenite as _;
 
 use crate::{
     error::DataError,

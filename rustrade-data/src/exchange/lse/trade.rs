@@ -36,7 +36,9 @@ use smol_str::SmolStr;
 /// # ⚠️ Identical consecutive ticks are REAL and are both emitted
 /// This decoder performs no de-duplication, deliberately. See
 /// [`LseTick`](super::tick::LseTick) for the reconciliation that proves the repeats are distinct
-/// prints, and `identical_consecutive_ticks_are_both_emitted` for the test that pins it.
+/// prints. The property is pinned by `identical_live_ticks_are_never_deduplicated` in
+/// [`transformer`](super::transformer), which is the only place a filter could be added: this
+/// impl is a stateless `From` and has nothing to remember a previous tick with.
 impl<InstrumentKey> From<(ExchangeId, InstrumentKey, LseMessage)>
     for MarketIter<InstrumentKey, PublicTrade>
 {
@@ -116,11 +118,14 @@ mod tests {
         assert_eq!(events[0].kind.side, None);
     }
 
-    /// The feed republishes identical ticks and they are genuine distinct prints: de-duplicating a
-    /// sampled run destroyed 3–10% of volume that otherwise reconciles exactly against the
-    /// provider's own candles. This test exists so the "obvious" filter is not added later.
+    /// Two identical frames decode to two identical events, which is what makes the repeats
+    /// indistinguishable downstream and therefore what a de-duplication filter would key on. The
+    /// filter itself could only live in the transformer, which is stateful — see
+    /// `identical_live_ticks_are_never_deduplicated` there for the property that pins its absence.
+    /// This decoder is a stateless `From`, so what it pins is narrower: the decode carries no
+    /// distinguishing mark that would let one of the two be dropped.
     #[test]
-    fn identical_consecutive_ticks_are_both_emitted() {
+    fn identical_consecutive_ticks_decode_to_identical_events() {
         let json = tick_json("2026-01-02T09:37:24.760146+00:00", "42000.5", "0.00155");
 
         let first = decode(&json);

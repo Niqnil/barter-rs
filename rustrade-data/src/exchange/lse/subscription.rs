@@ -36,14 +36,18 @@ use smol_str::SmolStr;
 pub enum LseSubResponse {
     /// A subscription was accepted, and the connection now holds `count` of its `max` slots.
     ///
-    /// Only `symbol` is required to deserialise. `count` and `max` are reported by the provider and
-    /// modelled for the reader, but nothing acts on them — the cap is enforced before a subscribe
-    /// is sent, against the `authenticated` frame — so requiring them would let a rename or an
-    /// omission upstream turn an arriving confirmation into a ten-second validation timeout
-    /// blaming latency. The same reasoning the [`Error`](Self::Error) variant is built on.
+    /// **No field is required to deserialise**, `symbol` included. All three are reported by the
+    /// provider and modelled for the reader, but nothing acts on any of them: the validator counts
+    /// confirmations rather than matching them to symbols, and the cap is enforced before a
+    /// subscribe is sent, against the `authenticated` frame. Requiring a field nothing reads would
+    /// let a rename or an omission upstream turn an arriving confirmation into a ten-second
+    /// validation timeout blaming latency — and `symbol` is not privileged here, because a
+    /// confirmation that cannot be matched to a request is worth exactly as much as one that can.
+    /// The same reasoning the [`Error`](Self::Error) variant is built on.
     Subscribed {
         /// The symbol, case-normalised by the provider (`eur/usd` is confirmed as `EUR/USD`).
-        symbol: SmolStr,
+        #[serde(default)]
+        symbol: Option<SmolStr>,
         /// Slots held on this connection after the subscription.
         #[serde(default)]
         count: Option<u32>,
@@ -104,7 +108,7 @@ mod tests {
         assert_eq!(
             response,
             LseSubResponse::Subscribed {
-                symbol: "EUR/USD".into(),
+                symbol: Some("EUR/USD".into()),
                 count: Some(1),
                 max: Some(16),
             }
@@ -160,8 +164,8 @@ mod tests {
 
     /// A confirmation that failed to deserialise would fall through to the buffered-events path and
     /// leave the validator waiting out its ten-second timeout for a frame that had already arrived
-    /// — a failure that reads as latency. Nothing consumes these two fields, so nothing is worth
-    /// that.
+    /// — a failure that reads as latency. Nothing consumes any of these fields, `symbol` included,
+    /// so nothing is worth that.
     #[test]
     fn a_confirmation_missing_the_fields_nothing_reads_still_confirms() {
         let response: LseSubResponse =
@@ -170,11 +174,25 @@ mod tests {
         assert_eq!(
             response,
             LseSubResponse::Subscribed {
-                symbol: "EUR/USD".into(),
+                symbol: Some("EUR/USD".into()),
                 count: None,
                 max: None,
             }
         );
         assert!(response.validate().is_ok());
+
+        // The tag alone is enough. The validator counts confirmations rather than matching them to
+        // requests, so a confirmation naming nothing still confirms one.
+        let bare: LseSubResponse = serde_json::from_str(r#"{"type":"subscribed"}"#).unwrap();
+
+        assert_eq!(
+            bare,
+            LseSubResponse::Subscribed {
+                symbol: None,
+                count: None,
+                max: None,
+            }
+        );
+        assert!(bare.validate().is_ok());
     }
 }

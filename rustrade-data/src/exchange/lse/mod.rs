@@ -234,9 +234,16 @@ where
 
     /// One payload per symbol — the provider accepts no batched subscribe.
     ///
-    /// [`LseSubscriber`] builds its payloads with the same helper rather than calling this, because
-    /// a subscription may carry a replay window and this function cannot see one. The two therefore
-    /// agree by construction.
+    /// # ⚠️ Nothing sends what this builds
+    /// [`LseSubscriber`] does not call this: a subscription may carry a replay window and this
+    /// function cannot see one, so the subscriber builds its own payloads and the mapper's output
+    /// is discarded where it does so. This is required by the [`Connector`] contract and is
+    /// implemented faithfully; it is not the route this integration subscribes over.
+    ///
+    /// It shares `subscribe_message` with the live route, so the two cannot disagree about a
+    /// payload's *shape*. They do differ in what they are given: this receives one entry per
+    /// subscription, while the subscriber sends one per *distinct* symbol, because a repeated
+    /// symbol is one slot and one confirmation on this provider.
     fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {
         exchange_subs
             .iter()

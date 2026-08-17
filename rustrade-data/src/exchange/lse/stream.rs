@@ -122,17 +122,19 @@ where
             ));
         }
 
-        // The resume state is partitioned by subscription kind -- see
-        // [`LseResumeKey`](super::resume::LseResumeKey) -- and every subscription in one batch
-        // shares a `Kind`, so the first names it for all of them. An empty batch has nothing to
-        // resume, which is what the `zip` yields.
+        // The resume state is partitioned by dataset and subscription kind -- see
+        // [`LseResumeKey`](super::resume::LseResumeKey). The dataset is `Exchange::ID` and the
+        // transformer reads it there; the kind has no type-level value to read, and every
+        // subscription in one batch shares a `Kind`, so the first names it for all of them. An
+        // empty batch has nothing to resume, which is what the `zip` yields.
         let resume = subscriber.resume_state().zip(
             subscriptions
                 .first()
                 .map(|subscription| subscription.kind.as_str()),
         );
 
-        let mut transformer = LseTransformer::new(instrument_map, ws_sink_tx, resume).await?;
+        let mut transformer =
+            LseTransformer::new(instrument_map, &initial_snapshots, ws_sink_tx, resume).await?;
 
         let mut processed = process_buffered_events::<WebSocketSerdeParser, _>(
             &mut transformer,

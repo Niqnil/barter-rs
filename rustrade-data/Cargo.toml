@@ -143,6 +143,19 @@ databento = { version = "0.54", optional = true, features = ["chrono"] }
 tokio-tungstenite = { version = "0.30", optional = true, features = ["native-tls"] }
 urlencoding = { version = "2.1", optional = true }
 
+# Integration tests whose contents are entirely feature-gated. Without `required-features`, the
+# target still builds with the feature off and libtest reports "0 passed" -- a green run that
+# asserted nothing. Declaring it here makes `cargo test --test <name>` fail with a message naming
+# the missing feature instead.
+
+[[test]]
+name = "lse_ws_handshake"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_ws_canary"
+required-features = ["lse"]
+
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.
 

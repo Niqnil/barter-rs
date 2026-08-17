@@ -150,8 +150,11 @@ impl LseSubscriber {
     /// the provider says it will replay from against what was asked for and warns on a mismatch;
     /// see [`LseMessage::ReplayStarted`](super::tick::LseMessage::ReplayStarted).
     ///
-    /// One state may be shared by any set of streams, including two carrying the same symbol as
-    /// different kinds — watermarks are keyed by subscription *and* kind.
+    /// # ⚠️ One state per duplicated subscription
+    /// Watermarks are keyed by dataset, subscription **and** subscription kind, so one state serves
+    /// any set of streams that differ in any of those three. Two streams that duplicate all three
+    /// share one watermark and advance it independently, which resumes the trailing one past events
+    /// it never delivered — see [`LseResumeState`] for the obligation in full.
     ///
     /// # ⚠️ The replayed prefix is skipped by position, not by the `replay` flag
     /// The provider re-serves every tick sharing the resume instant, and the ones already delivered
@@ -182,6 +185,11 @@ impl LseSubscriber {
     /// here: a symbol added to a batch after a reconnect has no history to resume from and must
     /// not be handed one.
     ///
+    /// `exchange` and `kind` are the other two axes the watermark is filed under. Reading one
+    /// without them would resume this subscription from whatever another dataset or another kind
+    /// last delivered for the same symbol, which is a window that skips events this stream never
+    /// saw.
+    ///
     /// # The watermark's instant is sent unmodified, and that is load-bearing
     /// `start` is **inclusive**, so the provider replays every event carrying it and the
     /// transformer skips the prefix already delivered. Nudging the instant forward here to exclude
@@ -191,10 +199,17 @@ impl LseSubscriber {
     /// filters at microsecond resolution, so a millisecond-floored `start` would re-serve a whole
     /// millisecond of already-delivered, timestamp-distinct events on the datasets that carry
     /// microseconds.
-    fn resume_start(&self, market: &str, kind: &'static str) -> Option<DateTime<Utc>> {
+    fn resume_start(
+        &self,
+        exchange: ExchangeId,
+        market: &str,
+        kind: &'static str,
+    ) -> Option<DateTime<Utc>> {
         self.resume
             .as_ref()
-            .and_then(|state| state.watermark(&LseResumeKey::new(subscription_id(market), kind)))
+            .and_then(|state| {
+                state.watermark(&LseResumeKey::new(exchange, subscription_id(market), kind))
+            })
             .map(|watermark| watermark.time_exchange)
     }
 }
@@ -266,15 +281,15 @@ impl Subscriber for LseSubscriber {
             ws_subscriptions: _,
         } = Self::SubMapper::map::<Exchange, Instrument, Kind>(subscriptions);
 
-        // Every subscription in a batch shares one `Kind`, and a watermark is filed under the kind
-        // it was delivered for -- see `LseResumeKey`. `markets` is empty when `subscriptions` is,
-        // so the loop below never runs without one.
+        // Every subscription in a batch shares one `Kind`, and a watermark is filed under the
+        // dataset and the kind it was delivered for -- see `LseResumeKey`. `markets` is empty when
+        // `subscriptions` is, so the loop below never runs without one.
         let kind = subscriptions
             .first()
             .map(|subscription| subscription.kind.as_str());
 
         for market in &markets {
-            let start = kind.and_then(|kind| self.resume_start(market, kind));
+            let start = kind.and_then(|kind| self.resume_start(exchange, market, kind));
             let message = subscribe_message(market, start);
             debug!(%exchange, payload = ?message, "sending London Strategic Edge subscription");
             websocket
@@ -626,7 +641,7 @@ pub struct LseSymbol {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::exchange::lse::{LseCrypto, LseEquities, LseFx};
+    use crate::exchange::lse::LseFx;
     // `SubscriptionKind` is already in scope through `use super::*`, which is what `as_str` below
     // resolves through.
     use crate::subscription::{book::OrderBooksL1, trade::PublicTrades};
@@ -711,7 +726,7 @@ mod tests {
         let subscriber = LseSubscriber::new(LseCredentials::new("key"));
 
         assert_eq!(
-            subscriber.resume_start("BTC/USD", PublicTrades.as_str()),
+            subscriber.resume_start(ExchangeId::LseCrypto, "BTC/USD", PublicTrades.as_str()),
             None
         );
     }
@@ -722,18 +737,22 @@ mod tests {
     fn a_resuming_subscriber_asks_for_a_window_only_where_it_has_delivered() {
         let state = Arc::new(LseResumeState::new());
         state.record(
-            &LseResumeKey::new(subscription_id("BTC/USD"), PublicTrades.as_str()),
+            &LseResumeKey::new(
+                ExchangeId::LseCrypto,
+                subscription_id("BTC/USD"),
+                PublicTrades.as_str(),
+            ),
             at("2026-08-14T10:16:55.161234Z"),
         );
 
         let subscriber = LseSubscriber::new(LseCredentials::new("key")).with_resume(state);
 
         assert_eq!(
-            subscriber.resume_start("BTC/USD", PublicTrades.as_str()),
+            subscriber.resume_start(ExchangeId::LseCrypto, "BTC/USD", PublicTrades.as_str()),
             Some(at("2026-08-14T10:16:55.161234Z")),
         );
         assert_eq!(
-            subscriber.resume_start("ETH/USD", PublicTrades.as_str()),
+            subscriber.resume_start(ExchangeId::LseCrypto, "ETH/USD", PublicTrades.as_str()),
             None
         );
     }
@@ -745,16 +764,49 @@ mod tests {
     fn a_window_is_asked_for_per_kind_rather_than_per_symbol() {
         let state = Arc::new(LseResumeState::new());
         state.record(
-            &LseResumeKey::new(subscription_id("BTC/USD"), PublicTrades.as_str()),
+            &LseResumeKey::new(
+                ExchangeId::LseCrypto,
+                subscription_id("BTC/USD"),
+                PublicTrades.as_str(),
+            ),
             at("2026-08-14T10:16:55.161234Z"),
         );
 
         let subscriber = LseSubscriber::new(LseCredentials::new("key")).with_resume(state);
 
         assert_eq!(
-            subscriber.resume_start("BTC/USD", OrderBooksL1.as_str()),
+            subscriber.resume_start(ExchangeId::LseCrypto, "BTC/USD", OrderBooksL1.as_str()),
             None,
             "a kind that has delivered nothing must subscribe live, not from another kind's mark",
+        );
+    }
+
+    /// The five dataset connectors share one endpoint and one identifier construction, and the
+    /// `Bare` symbol shape rebuilds a symbol from the base asset alone — so one ticker on two of
+    /// them produces one wire identifier. A window read across that boundary would resume this
+    /// dataset from what a different one delivered.
+    #[test]
+    fn a_window_is_asked_for_per_dataset_rather_than_per_symbol() {
+        let state = Arc::new(LseResumeState::new());
+        state.record(
+            &LseResumeKey::new(
+                ExchangeId::LseEquities,
+                subscription_id("AAPL"),
+                PublicTrades.as_str(),
+            ),
+            at("2026-08-14T10:16:55.161234Z"),
+        );
+
+        let subscriber = LseSubscriber::new(LseCredentials::new("key")).with_resume(state);
+
+        assert_eq!(
+            subscriber.resume_start(ExchangeId::LseEquities, "AAPL", PublicTrades.as_str()),
+            Some(at("2026-08-14T10:16:55.161234Z")),
+        );
+        assert_eq!(
+            subscriber.resume_start(ExchangeId::LseFutures, "AAPL", PublicTrades.as_str()),
+            None,
+            "a dataset that has delivered nothing must subscribe live, not from another's mark",
         );
     }
 
@@ -1015,8 +1067,5 @@ mod tests {
         assert_eq!(expected_categories(ExchangeId::LseFx), vec!["Forex"]);
         assert_eq!(expected_categories(ExchangeId::LseCrypto), vec!["Crypto"]);
         assert!(!expected_categories(ExchangeId::LseCfd).contains(&"Forex"));
-
-        // Referenced so the connector aliases stay exercised by this module's tests.
-        let _ = (LseCrypto::default(), LseEquities::default());
     }
 }

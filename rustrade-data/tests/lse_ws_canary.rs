@@ -51,6 +51,14 @@
 //!   secrets configured", so a mistyped key would report green forever.
 //! - Key present but an assertion fails → **FAIL** (the real signal).
 //!
+//! ## ⚠️ The contract above is invisible without `--nocapture`
+//!
+//! Every skip and every `CANARY_OK` is a `println!`, and libtest **discards stdout for a passing
+//! test**. Run without `--nocapture` — as the command in *Running* below does not — and a skip is
+//! reported as `ok`, identical to a run that exercised every signal. That is why `--nocapture` is
+//! part of the invocation rather than a debugging nicety, and why nothing this file *decides* is
+//! left to a printed line: what must not pass silently is asserted.
+//!
 //! # ⚠️ A closed venue is not a silent one — measured
 //!
 //! One test covers the only venue that reaches the space-separated timestamp spelling, and that
@@ -63,6 +71,18 @@
 //! So that test holds the wide plausibility band unconditionally and reports whether the tight
 //! recency signal was reached at all. A stale-but-plausible instant and a `CANARY_SKIP` line mean
 //! the same thing — rerun while that market is open. Neither is a pass for the signal it names.
+//!
+//! ## ⚠️ Silence must be proved innocent before it is read as a closure
+//!
+//! Tolerating silence opens a hole, and it is the one this whole file is built to close. The error
+//! handler these tests install is a `filter_map`: an item it is called for is **removed** from the
+//! stream. A connection on which every frame failed to decode therefore looks, from below the
+//! handler, exactly like a connection that delivered nothing — so a shape change that broke the
+//! decoder outright would be read as "the market is shut" and reported as a *pass*.
+//!
+//! So decode failures are counted, and the count is asserted zero **before** any silence is
+//! interpreted. Silence is only allowed to mean a closed venue once it is known that nothing
+//! arrived and failed to be read.
 //!
 //! # Running
 //!
@@ -97,7 +117,13 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::time::Instant;
 
 const KEY_ENV: &str = "LSE_API_KEY";
@@ -206,6 +232,45 @@ fn assert_stamped_plausibly(
     );
 }
 
+/// A decode-failure counter, and the error handler that feeds it.
+///
+/// # ⚠️ Printing a decode failure is not reporting it
+/// [`with_error_handler`](ReconnectingStream::with_error_handler) is a `filter_map`: the item it is
+/// called for is **removed** from the stream. So a connection on which every frame failed to decode
+/// looks, from below the handler, exactly like a connection that delivered nothing — and a test
+/// that reads silence as "the market is closed" would report `CANARY_SKIP` and pass, on precisely
+/// the shape change this file exists to catch. A `println!` cannot close that: libtest discards
+/// stdout for a passing test, so the evidence would only exist in a run that already knew to look.
+///
+/// The counter turns it into an assertion. The handler still prints, because the message names
+/// *what* changed and the count only says that something did.
+fn decode_failures() -> (Arc<AtomicUsize>, impl Fn(DataError)) {
+    let failures = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&failures);
+
+    let handler = move |error: DataError| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        println!("CANARY: market stream error: {error:?}");
+    };
+
+    (failures, handler)
+}
+
+/// Fail if any frame failed to decode, whatever else the stream did.
+///
+/// Called **before** any silence is interpreted: a decode failure explains silence, and reading it
+/// as a closed market instead is how this canary would go quiet on a real shape change.
+fn assert_every_frame_decoded(failures: &Arc<AtomicUsize>) {
+    let failed = failures.load(Ordering::Relaxed);
+
+    assert_eq!(
+        failed, 0,
+        "{failed} frame(s) failed to decode - the error handler filters them out of the stream, so \
+         this would otherwise present as silence rather than as a failure. The provider's frame \
+         shape has changed; see the CANARY lines above for what it now sends",
+    );
+}
+
 /// Drive `stream` until every instrument in `expected` has delivered a tick, or the deadline.
 ///
 /// Returns the instruments that never ticked **and** the newest instant seen. The caller decides
@@ -284,22 +349,26 @@ async fn every_subscribed_crypto_symbol_delivers_a_live_tick() {
         .await
         .expect("subscribing to continuously-traded crypto symbols should succeed");
 
-    // Decode failures are reported rather than swallowed: they are themselves a shape-change
-    // signal, and they explain a delivery timeout that would otherwise read as silence.
-    let stream = streams
-        .select_all()
-        .with_error_handler(|error| println!("CANARY: market stream error: {error:?}"));
+    // Decode failures are counted as well as printed: the handler filters them out of the stream,
+    // so an undecodable frame arrives below as nothing at all.
+    let (failures, on_error) = decode_failures();
+    let stream = streams.select_all().with_error_handler(on_error);
 
     // Crypto is the one venue whose staleness is unambiguous, so it carries the tight window.
     let (silent, _newest) =
         collect_first_tick_per_instrument(Box::pin(stream), &expected, MAX_TICK_AGE).await;
 
+    // Before the silence below is read as a missing subscription: a frame that failed to decode
+    // produces the same silence and has a different cause, so diagnosing it as the other would send
+    // a reader after the pre-subscribe guard for a problem in the decoder.
+    assert_every_frame_decoded(&failures);
+
     assert!(
         silent.is_empty(),
-        "{silent:?} were confirmed but delivered no tick in {DELIVERY_TIMEOUT:?} - on a \
-         continuously-traded venue that is the confirmed-then-silent failure this integration's \
-         pre-subscribe guard exists to prevent, which means the guard's symbol list no longer \
-         reflects what the provider actually serves",
+        "{silent:?} were confirmed but delivered no tick in {DELIVERY_TIMEOUT:?}, and every frame \
+         that did arrive decoded - on a continuously-traded venue that is the confirmed-then-silent \
+         failure this integration's pre-subscribe guard exists to prevent, which means the guard's \
+         symbol list no longer reflects what the provider actually serves",
     );
 }
 
@@ -330,17 +399,22 @@ async fn a_cfd_tick_decodes_to_a_plausible_instant() {
         .await
         .expect("subscribing to a published CFD symbol should succeed");
 
-    // Decode failures are reported rather than swallowed: they are themselves a shape-change
-    // signal, and they explain a delivery timeout that would otherwise read as silence.
-    let stream = streams
-        .select_all()
-        .with_error_handler(|error| println!("CANARY: market stream error: {error:?}"));
+    // Decode failures are counted as well as printed: the handler filters them out of the stream,
+    // so an undecodable frame arrives below as nothing at all.
+    let (failures, on_error) = decode_failures();
+    let stream = streams.select_all().with_error_handler(on_error);
 
     // The wide band, because this venue closes. A tick arriving here is not evidence the market is
     // open: a closed session serves its last print, correctly stamped hours or days ago.
     let (silent, newest) =
         collect_first_tick_per_instrument(Box::pin(stream), &expected, MAX_CLOSED_VENUE_TICK_AGE)
             .await;
+
+    // ⚠️ BEFORE the match below, and that ordering is the whole point. This is the one test whose
+    // silence is a legitimate SKIP, so it is the one place where a total decode failure -- the exact
+    // shape change this file exists to catch -- would otherwise be read as "the market is shut" and
+    // reported as a pass.
+    assert_every_frame_decoded(&failures);
 
     // The plausibility assertion already ran inside the collector, on every tick that arrived. What
     // is left is to say which signal was actually reached, because neither outcome below is a pass

@@ -9,6 +9,7 @@ use serde::{
     Deserialize, Deserializer,
     de::{self, Unexpected, Visitor},
 };
+use smol_str::SmolStr;
 use std::fmt;
 
 /// A tick published on the London Strategic Edge WebSocket.
@@ -43,6 +44,25 @@ use std::fmt;
 /// prints: de-duplicating them destroyed 3–10% of the volume that reconciles exactly against the
 /// provider's candles. This is an aggregated cross-venue tape on which identical-size fills at the
 /// same millisecond are ordinary. Do not add a de-duplication filter.
+///
+/// # The four [`Decimal`] fields carry ~15 significant digits, not arbitrary precision
+/// This feed sends prices as JSON **numbers** rather than as strings — it is the only connector in
+/// this crate that does — so they are parsed as `f64` before reaching [`Decimal`]. The ceiling is
+/// therefore the `f64`'s: 15 significant digits survive exactly, and a 17-digit literal like
+/// `10.123456789012345` lands as `10.123456789012344`. The provider's own tick shapes
+/// (`42000.5`, `0.00155`, `16.9`) are nowhere near that, so no observed value loses a digit.
+///
+/// The same ceiling applies on the bulk-export path for the same reason, where it is pinned by
+/// `an_equity_row_deserializes_float_prices_and_an_integer_volume` in
+/// [`historical`](super::historical).
+///
+/// Reading the provider's digits instead of the `f64` is **not available here**, and that is
+/// structural rather than an omission: [`LseMessage`] is internally tagged, so serde buffers the
+/// frame body into its `Content` type before this struct is deserialised, and `Content` stores a
+/// JSON number as an already-parsed `f64`. A raw-text deserialiser — `serde_json::value::RawValue`
+/// — cannot be driven from that buffer at all, for the same reason a borrowed `&str` symbol cannot
+/// (see `de_tick_subscription_id`). Recovering the digits would mean giving up the derived
+/// tagging for a hand-written dispatch on the crate's central wire enum.
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize)]
 pub struct LseTick {
     /// Subscription identifier built from `symbol` during deserialisation.
@@ -94,7 +114,9 @@ pub struct LseTick {
     #[serde(rename = "ts", deserialize_with = "de_timestamp")]
     pub time_exchange: DateTime<Utc>,
 
-    /// The tick price. Equal to [`bid`](Self::bid) on every sample taken; see the type-level note.
+    /// The tick price. Equal to [`bid`](Self::bid) on every sample taken; see the type-level note,
+    /// which also covers the ~15-significant-digit ceiling this and the three fields below decode
+    /// under.
     pub price: Decimal,
 
     /// The bid.
@@ -122,6 +144,11 @@ pub struct LseTick {
 /// this integration does not act on decodes to [`Other`](Self::Other) so a control frame cannot
 /// fail the parse and take the stream down with it; the confirmations that carry meaning to the
 /// *handshake* are decoded by the subscription types instead, where they can be acted on.
+///
+/// Two control frames are modelled rather than collapsed into [`Other`](Self::Other), because both
+/// carry something no other frame does: [`ReplayStarted`](Self::ReplayStarted) is the only evidence
+/// a replay window was clamped, and [`Error`](Self::Error) is the only evidence the provider
+/// rejected something after the handshake stopped reading.
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LseMessage {
@@ -153,6 +180,29 @@ pub enum LseMessage {
         from: DateTime<Utc>,
     },
 
+    /// A rejection raised *after* the handshake completed.
+    ///
+    /// # Why the handshake cannot catch these
+    /// The subscription validator stops reading the socket the moment the last confirmation
+    /// arrives, so every rejection the provider raises afterwards lands here instead — a later
+    /// `LIMIT_REACHED`, an `INVALID_START` on a resumed symbol, a credential that expired
+    /// mid-connection. Collapsed into [`Other`](Self::Other) it would be discarded in silence,
+    /// which is the one thing a rejection must never be: the provider does **not** name the symbol
+    /// it rejected, so the only outward sign is a subscription that stops ticking.
+    ///
+    /// Both fields are optional for the same reason they are on the handshake's own rejection: a
+    /// frame missing one must still decode, because failing the parse on an error frame would take
+    /// the whole stream down over the message that was trying to report a problem.
+    Error {
+        /// The provider's error code — `LIMIT_REACHED` and `INVALID_START` are the two observed.
+        #[serde(default)]
+        code: Option<SmolStr>,
+
+        /// The provider's own diagnostic.
+        #[serde(default)]
+        message: Option<SmolStr>,
+    },
+
     /// Any other frame — a control frame, or one this integration does not model.
     #[serde(other)]
     Other,
@@ -169,20 +219,29 @@ impl Identifier<Option<SubscriptionId>> for LseMessage {
         match self {
             Self::Tick(tick) => Some(tick.subscription_id.clone()),
             // A replay boundary names a subscription but describes the stream rather than a market
-            // event. The transformer consumes it before this point; resolving it to an instrument
-            // would only offer it to a decoder that has nothing to build from it.
-            Self::ReplayStarted { .. } | Self::Other => None,
+            // event, and a rejection names no subscription at all. The transformer consumes both
+            // before this point; resolving either to an instrument would only offer it to a decoder
+            // that has nothing to build from it.
+            Self::ReplayStarted { .. } | Self::Error { .. } | Self::Other => None,
         }
     }
 }
 
 /// Deserialise the tick's `symbol` into the [`SubscriptionId`] it was registered under.
+///
+/// # Why this is not typed as `&str`
+/// Every symbol this feed publishes contains a `/`, and a JSON producer is free to spell that as
+/// the escape `\/` — RFC 8259 lists it among the permitted escapes, and escaping it is common
+/// enough that several encoders do it by default. A borrowed `&str` cannot be produced from an
+/// escaped string, because unescaping needs somewhere to write the result, so a decoder typed that
+/// way fails at runtime on a frame that is entirely legal. `SmolStr` accepts either spelling and
+/// keeps a symbol of this length inline, so nothing is allocated for the ordinary case.
 fn de_tick_subscription_id<'de, D>(deserializer: D) -> Result<SubscriptionId, D::Error>
 where
     D: Deserializer<'de>,
 {
-    <&str as Deserialize>::deserialize(deserializer)
-        .map(|symbol| ExchangeSub::from((LseChannel::Tick, symbol)).id())
+    SmolStr::deserialize(deserializer)
+        .map(|symbol| ExchangeSub::from((LseChannel::Tick, symbol.as_str())).id())
 }
 
 /// Deserialise a WebSocket timestamp from any of the three spellings the provider uses.
@@ -488,12 +547,84 @@ mod tests {
         for input in [
             r#"{"type":"subscribed","symbol":"BTC/USD","count":1,"max":16}"#,
             r#"{"type":"replay_complete","symbol":"BTC/USD","rows":41,"buffered_drained":9}"#,
-            r#"{"type":"error","code":"LIMIT_REACHED","message":"Max 16 symbols"}"#,
             r#"{"type":"welcome","message":"hello","symbols_available":1}"#,
         ] {
             let message: LseMessage = serde_json::from_str(input).unwrap();
             assert_eq!(message, LseMessage::Other, "failed on {input}");
         }
+    }
+
+    /// A rejection raised after the handshake stopped reading is the one control frame that must
+    /// not be discarded in silence — the provider names no symbol, so a swallowed rejection leaves
+    /// a subscription that simply stops ticking as the only sign anything went wrong.
+    #[test]
+    fn a_rejection_decodes_as_an_error_rather_than_being_collapsed_into_other() {
+        let message: LseMessage = serde_json::from_str(
+            r#"{"type":"error","code":"LIMIT_REACHED","message":"Max 16 symbols"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            message,
+            LseMessage::Error {
+                code: Some("LIMIT_REACHED".into()),
+                message: Some("Max 16 symbols".into()),
+            }
+        );
+    }
+
+    /// Failing the parse on an error frame would take the stream down over the message that was
+    /// trying to report a problem, so a rejection missing either field must still decode.
+    #[test]
+    fn a_rejection_missing_its_fields_still_decodes_as_an_error() {
+        let message: LseMessage = serde_json::from_str(r#"{"type":"error"}"#).unwrap();
+
+        assert_eq!(
+            message,
+            LseMessage::Error {
+                code: None,
+                message: None,
+            }
+        );
+    }
+
+    /// The rejection names no subscription, so it must resolve to no instrument — the transformer
+    /// consumes it, and no decoder has a market event to build from it.
+    #[test]
+    fn a_rejection_identifies_no_subscription() {
+        let message: LseMessage =
+            serde_json::from_str(r#"{"type":"error","code":"LIMIT_REACHED"}"#).unwrap();
+
+        assert_eq!(message.id(), None);
+    }
+
+    /// `/` is in every symbol this feed publishes and RFC 8259 permits spelling it `\/`, which
+    /// several JSON encoders do by default. A symbol decoded as a borrowed `&str` cannot survive
+    /// that — unescaping needs somewhere to write — so this pins the owned decode.
+    #[test]
+    fn a_symbol_carrying_an_escaped_solidus_decodes_to_the_same_subscription() {
+        let escaped: LseMessage = serde_json::from_str(
+            r#"{"type":"tick","symbol":"BTC\/USD","ts":"2026-01-02T09:37:24.760146+00:00",
+                "price":42000.5,"bid":42000.5,"ask":42001.0,"volume":0.00155}"#,
+        )
+        .unwrap();
+
+        assert_eq!(escaped.id(), Some(SubscriptionId::from("tick|BTC/USD")));
+
+        // The replay boundary decodes its symbol through the same function, and a clamp that went
+        // undetected because the boundary frame failed to parse would be silent.
+        let boundary: LseMessage = serde_json::from_str(
+            r#"{"type":"replay_started","symbol":"BTC\/USD","from":"2026-01-02T09:37:24+00:00"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            boundary,
+            LseMessage::ReplayStarted {
+                subscription_id: SubscriptionId::from("tick|BTC/USD"),
+                from: "2026-01-02T09:37:24Z".parse::<DateTime<Utc>>().unwrap(),
+            }
+        );
     }
 
     /// The replay boundary is the one control frame that is modelled, because its `from` is the
