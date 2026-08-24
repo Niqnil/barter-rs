@@ -132,9 +132,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.42"
+version = "0.4.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
+checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -1159,9 +1159,9 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "databento"
-version = "0.54.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69ee0c66839f827bfd25ee8455f49414cdde18863753451b0dff69268878a041"
+checksum = "a5bcdafe88edf696d032e9d6992d5ce1a2c6aa1575ec80d0111c43408a23528e"
 dependencies = [
  "async-compression",
  "bon",
@@ -1172,7 +1172,7 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -1183,9 +1183,9 @@ dependencies = [
 
 [[package]]
 name = "dbn"
-version = "0.62.0"
+version = "0.67.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88815bb4d60cfc7aef10b3b4899f74081565f77ecdf537b2dfc012c847fd7658"
+checksum = "aa0f381095ebd6402a89d29526ae6e96edc5d15131d735e25e303f92e0c66521"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -1205,9 +1205,9 @@ dependencies = [
 
 [[package]]
 name = "dbn-macros"
-version = "0.62.0"
+version = "0.67.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e761e815ca3f77b939900d8888243f34512b522ac0ee8aa31e12b093a4f6f17"
+checksum = "7b4db0c288db84da99799a9ba311614430d42f01f9ca93a345db559a8d480b39"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
